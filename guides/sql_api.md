@@ -242,7 +242,7 @@ or replaced worker can resume rather than double-run.
 | `begin_or_resume_import(target_release_id, owner, runner_backend, stale_after)` | Claim or resume a durable import run            |
 | `heartbeat_import(target_run_id, progress_patch)`                               | Extend an import run's lease and merge progress |
 | `advance_import(target_run_id, next_status, metrics_patch)`                     | Move an import run to its next state            |
-| `fail_import(target_run_id, error_detail)`                                      | Mark an import run failed and release its lease |
+| `fail_import(target_run_id, error_detail)`                                      | Mark an import run failed and release its lease; refuses a completed run |
 
 `stale_after` defaults to `interval '15 minutes'` and must be non-negative; a negative
 interval raises SQLSTATE `22023` rather than being accepted and making every existing
@@ -255,6 +255,12 @@ starts a new attempt.
 `advance_import` refuses to move a run out of a terminal status: once a run is
 `completed` or `failed`, advancing it to any other status raises SQLSTATE `55000`.
 Start a new attempt with `begin_or_resume_import` instead of trying to resurrect one.
+
+`fail_import` carries the same guard on the one transition that would lose data:
+failing a `completed` run raises SQLSTATE `55000`. Failing a run that already
+failed is idempotent, so a caller recording the same failure twice does not
+raise. Nothing else is refused -- a run stuck in any working phase can always be
+failed, which is what an operator reclaiming one needs.
 
 ### Staging and analysis
 

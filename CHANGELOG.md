@@ -34,6 +34,8 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
 - **Import runs** — a durable `import_run` state machine (`begin_or_resume_import`,
   `heartbeat_import`, `advance_import`, `fail_import`) with a heartbeat lease and stale
   reclaim, so a crashed or replaced worker can resume rather than double-run an import.
+  `completed` is terminal on both write paths: neither advancing nor failing can move a
+  run out of it, so a late error cannot overwrite the outcome of a run that published.
 - **Host integration** — `GeoGenius.Preflight` for a startup-time prerequisite check
   (extensions, geometry and jsonb decoding, and schema version), and `mix geo_genius.setup`,
   `mix geo_genius.gen.migration`, `mix geo_genius.check_schema`, and

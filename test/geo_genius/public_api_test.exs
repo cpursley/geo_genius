@@ -3,6 +3,21 @@ defmodule GeoGenius.PublicApiTest do
 
   alias GeoGenius.AppEnv
 
+  # Every read entry point, as {function, leading arguments, options it requires}.
+  # Driven through one test so a new entry point is covered by adding a row.
+  @read_entry_points [
+    {:areas_for_point, [1.0, 2.0], []},
+    {:areas_for_geometry, [%Geo.Point{coordinates: {0.0, 0.0}, srid: 4326}], []},
+    {:areas_near, [1.0, 2.0, 100.0], []},
+    {:areas_by_code, ["slug", "alpha"], []},
+    {:search_areas, ["alpha"], []},
+    {:resolve, [%{"name" => "Alpha"}], []},
+    {:children_of, ["k"], []},
+    {:ancestors_of, ["k"], []},
+    {:related_areas, ["k"], []},
+    {:release_at, [~U[2026-01-01 00:00:00Z]], [collection: "demo"]}
+  ]
+
   defmodule RecordingStore do
     @moduledoc false
     @behaviour GeoGenius.Store
@@ -71,6 +86,34 @@ defmodule GeoGenius.PublicApiTest do
   setup do
     AppEnv.put(:store, RecordingStore)
     AppEnv.put(:repo, GeoGenius.TestRepo)
+  end
+
+  test "the read entry point matrix covers every Store callback" do
+    covered = @read_entry_points |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+
+    callbacks =
+      GeoGenius.Store.behaviour_info(:callbacks) |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+
+    assert covered == callbacks,
+           "@read_entry_points must hold one row per GeoGenius.Store callback"
+  end
+
+  test "every read entry point builds its context from the caller's options" do
+    for {name, args, required_opts} <- @read_entry_points do
+      arity = length(args) + 1
+      opts = [prefix: "custom_geo", repo: GeoGenius.SandboxedRepo] ++ required_opts
+
+      apply(GeoGenius, name, args ++ [opts])
+
+      assert_received {^name, context, _},
+                      "#{name}/#{arity} never reached the store"
+
+      assert context.prefix == "custom_geo",
+             "#{name}/#{arity} dropped :prefix on the way to Context.new/1"
+
+      assert context.repo == GeoGenius.SandboxedRepo,
+             "#{name}/#{arity} dropped :repo on the way to Context.new/1"
+    end
   end
 
   test "delegates to the configured store with a built context" do

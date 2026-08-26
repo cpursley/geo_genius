@@ -1,6 +1,6 @@
 BEGIN;
 
-SELECT plan(19);
+SELECT plan(21);
 
 SELECT has_table('geo_genius', 'import_run', 'import_run table exists');
 SELECT has_table('geo_genius', 'import_run_lease', 'import_run_lease table exists');
@@ -192,6 +192,50 @@ SELECT is(
   (SELECT r.heartbeat_at FROM geo_genius.import_run r
     ORDER BY r.attempt DESC LIMIT 1),
   'import_run_status falls back to the run''s own heartbeat_at once the lease is gone'
+);
+
+-- fail_import mirrors advance_import's terminal guard. Without it a late
+-- failure -- a runner reporting its own error, a cleanup that failed after the
+-- pipeline already finished -- stamps 'failed' over a run that completed and
+-- published, leaving the catalog's history contradicting the release it holds.
+SELECT geo_genius.upsert_collection('demo2', 'Demo Two', NULL);
+INSERT INTO geo_genius.release (collection_id, release_key, manifest)
+SELECT id, 'r2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo2';
+
+SELECT geo_genius.begin_or_resume_import(
+  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  'worker-2', 'task', interval '5 minutes'
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT id FROM geo_genius.import_run
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')),
+  'completed',
+  '{}'::jsonb
+);
+
+SELECT throws_ok(
+  $$SELECT geo_genius.fail_import(
+      (SELECT id FROM geo_genius.import_run
+        WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')),
+      '{"reason": "late"}'::jsonb)$$,
+  '55000',
+  'import run ' ||
+    (SELECT id::text FROM geo_genius.import_run
+      WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')) ||
+    ' has completed and cannot be failed',
+  'fail_import refuses a run that has completed'
+);
+
+-- Only completed is refused. A retry path that records a failure twice, or a
+-- pipeline failing after a phase already did, must not raise on the second.
+SELECT lives_ok(
+  $$SELECT geo_genius.fail_import(
+      (SELECT id FROM geo_genius.import_run
+        WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+        ORDER BY attempt DESC LIMIT 1),
+      '{"reason": "again"}'::jsonb)$$,
+  'fail_import is idempotent on a run that already failed'
 );
 
 SELECT finish();

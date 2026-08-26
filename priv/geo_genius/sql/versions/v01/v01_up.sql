@@ -2527,9 +2527,30 @@ VOLATILE
 SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
+DECLARE
+  current_status text;
 BEGIN
   IF target_run_id IS NULL THEN
     RAISE EXCEPTION 'run id is required' USING ERRCODE = '22004';
+  END IF;
+
+  -- completed is terminal, matching advance_import. Stamping 'failed' over a
+  -- run that finished -- a late error from a runner, a cleanup that failed
+  -- after the pipeline already recorded the outcome -- leaves the catalog's
+  -- history contradicting the release that run actually published.
+  -- 'failed' over 'failed' stays idempotent: only completed is refused, so a
+  -- caller recording the same failure twice does not raise.
+  -- No early exit for a run that does not exist: current_status stays NULL,
+  -- this guard falls through, and the UPDATE's own NOT FOUND raises the 23503.
+  SELECT status INTO current_status
+    FROM $SCHEMA$.import_run WHERE id = target_run_id;
+
+  IF current_status = 'completed' THEN
+    RAISE EXCEPTION
+      'import run % has completed and cannot be failed', target_run_id
+      USING
+        ERRCODE = '55000',
+        HINT = 'Start a new attempt with begin_or_resume_import instead.';
   END IF;
 
   UPDATE $SCHEMA$.import_run

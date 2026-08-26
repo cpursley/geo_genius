@@ -18,9 +18,10 @@ defmodule GeoGenius.Runner do
   **A runner must not call `GeoGenius.Catalog.fail_import/3`.** The pipeline
   owns the failure path end to end, including the case where its own cleanup
   or confirmation read fails after a phase already recorded an outcome.
-  `fail_import/3` carries no terminal-state guard, so a runner calling it
-  after the pipeline already finished could stamp `failed` over a completed
-  run. A backend that wants to record a failure of its own -- it could not
+  A runner calling it after the pipeline already finished raises 55000 rather
+  than recording anything, because `fail_import/3` refuses a completed run --
+  so the call is not a way to report a late failure, only a way to crash the
+  backend. A backend that wants to record a failure of its own -- it could not
   start the work at all, say -- returns `{:error, reason}` from `enqueue/3`
   instead and leaves the run exactly where the pipeline left it.
   """

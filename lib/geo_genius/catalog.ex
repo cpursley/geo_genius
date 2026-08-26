@@ -260,7 +260,12 @@ defmodule GeoGenius.Catalog do
     ])
   end
 
-  @doc "Marks a run failed, storing its error detail."
+  @doc """
+  Marks a run failed, storing its error detail.
+
+  Raises 55000 for a run that has completed. Idempotent on one that already
+  failed.
+  """
   @spec fail_import(Context.t(), Ecto.UUID.t(), map()) :: :ok
   def fail_import(%Context{} = context, run_id, error_detail) do
     void(context, "fail_import", "$1, $2", [dump_uuid(run_id), error_detail])

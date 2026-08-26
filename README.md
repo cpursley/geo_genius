@@ -422,8 +422,8 @@ without polling.
 - [`guides/ingestion.md`](guides/ingestion.md) — the manifest, providers, adapters,
   runners, the import phases, publication, and the operational mix tasks
 - [CHANGELOG](CHANGELOG.md) — releases
-- [`docs/design/geo-genius-design.md`](docs/design/geo-genius-design.md) — the design
-  spec the three plans were built from
+- [`docs/design/geo-genius-design.md`](https://github.com/agoodway/geo_genius/blob/main/docs/design/geo-genius-design.md) —
+  the design spec the three plans were built from
 
 ## Testing
 

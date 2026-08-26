@@ -331,10 +331,9 @@ defmodule GeoGenius.Pipeline do
 
   # By the time this reads, the run is `completed` in PostgreSQL. A read that
   # fails here costs the caller its snapshot, never the outcome, so it must not
-  # route to `fail/3`: `fail_import/3` carries no terminal-state guard the way
-  # `advance_import/4` does, and would overwrite a finished run with `failed`
-  # -- sending the host `:import_failed` moments after `:import_completed` for
-  # the same run.
+  # route to `fail/3`: `fail_import/3` refuses a completed run, so the call
+  # would raise 55000 and bury the read error that actually happened behind a
+  # failure to record it.
   defp completed(state) do
     case Catalog.import_run(state.context, state.run.run_id) do
       %ImportRun{} = run -> {:ok, run}
