@@ -1,0 +1,27 @@
+# GeoGenius test Postgres image
+# PG 18 + PostGIS 3.6 + pgTAP + pg_prove.
+#
+# imresamu/postgis is the community fork that publishes arm64 manifests; the
+# official postgis/postgis image does not.
+FROM imresamu/postgis:18-3.6-bookworm
+
+ENV POSTGRES_PASSWORD=postgres
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential git postgresql-server-dev-18 curl perl libdbd-pg-perl
+
+# pgTAP from source: it is not published in PGDG apt.
+RUN git clone --depth 1 https://github.com/theory/pgtap.git /tmp/pgtap && \
+    cd /tmp/pgtap && make && make install && \
+    rm -rf /tmp/pgtap
+
+# pg_prove, the Perl TAP runner for pgTAP suites.
+RUN curl -L -o /tmp/cpanm https://cpanmin.us && chmod +x /tmp/cpanm && \
+    /tmp/cpanm --notest TAP::Parser::SourceHandler::pgTAP && \
+    rm -f /tmp/cpanm
+
+# Drop build-only packages. Runtime perl and libdbd-pg-perl stay so pg_prove runs.
+RUN apt-get remove -y build-essential git postgresql-server-dev-18 curl && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*

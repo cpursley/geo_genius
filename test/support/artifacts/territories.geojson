@@ -1,0 +1,41 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "territory_id": "west",
+        "territory_name": "West Territory",
+        "short_name": "W",
+        "population": 1200
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "territory_id": "east",
+        "territory_name": "East Territory",
+        "short_name": "E",
+        "population": 800
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 0.0]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "territory_id": "nowhere",
+        "territory_name": "Metadata Only",
+        "short_name": "N",
+        "population": 5
+      },
+      "geometry": null
+    }
+  ]
+}

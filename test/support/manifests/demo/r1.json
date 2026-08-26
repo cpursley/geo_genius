@@ -1,0 +1,39 @@
+{
+  "collection": "demo",
+  "collection_name": "Demo Territories",
+  "description": "Operator-drawn delivery zones",
+  "release": "r1",
+  "provider": "geojson",
+  "requires_geometry": true,
+  "source_date": "2026-01-15",
+  "authority": { "key": "demo", "name": "Demo Operations" },
+  "area_types": [{ "key": "territory", "rank": 100 }],
+  "sources": [
+    {
+      "source_key": "demo:territories",
+      "provider": "geojson",
+      "license": "CC0-1.0",
+      "attribution": "Demo Corp",
+      "release_key": "2026-01",
+      "source_date": "2026-01-15",
+      "artifacts": [
+        {
+          "logical_name": "territories.geojson",
+          "url": "https://example.test/territories.geojson",
+          "operator_supplied": false,
+          "format": "geojson",
+          "required": true,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bytes": 4096,
+          "members": ["territories.geojson"]
+        }
+      ]
+    }
+  ],
+  "options": {
+    "code_property": "territory_id",
+    "name_property": "territory_name",
+    "area_type": "territory",
+    "attribute_properties": ["short_name", "population"]
+  }
+}

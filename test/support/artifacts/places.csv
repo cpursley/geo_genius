@@ -1,0 +1,4 @@
+place_id,place_name,short_name,lon,lat,population,zip
+west,"West, Territory",W,-84.4,33.8,1200,30309
+east,East Territory,E,-84.3,33.7,800,30310
+nogeo,No Geometry Here,N,,,5,30311
