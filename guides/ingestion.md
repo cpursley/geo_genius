@@ -27,7 +27,7 @@ somebody reviewed a document and committed it.
   "provider": "geojson",
   "requires_geometry": true,
   "source_date": "2026-01-15",
-  "authority": { "key": "demo", "name": "Demo Operations" },
+  "authorities": [{ "key": "demo", "name": "Demo Operations" }],
   "area_types": [{ "key": "territory", "rank": 100 }],
   "sources": [
     {
@@ -70,11 +70,25 @@ its key.
 `provider` must resolve through the registry described under
 [Providers](#providers). `requires_geometry` is a promise about the collection, checked
 at publication time: with it set, `verify_release` refuses a release in which any area
-lacks a boundary. `authority` names who is responsible for the identifiers, and it is the
-first segment of every `area_key` the release produces, so `demo` above yields
-`demo:territory:west`. `area_types` declares the ranked types this collection uses, low
-rank containing high; a provider that has a fixed hierarchy of its own supplies it when
-the manifest declares none.
+lacks a boundary. `authorities` names who is responsible for the identifiers; an
+authority key is the first segment of every `area_key` keyed under it, so `demo` above
+yields `demo:territory:west`. It is a list because a collection may draw on more than
+one: a US release keyed partly by the Census, partly by the USPS, and partly by its own
+vendor identifiers names all three, and a provider may emit areas under any of them.
+Every authority an area is keyed under must be declared here, since an area naming one
+the collection does not carry is refused.
+
+`authorities` is required and must name at least one. That is stricter than
+`area_types`, which may be omitted: a provider supplies its own ranked hierarchy from
+`area_types/0` when the manifest declares none, and nothing supplies authorities. A
+manifest declaring none can therefore register no area at all, and rejecting it at load
+names the field rather than failing partway through normalization. `area_types` declares
+the ranked types this collection uses, low rank containing high.
+
+`GeoGenius.Providers.GeoJSON` and `GeoGenius.Providers.CSV` key every area they emit
+under one authority, which they take from `options["authority"]` or, when that is
+absent, from the manifest's own single authority; a manifest declaring several must name
+which one under that option.
 
 `sources` is a list because a release can draw on more than one feed: an authority's own
 publication plus an operator-supplied correction, for instance. Each source needs a
@@ -145,20 +159,24 @@ GeoGenius.import(manifest: manifest)
 ## Providers
 
 A provider adapts one source format. It is called for parsing and never for a write:
-every write the import makes is the pipeline's, through `GeoGenius.Catalog`. Three
+every write the import makes is the pipeline's, through `GeoGenius.Catalog`. Four
 providers ship: `GeoGenius.Providers.GeoJSON` (`"geojson"`), `GeoGenius.Providers.CSV`
-(`"csv"`), and `GeoGenius.Providers.Shapefile` (`"shapefile"`), the last of which
-converts its archive with `ogr2ogr` before parsing the result as GeoJSON.
+(`"csv"`), `GeoGenius.Providers.Shapefile` (`"shapefile"`), which converts its archive
+with `ogr2ogr` before parsing the result as GeoJSON, and
+`GeoGenius.Providers.SimpleMaps` (`"simplemaps"`), which has a section of its own
+[below](#the-simplemaps-provider).
 
-`GeoGenius.Provider` declares six callbacks.
+`GeoGenius.Provider` declares seven callbacks.
 
 `area_types/0` returns the ranked hierarchy this provider's collections use when a
-manifest declares none. All three shipped providers have none of their own, so they
-delegate to `GeoGenius.Provider.no_area_types/0` and let the manifest decide.
+manifest declares none. The GeoJSON, CSV and shapefile providers have none of their own,
+so they delegate to `GeoGenius.Provider.no_area_types/0` and let the manifest decide.
+SimpleMaps parses two fixed files and returns the four-level hierarchy they describe.
 
 `required_options/0` returns the `options` keys manifest validation insists on. The
 GeoJSON provider requires `"area_type"` and `"code_property"`; the CSV provider requires
-`"area_type"` and `"code_column"`.
+`"area_type"` and `"code_column"`. SimpleMaps reads its columns by name and requires
+none.
 
 `artifacts/1` returns the artifacts, across the manifest's sources, this provider will
 stage. The shipped providers stage every declared artifact and so delegate to
@@ -179,12 +197,37 @@ itself.
 database. Return `:skip` for a row that carries no area, such as a summary record or a
 feature with no usable code, since that is an expected shape rather than a failure.
 
+It may also return `{:ok, [%GeoGenius.Provider.Area{}, ...]}`, which is what a source
+that denormalises a hierarchy into every row needs: a city row that also carries its
+county and its state describes all three, and returning them together is cheaper and
+truer than staging the same row once per level. Areas repeated across rows converge on
+`area_key`, so emit an implied parent from every row that implies it rather than tracking
+which ones you have already emitted.
+
 `relations/1` returns `:rebuild` when the areas nest spatially or by code and `:none`
-when the collection carries no hierarchy. All three shipped providers delegate to
-`GeoGenius.Provider.always_rebuild/1`. Note that a rebuild pairs a lower `area_type.rank`
-against a higher one, so a release built from one manifest of one area type produces no
-measured relations at all; hierarchy appears when a release composes several sources of
-different types.
+when the collection carries no hierarchy. The GeoJSON, CSV and shapefile providers
+delegate to `GeoGenius.Provider.always_rebuild/1`; SimpleMaps returns `:none`, because it
+carries centroids and no boundaries and so has no overlap to measure. Note that a rebuild
+pairs a lower `area_type.rank` against a higher one, so a release built from one manifest
+of one area type produces no measured relations at all; hierarchy appears when a release
+composes several sources of different types.
+
+`asserted_relations/2` returns the edges one staged row states outright, as
+`{parent_area_key, child_area_key, relation_type}` tuples with `relation_type` one of
+`"contains"`, `"mostly_contains"`, or `"overlaps"`. It is for the hierarchy no overlap
+test can derive: a county FIPS on every city row, an admin parent code on every place, or
+a source with no geometry at all. Both keys are the strings
+`GeoGenius.Provider.Area.key/1` composes -- `authority_key`, `area_type_key` and `code`
+joined by `:`, the same composition PostgreSQL stores in `area.area_key`. Build the area
+an edge names and take its key from there rather than joining the parts by hand, so an
+edge can only name a key `normalize/2` produced.
+
+It composes with `relations/1` rather than replacing it: a provider whose areas nest
+spatially may both rebuild measured relations and assert edges the geometry does not
+carry, and both land in the same release. Asserted edges are written after every area
+exists, so an edge may name any area the run produced rather than only the ones its own
+row emitted. A provider whose source carries no hierarchy in its columns delegates to
+`GeoGenius.Provider.no_asserted_relations/2`.
 
 To write your own, implement the behaviour and register the module under the name your
 manifests will use:
@@ -202,7 +245,141 @@ written for it.
 The spec these providers were built against writes `stage/2` and `normalize/1`. The
 shipped arities are `stage/5` and `normalize/2`, because a provider needs the manifest on
 every call and `stage` needs somewhere to emit to and an adapter to shell out through.
-The six callbacks and their responsibilities are otherwise unchanged.
+The callbacks and their responsibilities are otherwise unchanged.
+
+`asserted_relations/2` is required, not optional. A provider written against the earlier
+six-callback behaviour keeps compiling by adding one line:
+
+```elixir
+@impl GeoGenius.Provider
+defdelegate asserted_relations(manifest, row), to: GeoGenius.Provider, as: :no_asserted_relations
+```
+
+## The SimpleMaps provider
+
+`GeoGenius.Providers.SimpleMaps` (`"simplemaps"`) parses the SimpleMaps US cities and US
+ZIP codes datasets: two comma-delimited files, `uscities` and `uszips`, named by the
+artifact's `logical_name` rather than by a manifest option. It requires no `options` at
+all. The files are licensed downloads, so the manifest this package ships,
+`us_simplemaps`, declares both artifacts `operator_supplied` with a `cache_key` and no
+`url`; place your copies in the cache under those keys, and replace each artifact's
+`sha256` and `bytes` with the digest and size of the copy you licensed. The shipped
+`license` and `attribution` describe the paid tier, whose row counts the validation rules
+below are measured against, so replace those two as well if you licensed a different
+tier -- the free files are CC BY 4.0. A host-shipped manifest wins over the package's
+own, so the usual route is to copy it into your own `:manifest_paths` directory and edit
+it there.
+
+### Four area types
+
+| Area type | Rank | Comes from                                              |
+|-----------|------|---------------------------------------------------------|
+| `state`   | 10   | the `state_id`/`state_name` columns of both files       |
+| `county`  | 20   | the `county_fips_all` and county-name columns of both   |
+| `city`    | 30   | a `uscities` row                                        |
+| `zip`     | 40   | a `uszips` row                                          |
+
+Only cities and ZIPs exist as rows. Counties and states are read out of columns, so they
+carry only what those columns say: a code, a name, and a FIPS or ANSI code. They get no
+centroid and no attributes, because a row's `lat`/`lng` and its demographic columns
+measure the city or ZIP and nothing else.
+
+Both files denormalise the whole hierarchy into every row, so `normalize/2` returns
+several areas per row: a `uscities` row is its city, every county it falls in, and its
+state; a `uszips` row is every county it touches, the ZIP, and its state. A ZIP row also
+names a city, but only as the mailing name the USPS prefers for that ZIP, so that becomes
+a `:mailing` name on the ZIP rather than a city area of its own -- the `uscities` file is
+where a city gets its identity.
+
+### Three authorities, and the six state codes that key under the USPS
+
+The manifest must declare all three. An area naming an authority the collection does not
+carry is refused when the area is registered.
+
+| Authority    | Keys                                          |
+|--------------|------------------------------------------------|
+| `simplemaps` | cities, under the vendor's own `id`            |
+| `census`     | counties, and states that have an ANSI code    |
+| `usps`       | ZIPs, and the six state codes that do not      |
+
+`AA`, `AE` and `AP` are USPS constructs for military mail -- Armed Forces Americas, Europe
+and Pacific. `FM`, `PW` and `MH` are the Freely Associated States -- Micronesia, Palau and
+the Marshall Islands -- sovereign countries the USPS serves rather than states of any
+kind. The Census defines none of the six and assigns none of them an ANSI code, so keying
+them under `census` with an `ansi_state` code would assert two things no source says.
+They key under `usps` and carry a `usps_state` external code instead.
+
+**A host looking a state up by code must query both code types.** `ansi_state` alone
+silently misses those six, and every ZIP under them; the two together are the whole set.
+
+`AA`, `AE` and `AP` also publish nameless: `state_name` is blank in every one of their
+`uszips` rows and `uscities` carries no row at all for any of the six codes, so those
+three areas carry no name. Nothing invents one -- supplying "Armed Forces Europe" out of
+a table in this library would manufacture a fact the source does not carry. They exist so
+their ZIPs have a parent; a host that wants a label supplies its own.
+
+### Area keys
+
+`GeoGenius.Provider.Area.key/1` composes every one of them:
+
+| Area type | Form                     | Example              |
+|-----------|--------------------------|----------------------|
+| `city`    | `simplemaps:city:<id>`   | `simplemaps:city:1840021543` |
+| `county`  | `census:county:<fips>`   | `census:county:06075` |
+| `state`   | `census:state:<code>`    | `census:state:CA`     |
+| `state`   | `usps:state:<code>`      | `usps:state:AE`       |
+| `zip`     | `usps:zip:<zip>`         | `usps:zip:94110`      |
+
+### Relations
+
+SimpleMaps carries centroids and no boundaries, so `relations/1` is `:none` and the whole
+hierarchy comes from `asserted_relations/2`, read from the FIPS columns. A row asserts a
+state-to-county edge per county it names, and a county-to-child edge per county:
+`contains` when the row names one county, `overlaps` when it names several, since a place
+crossing county lines is contained by neither. No edge is ever asserted between a city and
+a ZIP in either direction -- a ZIP crosses city lines and neither one contains the other.
+
+A row naming no county asserts one edge instead: its state contains the ZIP directly.
+That is the only parent such a row names, and hanging it there is truer than leaving it
+with no parent at all.
+
+### The county rules that fail a release
+
+`GeoGenius.Providers.SimpleMaps.Validation` runs before anything is built from a row. A
+row that fails ends the import, naming the column and enough of the row -- `zip`, `city`,
+`state_id` -- to find it in a file of tens of thousands. Both files are checked for:
+
+- `county_fips` present but absent from `county_fips_all`. The source is contradicting
+  itself about which counties the row belongs to.
+- `county_fips_all` and the county-name column (`county_name_all` on `uscities`,
+  `county_names_all` on `uszips`) of different lengths. The two are paired positionally,
+  so unequal lengths mean at least one FIPS is paired with the wrong name.
+
+`uscities` is additionally checked for a row naming **no** county, and `uszips` for
+`county_weights` that is blank beside a populated `county_fips_all`, that does not decode
+as a JSON object, or whose keys are not exactly `county_fips_all`.
+
+A blank code in `id`, `zip` or `state_id` is an error too, rather than the `:skip` the
+CSV provider returns for a blank code column. SimpleMaps populates those columns in every
+row of both files, so a blank one is a corrupt or truncated download, and `area_key` is
+`<authority>:<area_type>:<code>` -- a blank code would put every such row under one
+shared, meaningless key.
+
+**The county-less asymmetry is measured, not assumed.** A `uscities` row naming no county
+fails the release; a `uszips` row naming none is ordinary data. Every one of `uscities`'
+109,071 rows names at least one county, because every city sits in one, so a row naming
+none is corruption. 617 of `uszips`' 41,551 rows name none, because a military APO/FPO ZIP
+delivers to an overseas address belonging to no US county; failing them would abort a real
+import on the first one and never reach the other 616.
+
+### What is not checked
+
+**Every rule reads one staged row.** Nothing compares across rows or across the two
+files. Cross-file agreement -- one FIPS mapping to two different states, or `uscities` and
+`uszips` spelling one county's name two different ways -- cannot be seen from a single row
+and is **not** checked here. GeoGenius accepts several official names for one area, so a
+disagreement of that kind lands in the catalog as two names rather than as an error. A
+host that needs cross-file agreement enforced verifies it itself, after the import.
 
 ## The adapters
 
@@ -341,8 +518,12 @@ into an unlogged table of this run's own.
 on each, and writes the areas, names, codes, membership, and boundaries through
 `GeoGenius.Catalog`.
 
-`relating` rebuilds measured relations from boundary overlap when the provider asks for
-it, and does nothing when it does not.
+`relating` rebuilds measured relations from boundary overlap when `relations/1` asks for
+it, and then writes every edge `asserted_relations/2` returns for each staged row. The
+two compose: a release can carry both. Measures `relations` (only when a rebuild ran) and
+`asserted_relations`, which counts edges asserted rather than distinct edges written --
+two rows asserting the same edge each add one, though the edge itself upserts to a single
+row.
 
 `indexing` runs `analyze_release`, so the release has statistics before anything plans a
 query against it.

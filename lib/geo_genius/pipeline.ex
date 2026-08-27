@@ -6,15 +6,17 @@ defmodule GeoGenius.Pipeline do
   `begin_or_resume_import`, reads what it needs out of PostgreSQL, and walks
   the run through its phases: download every artifact, check each required one
   arrived, stage them through the manifest's provider, normalize the staged
-  rows into the catalog, rebuild relations, analyze, and verify. It never
-  claims a run and never opens a release; both belong to the caller that
-  registered the manifest.
+  rows into the catalog, rebuild relations and write every edge the provider
+  asserts, analyze, and verify. It never claims a run and never opens a
+  release; both belong to the caller that registered the manifest.
 
   The phases themselves live next door where they have room:
   `GeoGenius.Pipeline.Artifacts` owns everything that touches the cache, the
   downloader, and checksums; `GeoGenius.Pipeline.Normalize` owns everything
-  that knows `GeoGenius.Provider.Area`. This module owns the driver, the
-  failure path, staging, and the three one-line phases.
+  that knows `GeoGenius.Provider.Area`; `GeoGenius.Pipeline.Relate` owns
+  rebuilding measured relations and writing asserted edges. This module owns
+  the driver, the failure path, staging, and the two remaining one-line
+  phases, indexing and verifying.
 
   ## What an import does not do
 
@@ -74,8 +76,8 @@ defmodule GeoGenius.Pipeline do
   ## Options
 
     * `:publish` -- publish the release after it verifies. Defaults to `false`.
-    * `:batch_size` -- staged rows read and normalized per round trip.
-      Defaults to 500.
+    * `:batch_size` -- staged rows read and normalized or asserted per round
+      trip, and the relate phase's heartbeat cadence. Defaults to 500.
     * `:work_dir` -- the directory the run's own working directory is created
       beneath. Defaults to the system temporary directory.
     * `:stale_after_seconds` -- the staleness window this run was claimed
@@ -122,6 +124,7 @@ defmodule GeoGenius.Pipeline do
   alias GeoGenius.Pipeline.Artifacts
   alias GeoGenius.Pipeline.CommandAllowlist
   alias GeoGenius.Pipeline.Normalize
+  alias GeoGenius.Pipeline.Relate
   alias GeoGenius.Pipeline.State
   alias GeoGenius.Staging
   alias GeoGenius.Telemetry
@@ -499,16 +502,12 @@ defmodule GeoGenius.Pipeline do
     )
   end
 
-  defp relate(%State{} = state) do
-    case state.provider.relations(state.manifest) do
-      :rebuild -> {:ok, %{state | metrics: %{"relations" => rebuild_relations(state)}}}
-      :none -> {:ok, %{state | metrics: %{}}}
-    end
-  end
-
-  defp rebuild_relations(state) do
-    Catalog.rebuild_relations(state.context, state.run.release_id, timeout: state.timeout)
-  end
+  # Kept as a private one-line dispatch, rather than a direct
+  # `&Relate.relate/1` in `import_phases/0`, so a phase-level test can drive
+  # `GeoGenius.Pipeline.Relate.relate/1` in isolation the way
+  # `GeoGenius.Pipeline.Normalize.normalize/1` already is, without this
+  # module needing to expose anything beyond `execute/3`.
+  defp relate(%State{} = state), do: Relate.relate(state)
 
   defp index(%State{} = state) do
     Catalog.analyze_release(state.context, state.run.release_id, timeout: state.timeout)

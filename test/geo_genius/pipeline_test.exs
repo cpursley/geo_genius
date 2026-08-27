@@ -6,9 +6,15 @@ defmodule GeoGenius.PipelineTest do
   alias GeoGenius.Catalog
   alias GeoGenius.Context
   alias GeoGenius.GraphFixture
+  alias GeoGenius.ImportFixture
   alias GeoGenius.ImportRun
   alias GeoGenius.Manifest
   alias GeoGenius.Pipeline
+  alias GeoGenius.Pipeline.Normalize
+  alias GeoGenius.Pipeline.Relate
+  alias GeoGenius.Pipeline.State
+  alias GeoGenius.Provider.Area
+  alias GeoGenius.Provider.Area.Name
   alias GeoGenius.RecordingRepo
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
@@ -41,6 +47,60 @@ defmodule GeoGenius.PipelineTest do
       send(Keyword.fetch!(opts, :test_pid), {:ran, executable, args})
       File.cp!(Keyword.fetch!(opts, :fixture), Enum.at(args, -2))
       {:ok, ""}
+    end
+  end
+
+  defmodule AssertingProvider do
+    @moduledoc false
+    @behaviour GeoGenius.Provider
+
+    @impl true
+    def area_types, do: [%{key: "city", rank: 30}, %{key: "state", rank: 10}]
+    @impl true
+    def required_options, do: []
+    @impl true
+    defdelegate artifacts(manifest), to: GeoGenius.Provider, as: :all_artifacts
+    @impl true
+    def stage(_manifest, _artifact, _path, _emit, _opts), do: :ok
+    # Implemented directly rather than delegated to `always_rebuild/1`: the
+    # relate-phase fixture drives `relate/1` with no manifest built, since
+    # nothing on this path reads one.
+    @impl true
+    def relations(_manifest), do: :rebuild
+
+    # Asserts one `contains` edge per row, from the row's parent state to its
+    # child city, so a relate-phase test can pin both that the edge lands and
+    # that it composes with `relations/1`'s `:rebuild`.
+    @impl true
+    def asserted_relations(_manifest, %{payload: %{"child" => child, "parent" => parent}}) do
+      [{"demo_auth:state:#{parent}", "demo_auth:city:#{child}", "contains"}]
+    end
+
+    @impl true
+    def normalize(_manifest, %{payload: %{"child" => child, "parent" => parent}}) do
+      {:ok,
+       [
+         %Area{
+           authority_key: "demo_auth",
+           area_type_key: "city",
+           code: child,
+           centroid: nil,
+           geometry: nil,
+           names: [%Name{name: child, kind: :official}],
+           codes: [],
+           attributes: %{}
+         },
+         %Area{
+           authority_key: "demo_auth",
+           area_type_key: "state",
+           code: parent,
+           centroid: nil,
+           geometry: nil,
+           names: [%Name{name: parent, kind: :official}],
+           codes: [],
+           attributes: %{}
+         }
+       ]}
     end
   end
 
@@ -131,6 +191,11 @@ defmodule GeoGenius.PipelineTest do
       assert run.stage_metrics["boundary_count"] == 2
     end
 
+    # The single point where the Elixir composition and the SQL one are held
+    # to each other. `GeoGenius.Provider.Area.key/1` is the only Elixir
+    # statement of the format -- the pipeline and every provider compose keys
+    # through it -- so the expected rows are built with it rather than written
+    # out as literals, and a change to either side fails here.
     test "the derived area key is the one PostgreSQL stored", fixtures do
       {_manifest, _release_id, run_id} = prepare(fixtures)
 
@@ -147,6 +212,13 @@ defmodule GeoGenius.PipelineTest do
           """,
           []
         )
+
+      expected =
+        for code <- ~w(east nowhere west) do
+          [Area.key(%Area{authority_key: "demo", area_type_key: "territory", code: code})]
+        end
+
+      assert rows == expected
 
       assert rows == [
                ["demo:territory:east"],
@@ -172,6 +244,7 @@ defmodule GeoGenius.PipelineTest do
                "boundaries" => 2,
                "skipped" => 0,
                "relations" => 0,
+               "asserted_relations" => 0,
                "area_count" => 3,
                "boundary_count" => 2
              }
@@ -580,6 +653,47 @@ defmodule GeoGenius.PipelineTest do
     end
   end
 
+  describe "asserted relations" do
+    test "asserted edges are written and counted, and compose with a rebuild" do
+      # AssertingProvider returns :rebuild from relations/1 AND one edge per
+      # row, so this pins that the two paths compose rather than one
+      # replacing the other.
+      state = import_fixture(AssertingProvider, [%{"child" => "LA", "parent" => "CA"}])
+
+      assert {:ok, %{metrics: metrics}} = Relate.relate(state)
+      assert metrics["asserted_relations"] == 1
+      assert Map.has_key?(metrics, "relations")
+
+      assert relation_exists?(state, "demo_auth:state:CA", "demo_auth:city:LA", "contains")
+    end
+
+    test "the same edge asserted by two rows is written once" do
+      # Two IDENTICAL rows -- not two rows that merely share a parent -- so
+      # the same edge is asserted twice: `asserted_relations` counts both
+      # assertions, but `relation_count` (a row count in `geo_genius.relation`)
+      # stays at 1, since `put_relation` upserts and the edge converges.
+      rows = [%{"child" => "LA", "parent" => "CA"}, %{"child" => "LA", "parent" => "CA"}]
+      state = import_fixture(AssertingProvider, rows)
+
+      assert {:ok, %{metrics: metrics}} = Relate.relate(state)
+      assert metrics["asserted_relations"] == 2
+      assert relation_count(state, "demo_auth:state:CA") == 1
+    end
+
+    test "an edge naming an area absent from the release fails the run in relating", fixtures do
+      {_manifest, _release_id, run_id} = prepare_stub(fixtures, mode: "bad_relation")
+
+      assert {:error, %ImportRun{} = run} =
+               Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+
+      assert run.status == "failed"
+      assert run.error["phase"] == "relating"
+      assert run.error["exception"] == "GeoGenius.CatalogError"
+      assert run.error["reason"] =~ "put_relation"
+      assert run.error["reason"] =~ "no rows"
+    end
+  end
+
   describe "notifications and telemetry" do
     test "a raising notifier cannot fail an import, and the dropped event is logged",
          fixtures do
@@ -792,6 +906,94 @@ defmodule GeoGenius.PipelineTest do
     end
   end
 
+  # Registers a collection carrying `provider`'s own area types under the
+  # fixed `demo_auth` authority, stages `payloads` as rows, and normalizes
+  # them so every area a relate-phase test needs already exists in the
+  # release. Returns the `%State{}` a test drives directly against
+  # `GeoGenius.Pipeline.Relate.relate/1` -- no manifest is built, since
+  # `relate/1` only reads `state.manifest` through the provider it is handed.
+  defp import_fixture(provider, payloads) do
+    context = Context.new(repo: TestRepo, prefix: "geo_genius")
+    collection = "assert_fixture_#{System.unique_integer([:positive])}"
+
+    on_exit(fn -> ImportFixture.teardown!(collection) end)
+
+    Catalog.upsert_collection(context, %{key: collection, name: collection})
+    Catalog.upsert_authority(context, collection, %{key: "demo_auth", name: "Demo Authority"})
+
+    Enum.each(provider.area_types(), &Catalog.upsert_area_type(context, collection, &1))
+
+    release_id =
+      Catalog.open_release(context, collection, %{
+        release_key: "r1",
+        manifest: %{"collection" => collection},
+        source_date: ~D[2026-01-15]
+      })
+
+    run_id =
+      Catalog.begin_or_resume_import(context, release_id, %{
+        owner: "asserting-fixture",
+        runner_backend: "test",
+        stale_after_seconds: 300
+      })
+
+    on_exit(fn -> Staging.drop(context, run_id) end)
+
+    Staging.create(context, run_id)
+    rows = Enum.map(payloads, &%Staging.Row{artifact: "fixture", payload: &1, geom: nil})
+    Staging.insert(context, run_id, rows)
+
+    state = %State{
+      context: context,
+      run: Catalog.import_run(context, run_id),
+      opts: [],
+      work_dir: System.tmp_dir!(),
+      publish?: false,
+      batch_size: 500,
+      timeout: 30_000,
+      manifest: nil,
+      provider: provider
+    }
+
+    assert {:ok, state} = Normalize.normalize(state)
+    state
+  end
+
+  defp relation_exists?(%State{context: context, run: run}, parent_key, child_key, relation_type) do
+    %Postgrex.Result{rows: rows} =
+      TestRepo.query!(
+        """
+        SELECT 1
+          FROM "#{context.prefix}".relation
+          JOIN "#{context.prefix}".area AS parent ON parent.id = relation.parent_area_id
+          JOIN "#{context.prefix}".area AS child ON child.id = relation.child_area_id
+         WHERE relation.release_id = $1
+           AND parent.area_key = $2
+           AND child.area_key = $3
+           AND relation.relation_type = $4
+        """,
+        [Ecto.UUID.dump!(run.release_id), parent_key, child_key, relation_type]
+      )
+
+    rows != []
+  end
+
+  defp relation_count(%State{context: context, run: run}, parent_key) do
+    %Postgrex.Result{rows: [[count]]} =
+      TestRepo.query!(
+        """
+        SELECT count(*)
+          FROM "#{context.prefix}".relation
+          JOIN "#{context.prefix}".area AS parent ON parent.id = relation.parent_area_id
+         WHERE relation.release_id = $1
+           AND parent.area_key = $2
+        """,
+        [Ecto.UUID.dump!(run.release_id), parent_key]
+      )
+
+    count
+  end
+
   defp prepare(fixtures, opts \\ []) do
     prepare_manifest(fixtures, geojson_manifest(fixtures, opts))
   end
@@ -825,7 +1027,7 @@ defmodule GeoGenius.PipelineTest do
       requires_geometry: manifest.requires_geometry
     })
 
-    Catalog.upsert_authority(context, manifest.collection, manifest.authority)
+    Enum.each(manifest.authorities, &Catalog.upsert_authority(context, manifest.collection, &1))
     Enum.each(manifest.area_types, &Catalog.upsert_area_type(context, manifest.collection, &1))
 
     release_id =
@@ -877,7 +1079,7 @@ defmodule GeoGenius.PipelineTest do
       "provider" => "geojson",
       "requires_geometry" => false,
       "source_date" => "2026-01-15",
-      "authority" => %{"key" => "demo", "name" => "Demo Operations"},
+      "authorities" => [%{"key" => "demo", "name" => "Demo Operations"}],
       "area_types" => [%{"key" => "territory", "rank" => 100}],
       "sources" => [source_map(fixtures, opts)],
       "options" => %{
@@ -962,7 +1164,7 @@ defmodule GeoGenius.PipelineTest do
       "release" => "r1",
       "provider" => "shapefile",
       "requires_geometry" => false,
-      "authority" => %{"key" => "demo", "name" => "Demo Operations"},
+      "authorities" => [%{"key" => "demo", "name" => "Demo Operations"}],
       "area_types" => [%{"key" => "territory", "rank" => 100}],
       "sources" => [
         %{

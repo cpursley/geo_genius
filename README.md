@@ -35,8 +35,9 @@ it already knows about; it does not parse or normalize free-form street addresse
   lookup, ranked name search, hierarchy traversal, and a `resolve` cascade over one input.
 - A durable import run state machine with heartbeat leases and stale-run reclaim.
 - Ingestion: manifests describing a release, an artifact cache with checksum verification,
-  GeoJSON/CSV/shapefile providers, pluggable cache, downloader, command, notifier, and
-  runner adapters, and mix tasks for importing, publishing, and rolling back.
+  GeoJSON/CSV/shapefile/SimpleMaps providers, pluggable cache, downloader, command,
+  notifier, and runner adapters, and mix tasks for importing, publishing, and rolling
+  back.
 
 ## Why GeoGenius?
 
@@ -167,7 +168,7 @@ every file it is built from, at `<manifest_dir>/<collection>/<release>.json`:
   "release": "2026",
   "provider": "geojson",
   "requires_geometry": true,
-  "authority": { "key": "census", "name": "US Census Bureau" },
+  "authorities": [{ "key": "census", "name": "US Census Bureau" }],
   "area_types": [{ "key": "county", "rank": 200 }],
   "sources": [
     {

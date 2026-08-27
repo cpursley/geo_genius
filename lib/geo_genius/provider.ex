@@ -85,6 +85,24 @@ defmodule GeoGenius.Provider.Area do
           codes: [Code.t()],
           attributes: attributes()
         }
+
+  @doc """
+  The catalog key for an area: `authority_key`, `area_type_key` and `code`
+  joined by `:`.
+
+  This is the same composition PostgreSQL stores in `area.area_key`, which is
+  what makes the key a provider composes here addressable by every read.
+  `c:GeoGenius.Provider.asserted_relations/2` returns those keys as strings, so
+  this is how a provider names the two ends of an edge without re-deriving the
+  format. An area keyed `census`, `county`, `06075` is `"census:county:06075"`.
+
+  The agreement between this and the column is pinned by `GeoGenius.PipelineTest`,
+  once, rather than per caller.
+  """
+  @spec key(t()) :: String.t()
+  def key(%__MODULE__{} = area) do
+    "#{area.authority_key}:#{area.area_type_key}:#{area.code}"
+  end
 end
 
 defmodule GeoGenius.Provider do
@@ -122,13 +140,15 @@ defmodule GeoGenius.Provider do
   `normalize/2` takes no such list: it is pure, so a caller derives an area
   from a staged row with no environment and no adapter to substitute.
 
-  `area_types/0`, `artifacts/1`, and `relations/1` are byte-identical across
-  every provider this package ships, so their bodies live here as
-  `no_area_types/0`, `all_artifacts/1`, and `always_rebuild/1`; a provider
-  implements the callback with a one-line `defdelegate`, keeping its own
-  `@impl` and `@doc`. A provider whose collections do declare a fixed
-  hierarchy, or whose relations sometimes need none rebuilt, implements the
-  callback directly instead of delegating.
+  `area_types/0`, `artifacts/1`, `relations/1`, and `asserted_relations/2`
+  have one body most providers share, so those bodies live here as
+  `no_area_types/0`, `all_artifacts/1`, `always_rebuild/1`, and
+  `no_asserted_relations/2`; a provider implements the callback with a
+  one-line `defdelegate`, keeping its own `@impl` and `@doc`. A provider
+  whose collections declare a fixed hierarchy, whose relations need none
+  rebuilt, or whose rows carry a hierarchy in their columns implements the
+  callback directly instead of delegating -- `GeoGenius.Providers.SimpleMaps`
+  does all three.
 
   ## Option vocabulary across providers
 
@@ -146,8 +166,13 @@ defmodule GeoGenius.Provider do
   | alias names                  | `"alias_properties"`          | `"alias_columns"`          | `[]`                    |
   | free-form attributes         | `"attribute_properties"`      | `"attribute_columns"`      | `[]`                    |
   | external codes               | `"code_properties"`           | `"code_columns"`           | `[]`                    |
-  | authority                    | `"authority"` (shared key)     | `"authority"` (shared key)  | the manifest's own `authority.key` |
+  | authority                    | `"authority"` (shared key)     | `"authority"` (shared key)  | the manifest's own single authority |
   | delimiter                    | n/a                            | `"delimiter"`               | `","` (CSV only)        |
+
+  `GeoGenius.Providers.Shapefile` reads the GeoJSON vocabulary, since it
+  converts its archive before parsing it. `GeoGenius.Providers.SimpleMaps` is
+  outside this table entirely: it parses two fixed files, reads their columns
+  by name, and takes no options at all.
 
   Every string value this vocabulary reads out of a payload -- a code, a
   name, an attribute, an external code -- is trimmed before use, and a
@@ -207,14 +232,21 @@ defmodule GeoGenius.Provider do
             ) :: :ok | {:error, reason()}
 
   @doc """
-  Describes one staged row as an area.
+  Describes one staged row as an area, or as several.
 
   Returns `:skip` for a row that carries no area -- a header, a summary
   record, a feature with no usable code -- rather than an error, since that
   is an expected shape for some rows rather than a failure.
+
+  A list is for a source that denormalises a hierarchy into every row: a
+  city row that also carries its county and state describes all three, and
+  returning them together is cheaper and truer than staging the same row
+  once per level. Areas repeated across rows converge on `area_key`, so a
+  provider emits an implied parent from every row that implies it rather
+  than tracking which it has already emitted.
   """
   @callback normalize(manifest :: Manifest.t(), row :: Staging.Row.t()) ::
-              {:ok, Area.t()} | :skip | {:error, reason()}
+              {:ok, Area.t()} | {:ok, [Area.t()]} | :skip | {:error, reason()}
 
   @doc """
   Whether the areas this provider stages need `parent_area_id` relations
@@ -224,6 +256,42 @@ defmodule GeoGenius.Provider do
   for a provider whose collection carries no hierarchy.
   """
   @callback relations(manifest :: Manifest.t()) :: :rebuild | :none
+
+  @doc """
+  Relation edges this row asserts, which geometry cannot measure.
+
+  A source that carries its hierarchy in columns -- a county FIPS on every
+  city row, an admin parent code on every place -- knows edges no overlap
+  test can derive, and a source with no geometry at all has no other way to
+  express one. Each edge is `{parent_area_key, child_area_key,
+  relation_type}`, where `relation_type` is `"contains"`,
+  `"mostly_contains"`, or `"overlaps"`.
+
+  Both keys are the strings `GeoGenius.Provider.Area.key/1` composes. Build
+  the `%GeoGenius.Provider.Area{}` an edge names and take its key from there,
+  rather than joining the three parts by hand: an edge composed a second way
+  can name a key `normalize/2` never produced, and `GeoGenius.Catalog.put_relation/3`
+  refuses an area the release does not carry.
+
+  Composes with `relations/1` rather than replacing it: a provider whose
+  areas nest spatially may both rebuild measured relations and assert edges
+  the geometry does not carry. Edges are written after every area exists, so
+  an edge may reference an area any row emitted, not only its own.
+
+  Asserting an edge for a pair `relations/1` also rebuilds from geometry
+  overwrites that measurement: `GeoGenius.Catalog.put_relation/3` upserts on
+  the same `(parent_area_id, child_area_id)` pair, nulling
+  `intersection_area_m2`, `parent_coverage`, and `child_coverage` and
+  replacing the geometry-classified `relation_type` with the asserted one,
+  with no warning that a measurement was discarded. A provider returning
+  `:rebuild` should assert only pairs geometry cannot derive, keeping the two
+  sets of edges disjoint.
+  """
+  @callback asserted_relations(manifest :: Manifest.t(), row :: Staging.Row.t()) ::
+              [
+                {parent_area_key :: String.t(), child_area_key :: String.t(),
+                 relation_type :: String.t()}
+              ]
 
   @doc "No area types of its own; every manifest supplies its own `area_types`."
   @spec no_area_types() :: [Manifest.area_type()]
@@ -236,4 +304,8 @@ defmodule GeoGenius.Provider do
   @doc "Always rebuilds relations; the collection carries no hierarchy of its own to preserve."
   @spec always_rebuild(Manifest.t()) :: :rebuild
   def always_rebuild(%Manifest{}), do: :rebuild
+
+  @doc "Asserts no relations; the source carries no hierarchy in its columns."
+  @spec no_asserted_relations(Manifest.t(), Staging.Row.t()) :: []
+  def no_asserted_relations(%Manifest{}, %Staging.Row{}), do: []
 end

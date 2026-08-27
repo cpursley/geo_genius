@@ -67,6 +67,11 @@ defmodule GeoGenius.ConfigTest do
     assert Config.providers()["shapefile"] == GeoGenius.Providers.Shapefile
   end
 
+  test "resolves the shipped simplemaps provider with nothing registered" do
+    assert Config.provider!("simplemaps") == GeoGenius.Providers.SimpleMaps
+    assert Config.providers()["simplemaps"] == GeoGenius.Providers.SimpleMaps
+  end
+
   # A name resolving to a module that does not load is a configuration error.
   # Answering with the atom leaves manifest validation reading "module absent"
   # as "provider requires no options", which accepts every options block

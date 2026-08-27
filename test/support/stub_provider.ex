@@ -12,7 +12,7 @@ defmodule GeoGenius.StubProvider do
   # so one module covers every shape the pipeline has to survive:
   #
   #   "mode"      -- "default", "raise", "exit", "bad_kind", "bad_code_type",
-  #                  "stage_error", or "command_probe"
+  #                  "stage_error", "command_probe", or "bad_relation"
   #   "rows"      -- the row specs `stage/5` emits, each with "code", "name",
   #                  "area_type", and an optional GeoJSON "geometry"
   #   "relations" -- "rebuild" (default) or "none"
@@ -53,6 +53,18 @@ defmodule GeoGenius.StubProvider do
     case Map.get(options, "relations", "rebuild") do
       "none" -> :none
       "rebuild" -> :rebuild
+    end
+  end
+
+  # "bad_relation" names a child area no row -- this one or any other in the
+  # run -- ever produces, so `Catalog.put_relation/3` raises rather than
+  # writing anything: the fixture for a phase whose failure comes from the
+  # database, not from the provider's own validation.
+  @impl Provider
+  def asserted_relations(%Manifest{} = manifest, row) do
+    case mode(manifest) do
+      "bad_relation" -> [{"demo:region:north", "demo:region:ghost", "contains"}]
+      _other -> Provider.no_asserted_relations(manifest, row)
     end
   end
 

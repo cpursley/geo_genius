@@ -1,0 +1,51 @@
+{
+  "collection": "us_simplemaps",
+  "collection_name": "United States (SimpleMaps)",
+  "description": "States, counties, cities and ZIP codes of the United States, from the SimpleMaps US Cities and US Zips datasets",
+  "release": "2026-01",
+  "provider": "simplemaps",
+  "requires_geometry": false,
+  "source_date": "2026-01-01",
+  "authorities": [
+    { "key": "simplemaps", "name": "SimpleMaps" },
+    { "key": "census", "name": "US Census Bureau" },
+    { "key": "usps", "name": "US Postal Service" }
+  ],
+  "area_types": [
+    { "key": "state", "rank": 10 },
+    { "key": "county", "rank": 20 },
+    { "key": "city", "rank": 30 },
+    { "key": "zip", "rank": 40 }
+  ],
+  "sources": [
+    {
+      "source_key": "us_simplemaps:simplemaps",
+      "provider": "simplemaps",
+      "license": "LicenseRef-SimpleMaps",
+      "attribution": "SimpleMaps (simplemaps.com)",
+      "release_key": "2026-01",
+      "source_date": "2026-01-01",
+      "artifacts": [
+        {
+          "logical_name": "uscities",
+          "cache_key": "us_simplemaps/2026-01/uscities.csv",
+          "operator_supplied": true,
+          "format": "csv",
+          "required": true,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bytes": 1
+        },
+        {
+          "logical_name": "uszips",
+          "cache_key": "us_simplemaps/2026-01/uszips.csv",
+          "operator_supplied": true,
+          "format": "csv",
+          "required": true,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bytes": 1
+        }
+      ]
+    }
+  ],
+  "options": {}
+}

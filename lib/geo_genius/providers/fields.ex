@@ -30,8 +30,12 @@ defmodule GeoGenius.Providers.Fields do
   `code` and therefore a different `area_key`, creating a duplicate area
   instead of updating the existing one, and orphaning any `relation` rows
   keyed on the old code. A value that is entirely whitespace is treated the
-  same as an absent one: a blank code skips the row, a blank name or alias
-  is simply not added.
+  same as an absent one. What a provider does with an absent code is its own
+  call -- `GeoGenius.Providers.CSV` skips the row, since a manifest may name
+  a column its source fills only sometimes, while
+  `GeoGenius.Providers.SimpleMaps.Rows` fails it, since its source fills
+  every one of those columns in every row -- and a blank name or alias is
+  simply not added.
   """
   @spec presence(term()) :: String.t() | nil
   def presence(value) when is_binary(value) do

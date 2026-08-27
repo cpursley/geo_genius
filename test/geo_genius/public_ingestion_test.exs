@@ -120,10 +120,10 @@ defmodule GeoGenius.PublicIngestionTest do
         JOIN geo_genius.collection ON collection.id = authority.collection_id
         WHERE collection.key = $1 AND authority.key = $2
         """,
-        [collection, manifest.authority.key]
+        [collection, hd(manifest.authorities).key]
       )
 
-    assert authority_name == manifest.authority.name
+    assert authority_name == hd(manifest.authorities).name
 
     %Postgrex.Result{rows: [[rank]]} =
       TestRepo.query!(
@@ -714,7 +714,7 @@ defmodule GeoGenius.PublicIngestionTest do
         "provider" => "geojson",
         "requires_geometry" => false,
         "source_date" => "2026-01-15",
-        "authority" => %{"key" => collection, "name" => "Public Ingestion Ops"},
+        "authorities" => [%{"key" => collection, "name" => "Public Ingestion Ops"}],
         "area_types" => [%{"key" => "territory", "rank" => 100}],
         "sources" => [
           %{

@@ -25,7 +25,8 @@ defmodule GeoGenius.Config do
   @shipped_providers %{
     "geojson" => GeoGenius.Providers.GeoJSON,
     "csv" => GeoGenius.Providers.CSV,
-    "shapefile" => GeoGenius.Providers.Shapefile
+    "shapefile" => GeoGenius.Providers.Shapefile,
+    "simplemaps" => GeoGenius.Providers.SimpleMaps
   }
 
   @spec repo!(keyword()) :: module()

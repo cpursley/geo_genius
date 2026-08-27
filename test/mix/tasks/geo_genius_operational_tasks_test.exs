@@ -526,19 +526,24 @@ defmodule GeoGenius.OperationalTasksTest do
       assert_receive {:mix_shell, :info, [dropped]}
 
       remaining = Staging.leaked(context())
+      listed = listed_tables(dropped)
 
-      # The per-table loop below is the witness that every table went; this is
-      # the witness that the number the operator reads is the number that went.
-      # They catch disjoint mutations: a drop that stops after the first
-      # element still prints the full count, and a hard-coded count still
-      # passes every per-table check.
-      assert dropped =~ "dropped #{length(leaks)} leaked staging table(s)"
+      # The sweep drops every leaked table at the prefix, not only the two this
+      # test created, so the count it prints is not this test's to predict: an
+      # import another test left mid-flight puts a third table in the same
+      # window. The count is held against the tables the message itself lists
+      # instead. That still catches both mutations the pair is here for -- a
+      # hard-coded count disagrees with a listing of two, and a count taken
+      # before a drop that stopped partway disagrees with the shorter listing
+      # that drop produced.
+      assert reported_count(dropped) == length(listed)
+      assert length(listed) >= length(leaks)
 
-      # Asserted per table, not against the printed count: the count is derived
-      # from the list the task decided to drop, so it agrees with itself even
-      # when the drop stopped after the first element.
+      # Asserted per table rather than against the count, which is derived from
+      # the list the task decided to drop and so agrees with itself even when
+      # the drop stopped after the first element.
       for {run_id, table} <- leaks do
-        assert dropped =~ table
+        assert table in listed
         refute staging_table?("geo_genius", table)
         refute Enum.any?(remaining, fn {id, _table} -> id == run_id end)
       end
@@ -1184,7 +1189,7 @@ defmodule GeoGenius.OperationalTasksTest do
       "provider" => "geojson",
       "requires_geometry" => false,
       "source_date" => "2026-01-15",
-      "authority" => %{"key" => collection, "name" => "Operational Task Operations"},
+      "authorities" => [%{"key" => collection, "name" => "Operational Task Operations"}],
       "area_types" => [%{"key" => "territory", "rank" => 100}],
       "sources" => [
         %{
@@ -1272,6 +1277,21 @@ defmodule GeoGenius.OperationalTasksTest do
       assert Enum.any?(Staging.leaked(ctx), fn {id, _table} -> id == run_id end)
       {run_id, table}
     end)
+  end
+
+  # The count `mix geo_genius.sweep_staging` reports, and the table names it
+  # lists beneath that count -- one `  <table> (run <uuid>)` line each.
+  defp reported_count(message) do
+    [count] =
+      Regex.run(~r/dropped (\d+) leaked staging table\(s\)/, message, capture: :all_but_first)
+
+    String.to_integer(count)
+  end
+
+  defp listed_tables(message) do
+    ~r/^ +(staging_[0-9a-f]{32}) \(run /m
+    |> Regex.scan(message, capture: :all_but_first)
+    |> List.flatten()
   end
 
   # The byte offset of `needle` in `text`, for asserting the order two ids

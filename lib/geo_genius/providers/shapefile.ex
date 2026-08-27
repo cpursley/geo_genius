@@ -21,11 +21,12 @@ defmodule GeoGenius.Providers.Shapefile do
     4. Delegates the parse of the converted document to
        `GeoGenius.Providers.GeoJSON.stage/5`.
 
-  `normalize/2`, `required_options/0`, `area_types/0`, `artifacts/1`, and
-  `relations/1` all delegate to `GeoGenius.Providers.GeoJSON` unchanged: a
-  converted shapefile is a GeoJSON `FeatureCollection` by the time anything
-  downstream of `ogr2ogr` sees it, so the manifest options a release names
-  are the same ones `GeoGenius.Providers.GeoJSON` reads.
+  `normalize/2`, `required_options/0`, `area_types/0`, `artifacts/1`,
+  `relations/1`, and `asserted_relations/2` all delegate to
+  `GeoGenius.Providers.GeoJSON` unchanged: a converted shapefile is a GeoJSON
+  `FeatureCollection` by the time anything downstream of `ogr2ogr` sees it,
+  so the manifest options a release names are the same ones
+  `GeoGenius.Providers.GeoJSON` reads.
 
   This is the only shipped provider that needs GDAL installed -- a host
   publishing GeoJSON or CSV collections never installs it. `available?/2` on
@@ -136,6 +137,11 @@ defmodule GeoGenius.Providers.Shapefile do
   @doc "Delegates to `GeoGenius.Providers.GeoJSON.relations/1`: a converted shapefile's areas carry no hierarchy of their own; relations are always rebuilt."
   @spec relations(Manifest.t()) :: :rebuild | :none
   defdelegate relations(manifest), to: GeoJSON
+
+  @impl Provider
+  @doc "Delegates to `GeoGenius.Providers.GeoJSON.asserted_relations/2`: a converted shapefile carries no hierarchy in its columns beyond what its geometry already expresses."
+  @spec asserted_relations(Manifest.t(), Staging.Row.t()) :: []
+  defdelegate asserted_relations(manifest, row), to: GeoJSON
 
   defp default_work_dir do
     Path.join(System.tmp_dir!(), "geo_genius_shapefile_#{System.unique_integer([:positive])}")

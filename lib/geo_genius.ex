@@ -141,8 +141,8 @@ defmodule GeoGenius do
 
   `opts[:manifest]` is used as given; otherwise the manifest is loaded via
   `GeoGenius.Manifest.load/3` from `opts[:collection]` and `opts[:release]`
-  (both required in that case). Registering the collection, authority, area
-  types, source, source release, artifacts, and release-source link is
+  (both required in that case). Registering the collection, its authorities,
+  area types, source, source release, artifacts, and release-source link is
   idempotent, so importing the same release twice re-registers the same rows
   rather than duplicating them.
 
@@ -334,7 +334,7 @@ defmodule GeoGenius do
       requires_geometry: manifest.requires_geometry
     })
 
-    Catalog.upsert_authority(context, manifest.collection, manifest.authority)
+    Enum.each(manifest.authorities, &Catalog.upsert_authority(context, manifest.collection, &1))
     Enum.each(manifest.area_types, &Catalog.upsert_area_type(context, manifest.collection, &1))
 
     release_id =

@@ -14,7 +14,7 @@ defmodule GeoGenius.Providers.CSVTest do
       collection: "demo",
       release: "r1",
       provider: "csv",
-      authority: %{key: "demo", name: "Demo"},
+      authorities: [%{key: "demo", name: "Demo"}],
       area_types: [%{key: "place", rank: 100}],
       sources: [],
       options:
@@ -37,7 +37,7 @@ defmodule GeoGenius.Providers.CSVTest do
       collection: "demo",
       release: "r1",
       provider: "csv",
-      authority: %{key: "demo", name: "Demo"},
+      authorities: [%{key: "demo", name: "Demo"}],
       area_types: [%{key: "place", rank: 100}],
       sources: [],
       options: Map.merge(%{"area_type" => "place", "code_column" => "place_id"}, options)
@@ -273,12 +273,22 @@ defmodule GeoGenius.Providers.CSVTest do
     assert area.authority_key == "acme"
   end
 
-  test "returns an error instead of raising when the manifest has no authority" do
-    manifest = %{manifest() | authority: nil}
+  test "returns an error instead of raising when the manifest declares no authority" do
+    manifest = %{manifest() | authorities: []}
     row = %Staging.Row{artifact: "a", payload: %{"place_id" => "x"}, geom: nil}
 
     assert {:error, reason} = CSV.normalize(manifest, row)
     assert reason =~ "authority"
+  end
+
+  test "returns an error instead of picking one when the manifest declares several" do
+    authorities = [%{key: "demo", name: "Demo"}, %{key: "acme", name: "Acme"}]
+    manifest = %{manifest() | authorities: authorities}
+    row = %Staging.Row{artifact: "a", payload: %{"place_id" => "x"}, geom: nil}
+
+    assert {:error, reason} = CSV.normalize(manifest, row)
+    assert reason =~ "several authorities"
+    assert reason =~ "demo, acme"
   end
 
   test "the name column defaults to \"name\" when options gives no name_column" do

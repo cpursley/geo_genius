@@ -59,7 +59,7 @@ defmodule GeoGenius.Providers.ShapefileTest do
       collection: "demo",
       release: "r1",
       provider: "shapefile",
-      authority: %{key: "demo", name: "Demo"},
+      authorities: [%{key: "demo", name: "Demo"}],
       area_types: [%{key: "territory", rank: 100}],
       sources: [],
       options: %{

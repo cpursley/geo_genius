@@ -38,7 +38,7 @@ defmodule GeoGenius.ManifestTest do
     assert manifest.provider == "geojson"
     assert manifest.requires_geometry == true
     assert manifest.source_date == ~D[2026-01-15]
-    assert manifest.authority == %{key: "demo", name: "Demo Operations"}
+    assert manifest.authorities == [%{key: "demo", name: "Demo Operations"}]
     assert manifest.area_types == [%{key: "territory", rank: 100}]
     assert manifest.options["code_property"] == "territory_id"
   end
@@ -322,11 +322,84 @@ defmodule GeoGenius.ManifestTest do
     assert manifest.source_date == nil
   end
 
-  test "rejects a string where the authority object belongs, instead of raising" do
-    map = Map.put(valid_map(), "authority", "Demo Operations")
+  test "carries every authority a collection draws on, in the order declared" do
+    authorities = [
+      %{"key" => "census", "name" => "US Census Bureau"},
+      %{"key" => "usps", "name" => "US Postal Service"}
+    ]
+
+    map = Map.put(valid_map(), "authorities", authorities)
+
+    assert {:ok, manifest} = Manifest.from_map(map)
+
+    assert manifest.authorities == [
+             %{key: "census", name: "US Census Bureau"},
+             %{key: "usps", name: "US Postal Service"}
+           ]
+
+    assert Manifest.to_map(manifest)["authorities"] == authorities
+  end
+
+  test "rejects a manifest that declares no authorities, naming the field" do
+    map = Map.delete(valid_map(), "authorities")
 
     assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
-    assert reason =~ "authority"
+    assert reason =~ "authorities"
+  end
+
+  test "rejects an empty authorities list, naming the field" do
+    map = Map.put(valid_map(), "authorities", [])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ "authorities"
+  end
+
+  # A file written against the singular `authority` key decodes with no
+  # `authorities` at all. Accepting that as "declares none" would carry a
+  # manifest that names its authority in a key nothing reads all the way to
+  # `upsert_area`, which raises `:no_data_found` from PL/pgSQL partway through
+  # normalization. The stale key is caught here instead, at load.
+  test "rejects a manifest carrying the singular authority key instead of reading it" do
+    map =
+      valid_map()
+      |> Map.delete("authorities")
+      |> Map.put("authority", %{"key" => "demo", "name" => "Demo Operations"})
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ "authorities"
+  end
+
+  test "rejects a null authorities, instead of raising Enumerable errors on nil" do
+    map = Map.put(valid_map(), "authorities", nil)
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ "authorities"
+  end
+
+  test "rejects a bare object where the authorities list belongs, instead of raising" do
+    map = Map.put(valid_map(), "authorities", %{"key" => "demo", "name" => "Demo Operations"})
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ "authorities"
+  end
+
+  test "rejects authorities entries that are not objects, instead of raising" do
+    map = Map.put(valid_map(), "authorities", ["demo"])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ "authorities"
+  end
+
+  # Validation covers the documents `from_map/2` reads. A `%Manifest{}` built
+  # in Elixir skips it entirely, and without the enforced key it would default
+  # `authorities` to nil and surface as a Protocol.UndefinedError from
+  # registration's Enum.each rather than as an error naming the field.
+  test "refuses to build a manifest struct that names no authorities" do
+    fields = %{collection: "demo", release: "r1", provider: "geojson", sources: []}
+
+    error = assert_raise ArgumentError, fn -> struct!(Manifest, fields) end
+
+    assert Exception.message(error) =~ "authorities"
   end
 
   test "rejects a null area_types, instead of raising Enumerable errors on nil" do

@@ -86,7 +86,7 @@ defmodule GeoGenius.Manifest do
   alias GeoGenius.{Cache, Config, Files, ManifestError}
   alias GeoGenius.Manifest.{Artifact, Source}
 
-  @enforce_keys [:collection, :release, :provider, :sources]
+  @enforce_keys [:collection, :release, :provider, :authorities, :sources]
   defstruct [
     :collection,
     :collection_name,
@@ -95,7 +95,7 @@ defmodule GeoGenius.Manifest do
     :provider,
     :requires_geometry,
     :source_date,
-    :authority,
+    :authorities,
     :area_types,
     :sources,
     :options
@@ -103,6 +103,29 @@ defmodule GeoGenius.Manifest do
 
   @typedoc "One entry of a manifest's `area_types` list, or a provider's own default hierarchy."
   @type area_type :: %{key: String.t(), rank: pos_integer()}
+
+  @typedoc """
+  One entry of a manifest's `authorities` list: who is responsible for the
+  identifiers a set of areas is keyed under.
+
+  A collection may draw on more than one -- a US release keyed partly by the
+  Census, partly by the USPS, and partly by its own vendor identifiers names
+  all three -- so this is a list rather than a single value.
+
+  `authorities` is required and must name at least one, unlike `area_types`,
+  which a provider can supply from `area_types/0` when the manifest declares
+  none. No callback supplies authorities, so an empty list is a manifest that
+  can register no area at all: `upsert_area` resolves an authority with
+  `SELECT ... INTO STRICT` and raises `:no_data_found` deep in normalization.
+  Rejecting it here is what turns that into an error naming the field, at load.
+
+  `:authorities` is in `@enforce_keys` for the same reason. Validation covers
+  the documents `load/3` and `from_map/2` read; the enforced key covers a
+  `%GeoGenius.Manifest{}` built in Elixir, which would otherwise default the
+  field to `nil` and reach registration's `Enum.each/2` as a
+  `Protocol.UndefinedError` rather than an error naming the field.
+  """
+  @type authority :: %{key: String.t(), name: String.t()}
 
   @type t :: %__MODULE__{
           collection: String.t(),
@@ -112,7 +135,7 @@ defmodule GeoGenius.Manifest do
           provider: String.t(),
           requires_geometry: boolean(),
           source_date: Date.t() | nil,
-          authority: %{key: String.t(), name: String.t()} | nil,
+          authorities: [authority()],
           area_types: [area_type()],
           sources: [Source.t()],
           options: map()
@@ -207,7 +230,7 @@ defmodule GeoGenius.Manifest do
       "provider" => manifest.provider,
       "requires_geometry" => manifest.requires_geometry,
       "source_date" => date_to_iso8601(manifest.source_date),
-      "authority" => keys_to_strings(manifest.authority, [:key, :name]),
+      "authorities" => Enum.map(manifest.authorities, &keys_to_strings(&1, [:key, :name])),
       "area_types" => Enum.map(manifest.area_types, &keys_to_strings(&1, [:key, :rank])),
       "sources" => Enum.map(manifest.sources, &source_to_map/1),
       "options" => manifest.options
@@ -266,7 +289,8 @@ defmodule GeoGenius.Manifest do
          {:ok, source_maps} <- require_nonempty_list(map, "sources"),
          {:ok, sources} <- build_all(source_maps, &build_source/1),
          {:ok, source_date} <- parse_date(Map.get(map, "source_date"), "source_date"),
-         {:ok, authority} <- validate_authority(Map.get(map, "authority")),
+         {:ok, authority_maps} <- require_nonempty_list(map, "authorities"),
+         {:ok, authorities} <- build_all(authority_maps, &validate_authority/1),
          {:ok, area_types} <- validate_area_types(Map.get(map, "area_types", [])),
          :ok <- validate_options(provider, Map.get(map, "options", %{})) do
       fields = %{
@@ -274,7 +298,7 @@ defmodule GeoGenius.Manifest do
         release: release,
         provider_name: provider_name,
         source_date: source_date,
-        authority: authority,
+        authorities: authorities,
         area_types: area_types,
         sources: sources
       }
@@ -292,7 +316,7 @@ defmodule GeoGenius.Manifest do
       provider: fields.provider_name,
       requires_geometry: Map.get(map, "requires_geometry", false),
       source_date: fields.source_date,
-      authority: fields.authority,
+      authorities: fields.authorities,
       area_types: fields.area_types,
       sources: fields.sources,
       options: Map.get(map, "options", %{})
@@ -532,12 +556,10 @@ defmodule GeoGenius.Manifest do
   defp date_to_iso8601(nil), do: nil
   defp date_to_iso8601(%Date{} = date), do: Date.to_iso8601(date)
 
-  defp validate_authority(nil), do: {:ok, nil}
-
   defp validate_authority(map) when is_map(map), do: {:ok, strings_to_keys(map, ["key", "name"])}
 
   defp validate_authority(other),
-    do: {:error, "authority must be an object, got: #{inspect(other)}"}
+    do: {:error, "authorities entry must be an object, got: #{inspect(other)}"}
 
   defp validate_area_types(list) when is_list(list), do: build_all(list, &validate_area_type/1)
 
@@ -552,8 +574,6 @@ defmodule GeoGenius.Manifest do
   defp strings_to_keys(map, keys) when is_map(map) do
     Map.new(keys, fn key -> {String.to_atom(key), Map.get(map, key)} end)
   end
-
-  defp keys_to_strings(nil, _keys), do: nil
 
   defp keys_to_strings(map, keys) when is_map(map) do
     Map.new(keys, fn key -> {Atom.to_string(key), Map.get(map, key)} end)

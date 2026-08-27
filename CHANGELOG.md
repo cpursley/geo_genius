@@ -1,5 +1,63 @@
 # Changelog
 
+## Unreleased
+
+### Provider contract
+
+- **`asserted_relations/2` is a required callback.** A provider returns the relation edges
+  one staged row states outright, as `{parent_area_key, child_area_key, relation_type}`
+  tuples, for the hierarchy no overlap test can derive: a county FIPS on every city row, an
+  admin parent code on every place, or a source with no geometry at all. It composes with
+  `relations/1` rather than replacing it, and both land in the same release. **An
+  out-of-tree provider must add one line to keep compiling:**
+
+  ```elixir
+  @impl GeoGenius.Provider
+  defdelegate asserted_relations(manifest, row), to: GeoGenius.Provider, as: :no_asserted_relations
+  ```
+
+- **`normalize/2` may return a list of areas.** A source that denormalises a hierarchy into
+  every row -- a city row carrying its county and its state -- describes several areas, and
+  returning them together is cheaper and truer than staging the same row once per level.
+  Areas repeated across rows converge on `area_key`. Returning a single `{:ok, area}` is
+  unchanged.
+- **`GeoGenius.Provider.Area.key/1` is public.** It composes an area's catalog key --
+  `authority_key`, `area_type_key` and `code` joined by `:` -- which is the same
+  composition PostgreSQL stores in `area.area_key` and the string form both ends of an
+  asserted edge take. A provider asserting edges composes keys through it rather than
+  re-deriving the format.
+- **`GeoGenius.Manifest` enforces `:authorities`.** The field was already required and
+  non-empty at load; it is now in `@enforce_keys` too, so a `%GeoGenius.Manifest{}` built
+  in Elixir cannot default it to `nil` and reach registration as a `Protocol.UndefinedError`
+  instead of an error naming the field.
+- **The `relating` phase writes asserted edges** as well as rebuilding measured relations,
+  streaming staged rows in pages and heartbeating the run's lease between them. It measures
+  `asserted_relations` beside `relations`.
+
+### SimpleMaps provider
+
+- **`GeoGenius.Providers.SimpleMaps` (`"simplemaps"`)** parses the SimpleMaps US cities and
+  US ZIP codes datasets into states, counties, cities and ZIPs, ranked 10/20/30/40. Both
+  files denormalise the hierarchy into every row, so counties and states are read out of
+  columns rather than off rows of their own, and the whole hierarchy is asserted from the
+  FIPS columns -- the data carries centroids and no boundaries, so `relations/1` is `:none`.
+  It requires no manifest `options`; the artifact's `logical_name`, `uscities` or `uszips`,
+  selects the parser.
+- **Three authorities.** Cities key under `simplemaps`, counties and most states under
+  `census`, and ZIPs under `usps`. Six state codes key under `usps` as well: `AA`, `AE` and
+  `AP` are USPS military-mail constructs and `FM`, `PW` and `MH` are the Freely Associated
+  States, and the Census assigns none of the six an ANSI code. A host looking a state up by
+  code queries both `ansi_state` and `usps_state`, or misses those six.
+- **Row-scoped county validation.** A row whose `county_fips`, `county_fips_all`,
+  county-name or `county_weights` columns contradict each other fails the release, naming
+  the column and the row. Cross-file agreement is deliberately not checked: it cannot be
+  seen from a single row. A `uscities` row naming no county fails; a `uszips` row naming
+  none hangs its ZIP off its state directly.
+- **A shipped manifest**, `us_simplemaps`, declaring the collection, the three authorities,
+  the four ranked area types and both artifacts as operator-supplied cache keys. The files
+  are licensed downloads, so an operator places their copies in the cache and replaces each
+  artifact's `sha256` and `bytes` with those of the copy they licensed.
+
 ## v0.1.0
 
 Initial release: a versioned catalog of named geographic areas, installed into a
@@ -48,13 +106,17 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
   `%Geo.Polygon{}`/`%Geo.MultiPolygon{}`), never as WKT/EWKT text, and the host Repo must
   be configured with a Postgrex types module registering `Geo.PostGIS.Extension`.
 - **Manifests** — a reviewed JSON document per release, describing the collection, the
-  provider, the ranked area types, every source with its license and attribution, and
-  every artifact with its URL or operator-supplied cache key, expected SHA-256, expected
-  byte count, archive members, and whether it is required. `GeoGenius.Manifest` validates
-  every field and names the one that was wrong; `to_map/1` round-trips, so the manifest
-  stored on the release row rebuilds without touching the filesystem. Manifests are
-  searched for under `config :geo_genius, :manifest_paths`, with the package's own
-  directory last so a host-shipped correction wins.
+  provider, the authorities its areas are keyed under, the ranked area types, every source
+  with its license and attribution, and every artifact with its URL or operator-supplied
+  cache key, expected SHA-256, expected byte count, archive members, and whether it is
+  required. `GeoGenius.Manifest` validates every field and names the one that was wrong;
+  `to_map/1` round-trips, so the manifest stored on the release row rebuilds without
+  touching the filesystem. Manifests are searched for under
+  `config :geo_genius, :manifest_paths`, with the package's own
+  directory last so a host-shipped correction wins. `authorities` is a required, non-empty
+  list, because a collection may draw on more than one — a US release keyed partly by the
+  Census, partly by the USPS, and partly by a vendor's own identifiers names all three —
+  and every authority its areas are keyed under is registered when the release is opened.
 - **Artifact acquisition** — a cache checked before any download, so a rerun costs
   nothing and an operator-supplied file is the same lookup as a fetched one. Cache hits
   are hashed on every run, and `record_artifact_observation` in PostgreSQL is the only

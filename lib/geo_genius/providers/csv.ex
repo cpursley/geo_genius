@@ -34,7 +34,8 @@ defmodule GeoGenius.Providers.CSV do
   remaining `options` keys are optional:
 
     * `"name_column"` -- defaults to `"name"`.
-    * `"authority"` -- defaults to the manifest's `authority.key`.
+    * `"authority"` -- defaults to the manifest's own authority, when it
+      declares exactly one.
     * `"lon_column"` and `"lat_column"` -- both required together to build a
       centroid; neither alone.
     * `"attribute_columns"` -- a list; defaults to `[]`.
@@ -123,6 +124,11 @@ defmodule GeoGenius.Providers.CSV do
   @doc "CSV areas carry no hierarchy of their own; relations are always rebuilt."
   @spec relations(Manifest.t()) :: :rebuild
   defdelegate relations(manifest), to: Provider, as: :always_rebuild
+
+  @impl Provider
+  @doc "Asserts no relations; this format carries no hierarchy in its columns."
+  @spec asserted_relations(Manifest.t(), Staging.Row.t()) :: []
+  defdelegate asserted_relations(manifest, row), to: Provider, as: :no_asserted_relations
 
   defp parser_for(delimiter) do
     case Map.fetch(@parsers, delimiter) do

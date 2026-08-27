@@ -12,7 +12,8 @@ defmodule GeoGenius.Providers.GeoJSON do
   remaining `options` keys are optional:
 
     * `"name_property"` -- defaults to `"name"`.
-    * `"authority"` -- defaults to the manifest's `authority.key`.
+    * `"authority"` -- defaults to the manifest's own authority, when it
+      declares exactly one.
     * `"attribute_properties"` -- a list; defaults to `[]`.
     * `"alias_properties"` -- a list; defaults to `[]`.
     * `"code_properties"` -- a list of `%{"type" => ..., "property" => ...}`;
@@ -90,6 +91,11 @@ defmodule GeoGenius.Providers.GeoJSON do
   @doc "GeoJSON areas carry no hierarchy of their own; relations are always rebuilt."
   @spec relations(Manifest.t()) :: :rebuild
   defdelegate relations(manifest), to: Provider, as: :always_rebuild
+
+  @impl Provider
+  @doc "Asserts no relations; this format carries no hierarchy in its columns."
+  @spec asserted_relations(Manifest.t(), Staging.Row.t()) :: []
+  defdelegate asserted_relations(manifest, row), to: Provider, as: :no_asserted_relations
 
   defp read_document(path) do
     case Files.read(path) do

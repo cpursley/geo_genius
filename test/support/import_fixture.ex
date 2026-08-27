@@ -161,7 +161,7 @@ defmodule GeoGenius.ImportFixture do
       requires_geometry: manifest.requires_geometry
     })
 
-    Catalog.upsert_authority(context, manifest.collection, manifest.authority)
+    Enum.each(manifest.authorities, &Catalog.upsert_authority(context, manifest.collection, &1))
     Enum.each(manifest.area_types, &Catalog.upsert_area_type(context, manifest.collection, &1))
 
     release_id =
@@ -230,7 +230,7 @@ defmodule GeoGenius.ImportFixture do
       "provider" => "geojson",
       "requires_geometry" => false,
       "source_date" => "2026-01-15",
-      "authority" => %{"key" => collection, "name" => "Runner Fixture Operations"},
+      "authorities" => [%{"key" => collection, "name" => "Runner Fixture Operations"}],
       "area_types" => [%{"key" => "territory", "rank" => 100}],
       "sources" => [
         %{

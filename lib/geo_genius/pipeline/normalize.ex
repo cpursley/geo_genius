@@ -65,6 +65,9 @@ defmodule GeoGenius.Pipeline.Normalize do
       {:ok, %Area{} = area} ->
         continue(write_area(state, row, area, counts))
 
+      {:ok, areas} when is_list(areas) ->
+        continue(write_areas(state, row, areas, counts))
+
       {:error, reason} ->
         {:halt, {:error, "#{inspect(state.provider)} could not normalize a row: #{reason}"}}
     end
@@ -73,21 +76,28 @@ defmodule GeoGenius.Pipeline.Normalize do
   defp continue({:ok, _counts} = written), do: {:cont, written}
   defp continue({:error, _reason} = error), do: {:halt, error}
 
+  # Folds the row's areas in order, stopping at the first that cannot be
+  # written so a later area never masks an earlier failure.
+  defp write_areas(state, row, areas, counts) do
+    Enum.reduce_while(areas, {:ok, counts}, fn area, {:ok, acc} ->
+      case write_area(state, row, area, acc) do
+        {:ok, next} -> {:cont, {:ok, next}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  # `upsert_area/3` returns a uuid, but every write after it takes the area
+  # key, so it is composed through `Area.key/1`, which is the one Elixir-side
+  # statement of the format PostgreSQL composes `area_key` from. The pipeline
+  # test asserts the two agree rather than trusting that they do.
   defp write_area(state, row, area, counts) do
-    area_key = area_key(area)
+    area_key = Area.key(area)
 
     with :ok <- validate_names(state, area, area_key),
          :ok <- validate_codes(state, area, area_key) do
       put_area(state, row, area, area_key, counts)
     end
-  end
-
-  # `upsert_area/3` returns a uuid, but every write after it takes the area
-  # key, so it is composed here from the same three parts PostgreSQL composes
-  # `area_key` from. The pipeline test asserts the two agree rather than
-  # trusting that they do.
-  defp area_key(%Area{} = area) do
-    "#{area.authority_key}:#{area.area_type_key}:#{area.code}"
   end
 
   defp validate_names(state, %Area{names: names}, area_key) do

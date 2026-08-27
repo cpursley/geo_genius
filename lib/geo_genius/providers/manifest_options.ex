@@ -28,6 +28,12 @@ defmodule GeoGenius.Providers.ManifestOptions do
   @doc """
   Resolves the authority key from `options["authority"]`, falling back to the
   manifest's own authority when the option is absent.
+
+  The fallback needs the manifest to name exactly one authority. A manifest
+  declaring several is describing areas keyed under more than one, which one
+  option key cannot express, so it must say which under `"authority"` rather
+  than have the first entry chosen for it -- a silent choice would file every
+  area of the release under whichever authority happened to be listed first.
   """
   @spec authority_key(Manifest.t(), map()) :: {:ok, String.t()} | {:error, String.t()}
   def authority_key(manifest, options) do
@@ -107,10 +113,18 @@ defmodule GeoGenius.Providers.ManifestOptions do
     |> Enum.reject(&is_nil/1)
   end
 
-  defp authority_key_from_manifest(%Manifest{authority: %{key: key}}), do: {:ok, key}
+  defp authority_key_from_manifest(%Manifest{authorities: [%{key: key}]}), do: {:ok, key}
 
-  defp authority_key_from_manifest(%Manifest{authority: nil}) do
-    {:error, "manifest has no authority, and options has no \"authority\" override"}
+  defp authority_key_from_manifest(%Manifest{authorities: []}) do
+    {:error, "manifest declares no authority, and options has no \"authority\" override"}
+  end
+
+  defp authority_key_from_manifest(%Manifest{authorities: authorities}) do
+    keys = Enum.map_join(authorities, ", ", & &1.key)
+
+    {:error,
+     "manifest declares several authorities (#{keys}), so options must name the one this " <>
+       "source is keyed under, as \"authority\""}
   end
 
   defp official_name(payload, name_field) do

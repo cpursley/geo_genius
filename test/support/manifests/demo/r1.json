@@ -6,7 +6,7 @@
   "provider": "geojson",
   "requires_geometry": true,
   "source_date": "2026-01-15",
-  "authority": { "key": "demo", "name": "Demo Operations" },
+  "authorities": [{ "key": "demo", "name": "Demo Operations" }],
   "area_types": [{ "key": "territory", "rank": 100 }],
   "sources": [
     {

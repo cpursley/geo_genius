@@ -14,7 +14,7 @@ defmodule GeoGenius.Providers.GeoJSONTest do
       collection: "demo",
       release: "r1",
       provider: "geojson",
-      authority: %{key: "demo", name: "Demo"},
+      authorities: [%{key: "demo", name: "Demo"}],
       area_types: [%{key: "territory", rank: 100}],
       sources: [],
       options:
@@ -37,7 +37,7 @@ defmodule GeoGenius.Providers.GeoJSONTest do
       collection: "demo",
       release: "r1",
       provider: "geojson",
-      authority: %{key: "demo", name: "Demo"},
+      authorities: [%{key: "demo", name: "Demo"}],
       area_types: [%{key: "territory", rank: 100}],
       sources: [],
       options:
@@ -397,12 +397,22 @@ defmodule GeoGenius.Providers.GeoJSONTest do
     assert reason =~ "code_property"
   end
 
-  test "returns an error instead of raising when the manifest has no authority" do
-    manifest = %{manifest() | authority: nil}
+  test "returns an error instead of raising when the manifest declares no authority" do
+    manifest = %{manifest() | authorities: []}
     row = %Staging.Row{artifact: "a", payload: %{"territory_id" => "x"}, geom: nil}
 
     assert {:error, reason} = GeoJSON.normalize(manifest, row)
     assert reason =~ "authority"
+  end
+
+  test "returns an error instead of picking one when the manifest declares several" do
+    authorities = [%{key: "demo", name: "Demo"}, %{key: "acme", name: "Acme"}]
+    manifest = %{manifest() | authorities: authorities}
+    row = %Staging.Row{artifact: "a", payload: %{"territory_id" => "x"}, geom: nil}
+
+    assert {:error, reason} = GeoJSON.normalize(manifest, row)
+    assert reason =~ "several authorities"
+    assert reason =~ "demo, acme"
   end
 
   test "asks for relations to be rebuilt" do

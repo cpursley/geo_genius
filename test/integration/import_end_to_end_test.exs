@@ -909,7 +909,7 @@ defmodule GeoGenius.ImportEndToEndTest do
       "provider" => "geojson",
       "requires_geometry" => Keyword.get(opts, :requires_geometry, false),
       "source_date" => "2026-01-15",
-      "authority" => %{"key" => collection, "name" => "End-to-end Operations"},
+      "authorities" => [%{"key" => collection, "name" => "End-to-end Operations"}],
       "area_types" => [%{"key" => "territory", "rank" => 100}],
       "sources" => [
         %{
@@ -942,7 +942,7 @@ defmodule GeoGenius.ImportEndToEndTest do
       "provider" => "csv",
       "requires_geometry" => false,
       "source_date" => "2026-02-01",
-      "authority" => %{"key" => collection, "name" => "End-to-end Registry"},
+      "authorities" => [%{"key" => collection, "name" => "End-to-end Registry"}],
       "area_types" => [%{"key" => "district", "rank" => 100}],
       "sources" => [
         %{
