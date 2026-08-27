@@ -160,6 +160,15 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
   `staging_table_name`, `create_staging`, `drop_staging`, `analyze_release`, and
   `published_release`, plus the `import_run_status` and `release_artifacts` views.
 
+### Registration
+
+- **`GeoGenius.Registration.register/2`** writes the catalog rows a manifest describes --
+  the collection, its authorities and area types, the release, and every source, source
+  release and artifact -- and returns the release id. This is steps 2 through 6 of
+  `GeoGenius.import/1`, lifted out so a host or a test that claims an import run directly
+  registers through the same function the public entry point does, rather than
+  reimplementing it. Registration remains idempotent end to end.
+
 ### Deliberate deviations from the specification
 
 1. **`GeoGenius.Providers.Shapefile` ships in place of `Providers.Census`.** Nothing in

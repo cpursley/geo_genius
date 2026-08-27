@@ -17,6 +17,7 @@ defmodule GeoGenius.ImportFixture do
   alias GeoGenius.Catalog
   alias GeoGenius.Context
   alias GeoGenius.Manifest
+  alias GeoGenius.Registration
   alias GeoGenius.TestRepo
 
   @artifact Path.expand("artifacts/territories.geojson", __DIR__)
@@ -63,7 +64,7 @@ defmodule GeoGenius.ImportFixture do
     ExUnit.Callbacks.on_exit({__MODULE__, collection}, fn -> teardown!(collection) end)
 
     {:ok, manifest} = Manifest.from_map(manifest_map(collection, release_key))
-    release_id = register!(context, manifest)
+    release_id = Registration.register(context, manifest)
     seed_cache!(manifest, corrupt?)
 
     run_id =
@@ -151,58 +152,6 @@ defmodule GeoGenius.ImportFixture do
       )
 
     Enum.map(rows, fn [id] -> id end)
-  end
-
-  defp register!(context, %Manifest{} = manifest) do
-    Catalog.upsert_collection(context, %{
-      key: manifest.collection,
-      name: manifest.collection_name || manifest.collection,
-      description: manifest.description,
-      requires_geometry: manifest.requires_geometry
-    })
-
-    Enum.each(manifest.authorities, &Catalog.upsert_authority(context, manifest.collection, &1))
-    Enum.each(manifest.area_types, &Catalog.upsert_area_type(context, manifest.collection, &1))
-
-    release_id =
-      Catalog.open_release(context, manifest.collection, %{
-        release_key: manifest.release,
-        manifest: Manifest.to_map(manifest),
-        source_date: manifest.source_date
-      })
-
-    Enum.each(manifest.sources, &register_source!(context, manifest, release_id, &1))
-    release_id
-  end
-
-  defp register_source!(context, manifest, release_id, source) do
-    Catalog.upsert_source(context, manifest.collection, %{
-      source_key: source.source_key,
-      provider: source.provider,
-      license: source.license
-    })
-
-    source_release_id =
-      Catalog.upsert_source_release(context, manifest.collection, %{
-        source_key: source.source_key,
-        release_key: source.release_key,
-        source_date: source.source_date,
-        metadata: %{}
-      })
-
-    Catalog.attach_source_release(context, release_id, source_release_id)
-
-    Enum.each(source.artifacts, fn artifact ->
-      Catalog.put_artifact(context, source_release_id, %{
-        logical_name: artifact.logical_name,
-        url: artifact.url,
-        operator_supplied: artifact.operator_supplied,
-        format: artifact.format,
-        expected_sha256: artifact.sha256,
-        expected_bytes: artifact.bytes,
-        metadata: artifact.metadata
-      })
-    end)
   end
 
   defp seed_cache!(%Manifest{} = manifest, corrupt?) do

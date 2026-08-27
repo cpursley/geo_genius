@@ -16,6 +16,7 @@ defmodule GeoGenius.PipelineTest do
   alias GeoGenius.Provider.Area
   alias GeoGenius.Provider.Area.Name
   alias GeoGenius.RecordingRepo
+  alias GeoGenius.Registration
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
 
@@ -1004,7 +1005,7 @@ defmodule GeoGenius.PipelineTest do
 
   defp prepare_manifest(fixtures, map) do
     {:ok, manifest} = Manifest.from_map(map)
-    release_id = register!(fixtures.context, manifest)
+    release_id = Registration.register(fixtures.context, manifest)
 
     run_id =
       Catalog.begin_or_resume_import(fixtures.context, release_id, %{
@@ -1019,57 +1020,6 @@ defmodule GeoGenius.PipelineTest do
   # What `GeoGenius.import/1` will do before it calls the pipeline: the
   # collection, its authority and area types, the release opened with its
   # reviewed manifest, and every source release and artifact it composes.
-  defp register!(context, %Manifest{} = manifest) do
-    Catalog.upsert_collection(context, %{
-      key: manifest.collection,
-      name: manifest.collection_name || manifest.collection,
-      description: manifest.description,
-      requires_geometry: manifest.requires_geometry
-    })
-
-    Enum.each(manifest.authorities, &Catalog.upsert_authority(context, manifest.collection, &1))
-    Enum.each(manifest.area_types, &Catalog.upsert_area_type(context, manifest.collection, &1))
-
-    release_id =
-      Catalog.open_release(context, manifest.collection, %{
-        release_key: manifest.release,
-        manifest: Manifest.to_map(manifest),
-        source_date: manifest.source_date
-      })
-
-    Enum.each(manifest.sources, &register_source!(context, manifest, release_id, &1))
-    release_id
-  end
-
-  defp register_source!(context, manifest, release_id, source) do
-    Catalog.upsert_source(context, manifest.collection, %{
-      source_key: source.source_key,
-      provider: source.provider,
-      license: source.license
-    })
-
-    source_release_id =
-      Catalog.upsert_source_release(context, manifest.collection, %{
-        source_key: source.source_key,
-        release_key: source.release_key,
-        source_date: source.source_date,
-        metadata: %{}
-      })
-
-    Catalog.attach_source_release(context, release_id, source_release_id)
-
-    Enum.each(source.artifacts, fn artifact ->
-      Catalog.put_artifact(context, source_release_id, %{
-        logical_name: artifact.logical_name,
-        url: artifact.url,
-        operator_supplied: artifact.operator_supplied,
-        format: artifact.format,
-        expected_sha256: artifact.sha256,
-        expected_bytes: artifact.bytes,
-        metadata: artifact.metadata
-      })
-    end)
-  end
 
   defp geojson_manifest(fixtures, opts) do
     %{
