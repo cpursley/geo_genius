@@ -12,6 +12,9 @@ defmodule GeoGenius.Config do
   # objects -- or the catalog itself -- with it.
   @reserved_prefixes ~w(public information_schema pg_catalog pg_toast pg_temp)
 
+  # Thirty minutes; `await_timeout/1` documents why that is the default.
+  @default_await_timeout 1_800_000
+
   @adapter_defaults %{
     cache: GeoGenius.Caches.FileSystem,
     downloader: GeoGenius.Downloaders.Req,
@@ -29,22 +32,22 @@ defmodule GeoGenius.Config do
     "simplemaps" => GeoGenius.Providers.SimpleMaps
   }
 
-  @spec repo!(keyword()) :: module()
   @doc "Resolves the Repo from `opts[:repo]`, falling back to application environment."
+  @spec repo!(keyword()) :: module()
   def repo!(opts) do
     Keyword.get_lazy(opts, :repo, fn -> Application.fetch_env!(:geo_genius, :repo) end)
   end
 
-  @spec prefix(keyword()) :: String.t()
   @doc "Resolves and validates the prefix from `opts[:prefix]`, falling back to application environment."
+  @spec prefix(keyword()) :: String.t()
   def prefix(opts) do
     opts
     |> Keyword.get(:prefix, Application.get_env(:geo_genius, :prefix, "geo_genius"))
     |> validate_prefix!()
   end
 
-  @spec validate_prefix!(term()) :: String.t()
   @doc "Validates that a value is a safe PostgreSQL schema identifier, raising otherwise."
+  @spec validate_prefix!(term()) :: String.t()
   def validate_prefix!(prefix) when not is_binary(prefix) do
     raise ArgumentError, "PostgreSQL prefix must be a string"
   end
@@ -72,15 +75,14 @@ defmodule GeoGenius.Config do
     end
   end
 
-  @spec store(keyword()) :: module()
   @doc "Resolves the Store module from options, falling back to application environment."
+  @spec store(keyword()) :: module()
   def store(opts) do
     Keyword.get_lazy(opts, :store, fn ->
       Application.get_env(:geo_genius, :store, GeoGenius.Stores.Postgres)
     end)
   end
 
-  @spec adapter(atom(), keyword()) :: module()
   @doc """
   Resolves one adapter module from options, then application environment, then
   the shipped default.
@@ -88,6 +90,7 @@ defmodule GeoGenius.Config do
   `:runner` is resolved by `GeoGenius.Runner.configured/1` instead, because its
   default depends on which optional durable-execution package is loaded.
   """
+  @spec adapter(atom(), keyword()) :: module()
   def adapter(name, opts) when is_map_key(@adapter_defaults, name) do
     Keyword.get_lazy(opts, name, fn ->
       Application.get_env(:geo_genius, name, Map.fetch!(@adapter_defaults, name))
@@ -163,5 +166,19 @@ defmodule GeoGenius.Config do
       end)
 
     List.wrap(configured) ++ [Application.app_dir(:geo_genius, "priv/geo_genius/manifests")]
+  end
+
+  @doc """
+  Resolves `await/3`'s default timeout from `opts[:timeout]`, falling back to
+  application environment, then to #{@default_await_timeout}ms (thirty
+  minutes) -- comfortably past the ~17 minutes a full US SimpleMaps import
+  takes, without blocking a caller that never says otherwise for the length
+  of a genuinely hung run. `:infinity` is a valid value at every level.
+  """
+  @spec await_timeout(keyword()) :: timeout()
+  def await_timeout(opts) do
+    Keyword.get_lazy(opts, :timeout, fn ->
+      Application.get_env(:geo_genius, :await_timeout, @default_await_timeout)
+    end)
   end
 end

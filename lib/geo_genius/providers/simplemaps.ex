@@ -21,7 +21,7 @@ defmodule GeoGenius.Providers.SimpleMaps do
   alias GeoGenius.Files
   alias GeoGenius.Manifest
   alias GeoGenius.Provider
-  alias GeoGenius.Providers.Batch
+  alias GeoGenius.Providers.Delimited
   alias GeoGenius.Providers.SimpleMaps.Rows
   alias GeoGenius.Staging
 
@@ -70,12 +70,7 @@ defmodule GeoGenius.Providers.SimpleMaps do
           Provider.stage_opts()
         ) :: :ok | {:error, Provider.reason()}
   def stage(%Manifest{}, %Manifest.Artifact{} = artifact, path, emit, _opts) do
-    path
-    |> File.stream!()
-    |> NimbleCSV.RFC4180.parse_stream(skip_headers: false)
-    |> Stream.chunk_every(@chunk_size)
-    |> Enum.reduce_while(:pending, &stage_chunk(&1, artifact, emit, &2))
-    |> finish()
+    Delimited.stage(path, NimbleCSV.RFC4180, @chunk_size, emit, &row_for(&1, &2, artifact))
   rescue
     error in File.Error ->
       {:error, Files.format_error(path, error.reason)}
@@ -101,37 +96,10 @@ defmodule GeoGenius.Providers.SimpleMaps do
           [{String.t(), String.t(), String.t()}]
   def asserted_relations(%Manifest{}, %Staging.Row{} = row), do: Rows.edges(row)
 
-  defp finish(:pending), do: :ok
-  defp finish({:headers, _headers}), do: :ok
-  defp finish({:error, _reason} = error), do: error
-
-  defp stage_chunk([headers | rows], artifact, emit, :pending) do
-    stage_rows(rows, headers, artifact, emit)
-  end
-
-  defp stage_chunk(chunk, artifact, emit, {:headers, headers}) do
-    stage_rows(chunk, headers, artifact, emit)
-  end
-
-  defp stage_chunk(_chunk, _artifact, _emit, {:error, _reason} = error), do: {:halt, error}
-
-  defp stage_rows([], headers, _artifact, _emit), do: {:cont, {:headers, headers}}
-
-  defp stage_rows(values_rows, headers, artifact, emit) do
-    case Batch.rows(values_rows, &row_for(headers, artifact, &1)) do
-      {:ok, rows} ->
-        :ok = emit.(rows)
-        {:cont, {:headers, headers}}
-
-      {:error, _reason} = error ->
-        {:halt, error}
-    end
-  end
-
   # The header line names every column; each data line becomes a map keyed
   # by it, so a column this provider never reads is carried rather than
   # dropped.
-  defp row_for(headers, artifact, values) do
+  defp row_for(headers, values, artifact) do
     payload = headers |> Enum.zip(values) |> Map.new()
     {:ok, %Staging.Row{artifact: artifact.logical_name, payload: payload, geom: nil}}
   end

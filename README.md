@@ -74,7 +74,8 @@ Current tables:
 - `boundary`, `boundary_part`, `relation`, `release_area` (partitioned by release)
 - `import_run`, `import_run_lease`
 
-Current views: `release_areas`, `published_areas`, `published_area_codes`,
+Current views: `release_areas`, `release_area_codes`, `release_area_names`,
+`release_relations`, `published_areas`, `published_area_codes`,
 `published_area_names`, `published_area_relations`, `published_boundaries`,
 `import_run_status`, `release_artifacts`.
 
@@ -338,9 +339,9 @@ GeoGenius.areas_by_code("fips", "48201")
 
 Both calls resolve `:repo` and `:prefix` from `config :geo_genius, repo: ..., prefix:
 ...` unless a call overrides them. See [`guides/reading.md`](guides/reading.md) for every
-read, the shared option keys, what `%GeoGenius.AreaMatch{}` carries, and
-`GeoGenius.Query` for composing a catalog read with a host's own tables in one round
-trip.
+read, the shared option keys, what `%GeoGenius.AreaMatch{}` carries, the plural reads
+that resolve a whole list in one call, and `GeoGenius.Query` for composing a catalog read
+with a host's own tables in one round trip.
 
 Loading data has an Elixir API of its own: `GeoGenius.import/1` runs a manifest through
 the ingestion pipeline, and `GeoGenius.publish/2` and `GeoGenius.rollback/2` move the
@@ -364,11 +365,20 @@ SELECT * FROM geo_genius.resolve(input);
 SELECT * FROM geo_genius.children_of(parent_area_key);
 SELECT * FROM geo_genius.ancestors_of(child_area_key);
 
+-- Set-keyed reads: one call per list, not one call per element
+SELECT * FROM geo_genius.children_of_many(parent_area_keys);
+SELECT * FROM geo_genius.areas_by_code_many(code_type, code_values);
+
 -- Write
 SELECT geo_genius.upsert_collection(key, name, description, requires_geometry);
 SELECT geo_genius.upsert_area(collection_key, authority_key, area_type_key, code);
 SELECT geo_genius.put_area_in_release(release_id, area_key, centroid, data);
 SELECT geo_genius.put_boundary(release_id, area_key, source_release_id, geom);
+
+-- Set writes: one call per batch, not one call per row. Each scalar write above
+-- is its plural form called with one-element arrays.
+SELECT geo_genius.upsert_area_many(collection_key, authority_keys, area_type_keys, codes);
+SELECT geo_genius.put_area_in_release_many(release_id, area_keys, centroids, data);
 
 -- Lifecycle
 SELECT geo_genius.verify_release(release_id);
@@ -380,17 +390,28 @@ SELECT geo_genius.begin_or_resume_import(release_id, owner, runner_backend);
 SELECT geo_genius.advance_import(run_id, next_status, metrics_patch);
 ```
 
-Reads that only need the currently published release, with no resolution logic, join the
-`published_*` views instead — they resolve through the publication pointer, so no view
-takes a release argument:
+Reads that need no resolution logic join the read views instead. They come in pairs: a
+`release_*` base carrying every release, and a `published_*` view that is the base joined
+to the publication pointer, so a pointer swap changes what all of them show at once:
 
-| View                                               | Contains                                                                                  |
-|----------------------------------------------------|-------------------------------------------------------------------------------------------|
-| `release_areas`                                    | Every `release_area` membership row, release-scoped, published or not                     |
-| `published_areas`                                  | `release_areas` narrowed to the currently published release; includes retired areas       |
-| `published_area_codes` / `published_area_names`    | Codes and names for published areas                                                       |
-| `published_area_relations`                         | Relations among published areas                                                           |
-| `published_boundaries`                             | Boundary geometry for published areas                                                     |
+| View                                                  | Contains                                                                            |
+|-------------------------------------------------------|--------------------------------------------------------------------------------------|
+| `release_areas`                                       | Every `release_area` membership row, published or not                               |
+| `release_area_codes` / `release_area_names`           | Codes and names, one row per release carrying the area                              |
+| `release_relations`                                   | Every relation edge, published or not                                               |
+| `published_areas`                                     | `release_areas` narrowed to the currently published release; includes retired areas |
+| `published_area_codes` / `published_area_names`       | Codes and names for published areas                                                 |
+| `published_area_relations`                            | Relations among published areas                                                     |
+| `published_boundaries`                                | Boundary geometry for published areas                                               |
+
+`GeoGenius.Published` is the Elixir surface over those views: read-only Ecto schemas
+carrying every column, plus composable query functions (`areas/1`, `children_of/2`,
+`ancestors_of/2`, `areas_by_code/3`, `codes/1`, `names/1`, `relations/1`) that return an
+`Ecto.Query` a host joins and aggregates against its own tables. Use it for joins,
+aggregates, set-keyed reads, and anything keyed on `release_id`; use `GeoGenius` and
+`GeoGenius.Query` for spatial resolution, name search, and multi-level traversal. Its
+`:release_id` option reads a release whether or not its collection publishes it, by
+swapping every source in the query onto the `release_*` base views.
 
 See [`guides/installation.md`](guides/installation.md) for what `NULL` measurement columns
 on a `relation` row mean, why `max_depth` costs what it costs on a densely mutually-related
@@ -422,9 +443,13 @@ without polling.
   options, what `%AreaMatch{}` carries, and `GeoGenius.Query`
 - [`guides/ingestion.md`](guides/ingestion.md) — the manifest, providers, adapters,
   runners, the import phases, publication, and the operational mix tasks
+- [`guides/projections.md`](guides/projections.md) — keeping a source's own columns in a
+  host-owned table keyed `(release_id, area_key)`, and resolving the artifacts to fill it
+  from
 - [CHANGELOG](CHANGELOG.md) — releases
-- [`docs/design/geo-genius-design.md`](https://github.com/agoodway/geo_genius/blob/main/docs/design/geo-genius-design.md) —
-  the design spec the three plans were built from
+- [`docs/design/geo-genius-design.md`](docs/design/geo-genius-design.md) — the design spec:
+  what the catalog stores, why a release is immutable once published, and what the
+  library deliberately leaves to its host
 
 ## Testing
 

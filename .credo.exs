@@ -6,7 +6,7 @@
         included: ["lib/", "test/"],
         excluded: [~r"/_build/", ~r"/deps/"]
       },
-      plugins: [],
+      plugins: [{ExSlop, []}],
       requires: [],
       strict: false,
       parse_timeout: 5000,
@@ -83,21 +83,20 @@
           {Credo.Check.Warning.UnusedTupleOperation, []},
           {Credo.Check.Warning.WrongTestFileExtension, []},
 
-          # ExSlop flags AI-generated code patterns that experienced Elixir devs avoid.
-          {ExSlop.Check.Warning.BlanketRescue, []},
-          {ExSlop.Check.Warning.RescueWithoutReraise, []},
-          {ExSlop.Check.Warning.RepoAllThenFilter, []},
-          {ExSlop.Check.Warning.QueryInEnumMap, []},
-          {ExSlop.Check.Warning.GenserverAsKvStore, []},
-          {ExSlop.Check.Refactor.FilterNil, []},
-          {ExSlop.Check.Refactor.RejectNil, []},
-          {ExSlop.Check.Refactor.ReduceAsMap, []},
-          {ExSlop.Check.Refactor.MapIntoLiteral, []},
-          {ExSlop.Check.Refactor.IdentityPassthrough, []},
-          {ExSlop.Check.Refactor.IdentityMap, []},
-          {ExSlop.Check.Refactor.CaseTrueFalse, []},
-          {ExSlop.Check.Refactor.TryRescueWithSafeAlternative, []}
-        ],
+          # ExSlop flags AI-generated code patterns that experienced Elixir
+          # devs avoid. The recommended set is taken whole rather than
+          # hand-listed, so a check added upstream is picked up here.
+        ] ++
+          Enum.map(ExSlop.recommended_checks(), fn
+            # `assert length(list) == n` is idiomatic ExUnit and gives better
+            # failure output than pattern matching; test fixtures are small
+            # enough that the traversal this check guards against is irrelevant.
+            ExSlop.Check.Refactor.LengthComparison = check ->
+              {check, files: %{excluded: ["test/"]}}
+
+            check ->
+              {check, []}
+          end),
         disabled: [
           {Credo.Check.Refactor.UtcNowTruncate, []},
           {Credo.Check.Consistency.MultiAliasImportRequireUse, []},

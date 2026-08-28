@@ -556,7 +556,20 @@ defmodule GeoGenius.Manifest do
   defp date_to_iso8601(nil), do: nil
   defp date_to_iso8601(%Date{} = date), do: Date.to_iso8601(date)
 
-  defp validate_authority(map) when is_map(map), do: {:ok, strings_to_keys(map, ["key", "name"])}
+  # An authority entry names a key and a display name, both of which reach
+  # `upsert_authority` as NOT NULL columns. Validating them here is what makes
+  # a malformed entry an error naming the field at load, rather than a
+  # `CatalogError` naming a SQL function partway through registration. The
+  # list the entry came from is carried into the message, so an authority
+  # error cannot be read as an area type one.
+  defp validate_authority(map) when is_map(map) do
+    with {:ok, key} <- require_string(map, "key"),
+         {:ok, name} <- require_string(map, "name") do
+      {:ok, %{key: key, name: name}}
+    else
+      {:error, reason} -> {:error, "authorities entry #{reason}"}
+    end
+  end
 
   defp validate_authority(other),
     do: {:error, "authorities entry must be an object, got: #{inspect(other)}"}
@@ -566,14 +579,21 @@ defmodule GeoGenius.Manifest do
   defp validate_area_types(other),
     do: {:error, "area_types must be a list, got: #{inspect(other)}"}
 
-  defp validate_area_type(map) when is_map(map), do: {:ok, strings_to_keys(map, ["key", "rank"])}
+  # `rank` orders a collection's area types and is written to an integer
+  # column, so a quoted or absent rank is checked here for the same reason an
+  # authority's fields are: the failure names the field at load instead of
+  # failing a cast inside PL/pgSQL.
+  defp validate_area_type(map) when is_map(map) do
+    with {:ok, key} <- require_string(map, "key"),
+         {:ok, rank} <- require_positive_integer(map, "rank") do
+      {:ok, %{key: key, rank: rank}}
+    else
+      {:error, reason} -> {:error, "area_types entry #{reason}"}
+    end
+  end
 
   defp validate_area_type(other),
     do: {:error, "area_types entry must be an object, got: #{inspect(other)}"}
-
-  defp strings_to_keys(map, keys) when is_map(map) do
-    Map.new(keys, fn key -> {String.to_atom(key), Map.get(map, key)} end)
-  end
 
   defp keys_to_strings(map, keys) when is_map(map) do
     Map.new(keys, fn key -> {Atom.to_string(key), Map.get(map, key)} end)

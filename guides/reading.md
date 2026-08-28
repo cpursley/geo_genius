@@ -2,9 +2,11 @@
 
 `GeoGenius` wraps the SQL functions described in [`sql_api.md`](sql_api.md) in typed
 Elixir functions: ten reads that return `[%GeoGenius.AreaMatch{}]` (or, for
-`release_at/2`, a bare release id), plus `GeoGenius.Query` for the one case a
-struct-returning call cannot serve, joining catalog areas against a host's own tables in
-a single round trip. This guide covers both.
+`release_at/2`, a bare release id). Two composable query APIs sit alongside them:
+`GeoGenius.Published`, read-only Ecto schemas over the `published_*` views, which is
+where joins, aggregates and set-keyed reads belong; and `GeoGenius.Query`, the same
+`SETOF` functions shaped as a query, for the traversal and search a view has no form for.
+This guide covers all three.
 
 Everything here reads a published catalog. Getting data into one is the other half, and
 it has its own guide: [`ingestion.md`](ingestion.md) covers manifests, providers, the
@@ -61,7 +63,7 @@ the same meaning and the same default everywhere:
 | `:types`            | Restrict to these area type keys                               | no filter         |
 | `:release_id`       | Read a specific release instead of the currently published one | published release |
 | `:include_retired`  | Include retired areas                                          | `false`           |
-| `:limit`            | Row cap on `areas_near/4` and `search_areas/2`                 | `50`              |
+| `:limit`            | Row cap on `areas_near/4` and `search_areas/2`; `nil` for none | `50`              |
 | `:classifications`  | Restrict traversal to these `relation_type` values             | no filter         |
 | `:max_depth`        | Depth on `children_of/2` and `ancestors_of/2`                  | `1`               |
 | `:parent_area_key`  | Scope `areas_by_code/3` to one area's descendants              | no scope          |
@@ -176,6 +178,47 @@ Areas related to this one, one level out, in either direction. Accepts
 GeoGenius.related_areas("census:county:48201", classifications: ["overlaps"])
 ```
 
+## Resolving many seeds in one call
+
+`children_of/2`, `ancestors_of/2`, `related_areas/2`, and `areas_by_code/3` each answer for
+one seed, so answering for a list costs one round trip per element. Each has a plural
+sibling taking a list where the singular takes a string:
+
+| Plural read                                | Seeds are   | Singular it answers for |
+|--------------------------------------------|-------------|-------------------------|
+| `children_of_many/2`                       | area keys   | `children_of/2`         |
+| `ancestors_of_many/2`                      | area keys   | `ancestors_of/2`        |
+| `related_areas_many/2`                     | area keys   | `related_areas/2`       |
+| `areas_by_code_many/3`                     | code values | `areas_by_code/3`       |
+
+Each takes the same options as the singular beside it and returns
+`%GeoGenius.SeededMatch{}` rather than `%GeoGenius.AreaMatch{}`: a result mixes rows from
+every seed, so each row carries the seed that produced it in `:seed_key` and the ordinary
+`%AreaMatch{}` in `:match`.
+
+```elixir
+GeoGenius.children_of_many(county_keys, types: ["city"])
+|> Enum.group_by(& &1.seed_key, & &1.match)
+```
+
+The plural result for `[a, b]` is exactly the singular results for `a` and then for `b`,
+concatenated in the order the seeds were given. A seed that matched nothing contributes no
+rows rather than one row of nils, so a caller needing every seed represented supplies its
+own default. An empty list returns `[]` in one call; `nil` is an error, the way a `nil`
+singular seed is, and so is a `nil` element inside the list -- a silently skipped element
+would lose one seed out of thousands without a trace.
+
+What this saves is round trips, not per-seed work: the SQL still runs the singular read
+once per seed. Measured against 1,000 seeds over a 4,000-area release on a loopback
+connection, 1,000 `children_of/2` calls took 445ms and one `children_of_many/2` call took
+52ms; inside the database, with no round trips in either, the same work took 51ms and 37ms.
+Essentially all of the difference is the protocol, which is also why the gap widens on a
+database that is not on localhost.
+
+Neither shape lets the planner push a predicate into the read -- these are `SETOF` plpgsql
+functions. A caller joining catalog areas against its own tables, or aggregating over them,
+wants [`GeoGenius.Query`](#geogeniusquery) instead of either.
+
 ### `release_at/2`
 
 The release a collection had published as of a moment, or `nil` if it had published
@@ -210,17 +253,11 @@ of one type, so reading `codes["postal"]` always yields a list, even when it hol
 element.
 
 `attributes` is the release's own jsonb column, projected by every read and by the
-`release_areas` view a host joins against. GeoGenius ships no index on it, because no shipped
-function filters it - every read carries it through as a projection. A host that filters on it,
-with `attributes @> '{"lsad": "county"}'` or a jsonpath, should add its own GIN index:
-
-```sql
-CREATE INDEX my_app_release_area_attributes_idx
-  ON geo_genius.release_area USING gin (data jsonb_path_ops);
-```
-
-The column is named `data` on the table and surfaces as `attributes` on the view and the
-struct. Index it at the prefix the host installed GeoGenius at.
+`release_areas` view a host joins against. GeoGenius ships no index on it, and the keys
+inside it are the vendor's, not the library's - see
+[Indexing your own attribute keys](sql_api.md#indexing-your-own-attribute-keys) for the two
+index shapes that serve it, which one serves which predicate, and what the library
+guarantees about reaching partitions created by later imports.
 
 `coverage_of_input` and `coverage_of_area` are percentages, `0` to `100` - a polygon
 argument wholly inside a matched area reads `coverage_of_input: 100.0`. They are not the
@@ -230,26 +267,42 @@ appear on `%AreaMatch{}`. Reading `coverage_of_area` as a fraction, or `parent_c
 as a percentage, is silently wrong rather than out of range - both are valid floats on
 the wrong scale.
 
-## `GeoGenius.Query`
+## `GeoGenius.Published`
 
-`GeoGenius`'s struct-returning reads answer one question per call. `GeoGenius.Query`
-returns `Ecto.Query.t()` instead, so a host can join catalog areas against its own tables
-and aggregate in a single round trip - counting host records per area, for example,
-rather than issuing one catalog read per record.
+Read-only Ecto schemas over the catalog's read views, plus composable query functions that
+return `Ecto.Query.t()`. This is the read path for joins, aggregates, set-keyed reads, and
+anything that needs a column the `SETOF` functions do not project.
 
-It covers four of the ten reads: `children_of/2`, `ancestors_of/2`, `areas_by_code/3`,
-and `search_areas/2`, each selecting `area_key`, `area_type`, `name`, `centroid`, and
-`attributes` (plus `score` on `search_areas/2`). The option keys match the struct-returning
-API's for the same read.
+Two things separate it from `GeoGenius.Query`. A plpgsql `SETOF` function is an optimizer
+barrier -- PostgreSQL cannot push a predicate, a join qualifier, or a `LIMIT` inside one,
+so the whole set materialises before the host's own `WHERE` runs -- and the four
+function-backed queries select five of `area_match`'s sixteen columns. A view is an
+ordinary relation the planner optimises, and these schemas carry every column the view
+has, `release_id` included.
 
-Joining catalog areas from `children_of/2` against a host's own record table, counting
-records per area including areas with none:
+Each schema reads one of a pair of views: a `published_*` view by default, and its
+release-scoped base when a `:release_id` is given. A pair projects identical columns in
+identical order, so one schema reads either source.
+
+| Schema                            | Default view               | With `:release_id`   |
+|-----------------------------------|----------------------------|----------------------|
+| `GeoGenius.Published.Area`        | `published_areas`          | `release_areas`      |
+| `GeoGenius.Published.AreaCode`    | `published_area_codes`     | `release_area_codes` |
+| `GeoGenius.Published.AreaName`    | `published_area_names`     | `release_area_names` |
+| `GeoGenius.Published.AreaRelation`| `published_area_relations` | `release_relations`  |
+
+`areas/1`, `children_of/2`, `ancestors_of/2`, `areas_by_code/3`, `codes/1`, `names/1` and
+`relations/1` each return a query selecting whole structs, and each names its sources with
+an Ecto binding -- `:area`, `:relation`, `:code`, `:name` -- so composing further never
+means counting positions.
+
+Counting host records per city of a state, including cities with none:
 
 ```elixir
 import Ecto.Query
-alias GeoGenius.Query
+alias GeoGenius.Published
 
-from(area in subquery(Query.children_of("us:state:pa", types: ["city"])),
+from([area: area] in Published.children_of("us:state:pa", types: ["city"]),
   left_join: record in MyApp.Record,
   on: record.area_key == area.area_key,
   group_by: area.area_key,
@@ -259,8 +312,95 @@ from(area in subquery(Query.children_of("us:state:pa", types: ["city"])),
 |> MyApp.Repo.all()
 ```
 
-The subquery runs GeoGenius's SQL function, the outer query is ordinary Ecto over the
-host's own schema, and the whole thing is one round trip to Postgres.
+The library's own design has a host keep vendor columns in a projection table keyed
+`(release_id, area_key)`. Joining one needs `release_id` on both sides, which no
+function-backed read projects:
+
+```elixir
+from([area: area] in Published.areas(collections: ["us_counties"]),
+  join: projection in MyApp.CountyProjection,
+  on: projection.area_key == area.area_key and projection.release_id == area.release_id,
+  select: {area.name, projection.median_price}
+)
+```
+
+Where the function-backed API takes one `area_key`, these take a list, so resolving the
+parents of three thousand areas is one query rather than three thousand. A single binary
+is accepted as a one-element set. `children_of/2` and `ancestors_of/2` return one row per
+relation edge, so an area reachable from two of the parents given appears twice; the
+`:relation` binding says which parent each row came from:
+
+```elixir
+Published.ancestors_of(area_keys, types: ["state"])
+|> select([area: area, relation: relation], {relation.child_area_key, area.area_key})
+|> MyApp.Repo.all()
+```
+
+With no `:release_id` these read the currently published release of every collection,
+through the publication pointer each `published_*` view carries. Giving `:release_id`
+swaps every source in the query onto its release-scoped base and reads that release
+whether or not its collection publishes it -- what a host verifying a release, or filling
+a projection ahead of go-live, needs:
+
+```elixir
+Published.areas(release_id: staged_release_id, types: ["city"]) |> MyApp.Repo.all()
+```
+
+The swap is all-or-nothing across the sources in one query, and every join between two
+release-carrying sources equates their `release_id` as well as the key it joins on. Both
+together are what keep a read on one release: joining an edge to an area on `area_key`
+alone, or reading one source from a base and another from a published view, would pair a
+row of one release with a row of another.
+
+Retired areas are excluded unless `include_retired: true`, on the published and
+unpublished paths alike, matching every `SETOF` read.
+
+`codes/1`, `names/1` and `relations/1` cannot honour that and do not take the option:
+their views carry no `retired_at`, because retirement is a property of an area rather than
+of a code, a name, or an edge between two areas. So all three return rows for retired
+areas as well -- moving from `children_of/2` to `relations/1` to reach an edge's
+measurement columns silently widens the result. Join `areas/1` back on `area_key` and
+`release_id` to narrow it:
+
+```elixir
+from([relation: relation] in Published.relations(parent_area_keys: keys),
+  join: area in subquery(Published.areas()),
+  on: area.area_key == relation.child_area_key and area.release_id == relation.release_id,
+  select: {relation.child_area_key, relation.parent_coverage}
+)
+```
+
+What has no view-backed form, and stays with `GeoGenius` or `GeoGenius.Query`: spatial
+resolution, `resolve/2`, trigram name search, and a walk deeper than one relation hop.
+
+`GeoGenius.Published`'s schema prefix is fixed at compile time for the same reason
+`GeoGenius.Query`'s is, described below. Read it back with `GeoGenius.Published.prefix/0`
+when building SQL of your own against the same catalog.
+
+## `GeoGenius.Query`
+
+`GeoGenius`'s struct-returning reads answer one question per call. `GeoGenius.Query`
+returns `Ecto.Query.t()` instead, so a host can compose one further before running it.
+
+It covers four of the ten reads: `children_of/2`, `ancestors_of/2`, `areas_by_code/3`,
+and `search_areas/2`, each selecting `area_key`, `area_type`, `name`, `centroid`, and
+`attributes` (plus `score` on `search_areas/2`). The option keys match the struct-returning
+API's for the same read.
+
+These read through the `SETOF` functions, so a join or an aggregate over one pays the
+optimizer barrier and cannot see `release_id` or the other ten columns the select drops.
+Use `GeoGenius.Published` above for that. What these serve is the traversal and search a
+view has no form for: `:max_depth` walks and `search_areas/2`'s trigram ranking. An
+unpublished release is served either way -- `GeoGenius.Published`'s `:release_id` reaches
+one too.
+
+```elixir
+import Ecto.Query
+alias GeoGenius.Query
+
+Query.children_of("us:state:pa", types: ["city"], max_depth: 3)
+|> MyApp.Repo.all()
+```
 
 `GeoGenius.Query`'s schema prefix is fixed at compile time, not per call, and that is a
 hard limitation rather than an oversight: Ecto's `fragment/1` requires its SQL to be a

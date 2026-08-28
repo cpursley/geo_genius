@@ -111,3 +111,15 @@ BEGIN
   DELETE FROM geo_genius.collection WHERE id = demo_collection_id;
 END;
 $fn$;
+
+-- The type and code halves of an area key, which two collections keying the
+-- same areas under authorities of their own still share. area_key is unique
+-- across the whole catalog rather than within a collection, so a test that
+-- writes one input two ways into two collections cannot compare whole keys.
+CREATE OR REPLACE FUNCTION geo_genius_test.type_and_code(area_key text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $fn$
+  SELECT split_part(area_key, ':', 2) || ':' || split_part(area_key, ':', 3);
+$fn$;

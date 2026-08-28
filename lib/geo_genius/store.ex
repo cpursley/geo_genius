@@ -7,7 +7,7 @@ defmodule GeoGenius.Store do
   SQL API, where they are already specified and tested.
   """
 
-  alias GeoGenius.{AreaMatch, Context}
+  alias GeoGenius.{AreaMatch, Context, SeededMatch}
 
   @typedoc """
   A coordinate or a radius in metres.
@@ -29,6 +29,20 @@ defmodule GeoGenius.Store do
   @callback ancestors_of(Context.t(), String.t(), keyword()) :: [AreaMatch.t()]
   @callback related_areas(Context.t(), String.t(), keyword()) :: [AreaMatch.t()]
   @callback release_at(Context.t(), DateTime.t(), keyword()) :: Ecto.UUID.t() | nil
+
+  @typedoc """
+  The plural reads' seeds: many area keys, or many code values.
+
+  Each returned `GeoGenius.SeededMatch` carries the seed it came from, and a
+  seed that matched nothing contributes no row.
+  """
+  @type seeds :: [String.t()]
+
+  @callback children_of_many(Context.t(), seeds(), keyword()) :: [SeededMatch.t()]
+  @callback ancestors_of_many(Context.t(), seeds(), keyword()) :: [SeededMatch.t()]
+  @callback related_areas_many(Context.t(), seeds(), keyword()) :: [SeededMatch.t()]
+  @callback areas_by_code_many(Context.t(), String.t(), seeds(), keyword()) ::
+              [SeededMatch.t()]
 
   @backend_modules %{"postgres" => GeoGenius.Stores.Postgres}
 

@@ -472,7 +472,11 @@ defmodule GeoGenius.PipelineTest do
       {_manifest, _release_id, run_id} = prepare_stub(fixtures, mode: "raise")
       on_exit(fn -> drop_staging!(run_id) end)
 
-      RecordingRepo.fail_on("drop_staging")
+      # The run issues two drops: the staging phase empties the table before
+      # it writes to it, and the cleanup drops it afterwards. The cleanup is
+      # the second, and it is the one this case is about -- failing the first
+      # would fail the run in staging and never reach the provider's raise.
+      RecordingRepo.fail_on("drop_staging", after: 1)
 
       # An exception raised inside `after` replaces the value of the whole
       # `try`, so an unguarded cleanup would turn this recorded failure into a
@@ -538,6 +542,36 @@ defmodule GeoGenius.PipelineTest do
 
       assert {:error, _run} = Pipeline.execute(fixtures.context, failed_run, fixtures.opts)
       assert staging_table(failed_run) == nil
+    end
+
+    # An attempt killed where the cleanup above could not run -- a lost
+    # machine, a killed VM -- leaves its rows staged under its own run id, and
+    # `begin_or_resume_import` hands that same run to the next worker once the
+    # lease goes stale. Every phase runs again from the start, so the artifact
+    # is parsed into the table a second time. Appending to what is there
+    # doubles the staged rows, and the rows it doubles them with are the
+    # previous attempt's: a row the source no longer carries is normalized
+    # into the release anyway.
+    test "a second staging pass empties the table the first one left behind", fixtures do
+      {_manifest, release_id, run_id} = prepare_stub(fixtures, [])
+
+      Staging.create(fixtures.context, run_id)
+
+      Staging.insert(fixtures.context, run_id, [
+        %Staging.Row{
+          artifact: "territories.geojson",
+          payload: %{"code" => "ghost", "name" => "Ghost", "area_type" => "region"},
+          geom: nil
+        }
+      ])
+
+      assert Staging.count(fixtures.context, run_id) == 1
+
+      assert {:ok, run} = Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+
+      assert run.stage_metrics["staged"] == 1
+      assert run.stage_metrics["areas"] == 1
+      assert release_area_keys(release_id) == ["demo:region:north"]
     end
   end
 
@@ -1224,6 +1258,22 @@ defmodule GeoGenius.PipelineTest do
     )
 
     on_exit(fn -> :telemetry.detach("geo-genius-pipeline-test") end)
+  end
+
+  defp release_area_keys(release_id) do
+    %Postgrex.Result{rows: rows} =
+      TestRepo.query!(
+        """
+        SELECT area.area_key
+          FROM geo_genius.release_area
+          JOIN geo_genius.area ON area.id = release_area.area_id
+         WHERE release_area.release_id = $1
+         ORDER BY area.area_key
+        """,
+        [Ecto.UUID.dump!(release_id)]
+      )
+
+    List.flatten(rows)
   end
 
   defp drop_staging!(run_id) do

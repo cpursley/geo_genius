@@ -3,17 +3,23 @@ defmodule GeoGenius.Query do
   Composable Ecto queries over the catalog's read functions.
 
   `GeoGenius`'s struct-returning functions answer one question per call. These
-  return queries instead, so a host can join catalog areas against its own
-  tables and aggregate in a single round trip. Counting host records per area
-  is the case this exists for.
+  return queries instead, so a host can compose one further before running it.
 
-  Joins are on `area_key`. It is the catalog's stable identifier, it survives
-  re-import, and it is what a host stores as its own reference.
+  Every read here goes through a `SETOF` plpgsql function. PostgreSQL cannot
+  push a predicate, a join qualifier, or a `LIMIT` inside one, so the whole set
+  materialises before a host's own `WHERE` runs, and the selects below project
+  five of `area_match`'s sixteen columns -- `release_id` among the eleven they
+  drop. **Joining catalog areas against a host's own table and aggregating
+  belongs in `GeoGenius.Published`**, whose read-only schemas over the
+  `published_*` views give the planner an ordinary relation and the caller
+  every column. A host projection keyed `(release_id, area_key)` is joinable
+  only from there.
 
-      from(area in subquery(GeoGenius.Query.children_of("us:state:pa", types: ["city"])),
-        left_join: record in MyApp.Record, on: record.area_key == area.area_key,
-        group_by: area.area_key,
-        select: {area.area_key, count(record.id)})
+  What these serve, and a view has no form for: a walk deeper than one relation
+  hop through `:max_depth`, and `search_areas/2`'s trigram ranking. An
+  unpublished release is served either way -- here through `:release_id`, and
+  there through the option of the same name, which swaps the schemas onto the
+  release-scoped base views.
 
   Ecto requires a fragment's SQL to be a literal, so the schema prefix is read
   at compile time via `Application.compile_env/3` and validated the same way
@@ -141,7 +147,8 @@ defmodule GeoGenius.Query do
 
   Accepts `:collections`, `:types`, `:limit`, `:release_id`, and
   `:include_retired`. `:release_id` accepts the same two shapes as
-  `children_of/2`.
+  `children_of/2`. `:limit` defaults to 50 and takes `nil` for no cap, which
+  is what a caller narrowing the ranking afterwards asks for.
   """
   @spec search_areas(String.t(), keyword()) :: Ecto.Query.t()
   def search_areas(query, opts \\ []) do

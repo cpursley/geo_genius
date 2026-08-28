@@ -143,9 +143,11 @@ defmodule GeoGenius.Providers.Shapefile do
   @spec asserted_relations(Manifest.t(), Staging.Row.t()) :: []
   defdelegate asserted_relations(manifest, row), to: GeoJSON
 
-  defp default_work_dir do
-    Path.join(System.tmp_dir!(), "geo_genius_shapefile_#{System.unique_integer([:positive])}")
-  end
+  # The same fixed root the pipeline creates its per-run directories under.
+  # `stage/5` nests a uniquely named `shp_` directory inside it and removes
+  # that on the way out, so a direct call -- one that passes no `:work_dir` --
+  # leaves nothing behind rather than one empty directory per call.
+  defp default_work_dir, do: Path.join(System.tmp_dir!(), "geo_genius")
 
   defp stage_from_archive(manifest, artifact, path, emit, opts, command, extract_dir) do
     with :ok <- ensure_command_available(command, opts),

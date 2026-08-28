@@ -3,10 +3,13 @@ defmodule GeoGenius.Staging do
   The per-run landing area between an artifact and the catalog.
 
   A provider parses one artifact into rows here, and normalization reads them
-  back out one at a time. The indirection buys resumability: a run that fails
-  while normalizing resumes without re-downloading or re-parsing anything, and
-  a provider's parsing is testable against a table rather than against the
-  catalog's constraints.
+  back out one at a time. The indirection buys separation: normalization reads
+  one row shape whatever format the artifact arrived in, the catalog is
+  written to at a pace no parser sets, and a provider's parsing is testable
+  against a table rather than against the catalog's constraints.
+
+  It is not where a resumed run picks up. Every attempt stages afresh, so a
+  pass begins by emptying the run's table -- see `reset/2`.
 
   The table is created and dropped per run and is `UNLOGGED`, because its
   content is reproducible from a checksummed artifact and skipping WAL for a
@@ -62,6 +65,36 @@ defmodule GeoGenius.Staging do
   @doc "Creates a run's staging table, if it does not already exist, returning its name."
   @spec create(Context.t(), Ecto.UUID.t()) :: String.t()
   def create(%Context{} = context, run_id), do: Catalog.create_staging(context, run_id)
+
+  @doc """
+  Empties a run's staging table, creating it if it is not there, and returns
+  its name.
+
+  `create/2` alone is `CREATE UNLOGGED TABLE IF NOT EXISTS`, which is what a
+  staging pass wants on the second call and not what it wants on the second
+  attempt. A run whose worker died where the pipeline's own cleanup could not
+  run -- a killed VM, a lost machine -- leaves its rows behind under the same
+  run id, and the next attempt to stage that run parses the same artifact into
+  the same table again. The rows double, and the ones from the first attempt
+  are the ones the source has since changed: a row deleted upstream is still
+  staged, still normalized, and back in the release.
+
+  So a pass starts from a table that is empty by construction. The table is
+  dropped rather than truncated, which also resets the identity sequence the
+  keyset pagination in `stream/3` reads through, and leaves nothing of the
+  previous attempt's shape behind for this one to inherit.
+
+  Nothing is lost by emptying it: staging is not where a resumed run picks up.
+  `GeoGenius.Pipeline.execute/3` walks a resumed run through every phase from
+  downloading, so the rows an interrupted attempt staged would be re-staged
+  beside themselves rather than reused. What makes a retry cheap is the
+  artifact cache, which skips the network.
+  """
+  @spec reset(Context.t(), Ecto.UUID.t()) :: String.t()
+  def reset(%Context{} = context, run_id) do
+    :ok = drop(context, run_id)
+    create(context, run_id)
+  end
 
   @doc "Drops a run's staging table, if it exists."
   @spec drop(Context.t(), Ecto.UUID.t()) :: :ok

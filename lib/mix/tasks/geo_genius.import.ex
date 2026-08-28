@@ -8,7 +8,9 @@ defmodule Mix.Tasks.GeoGenius.Import do
     * `--release` - the release key to import (required)
     * `--publish` - publish the release once the import completes
     * `--await` - wait for the run to finish instead of returning its id
-    * `--timeout` - how long `--await` waits, in milliseconds (default 300000)
+    * `--timeout` - how long `--await` waits, in milliseconds; left out, it
+      resolves the way `GeoGenius.await/3` does, through
+      `config :geo_genius, :await_timeout` and then the library default
     * `--owner` - the owner recorded on the run's lease (default the node name)
     * `--repo` - the Ecto Repo to run against
     * `--prefix` - the PostgreSQL schema GeoGenius is installed in
@@ -33,6 +35,7 @@ defmodule Mix.Tasks.GeoGenius.Import do
 
   use Mix.Task
 
+  alias GeoGenius.Config
   alias GeoGenius.ImportRun
   alias GeoGenius.MixHelpers
 
@@ -48,8 +51,6 @@ defmodule Mix.Tasks.GeoGenius.Import do
     repo: :string,
     prefix: :string
   ]
-
-  @default_timeout 300_000
 
   @impl Mix.Task
   def run(args) do
@@ -73,7 +74,7 @@ defmodule Mix.Tasks.GeoGenius.Import do
           release: String.t(),
           publish: boolean(),
           await: boolean(),
-          timeout: pos_integer(),
+          timeout: timeout() | nil,
           owner: String.t() | nil
         }
   def parse_args(args) do
@@ -86,7 +87,7 @@ defmodule Mix.Tasks.GeoGenius.Import do
       release: MixHelpers.required!(opts, :release),
       publish: opts[:publish] || false,
       await: opts[:await] || false,
-      timeout: opts[:timeout] || @default_timeout,
+      timeout: opts[:timeout],
       owner: opts[:owner]
     }
   end
@@ -123,16 +124,25 @@ defmodule Mix.Tasks.GeoGenius.Import do
   end
 
   defp report(repo, %{await: true} = parsed, run_id) do
-    case GeoGenius.await(run_id, parsed.timeout, repo: repo, prefix: parsed.prefix) do
+    timeout = effective_timeout(parsed)
+
+    case GeoGenius.await(run_id, timeout, repo: repo, prefix: parsed.prefix) do
       {:ok, %ImportRun{}} ->
         Mix.shell().info("GeoGenius import run #{run_id} completed")
         :ok
 
       {:error, :timeout} ->
-        Mix.raise("GeoGenius import run #{run_id} did not finish within #{parsed.timeout}ms")
+        Mix.raise("GeoGenius import run #{run_id} did not finish within #{timeout}ms")
 
       {:error, %ImportRun{} = run} ->
         Mix.raise("GeoGenius import run #{run_id} failed: #{inspect(run.error)}")
     end
   end
+
+  # `--await` without `--timeout` has to reach the same resolution
+  # `GeoGenius.await/3` performs, which an argument passed here would win
+  # against. Resolving it once means the value the raise names is the value
+  # the wait actually used, whichever level supplied it.
+  defp effective_timeout(%{timeout: nil}), do: Config.await_timeout([])
+  defp effective_timeout(%{timeout: timeout}), do: Config.await_timeout(timeout: timeout)
 end

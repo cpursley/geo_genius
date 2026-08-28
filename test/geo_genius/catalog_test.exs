@@ -622,4 +622,187 @@ defmodule GeoGenius.CatalogTest do
     assert artifact["logical_name"] == "areas.geojson"
     assert artifact["source_release_id"] == source_release_id
   end
+
+  describe "set writes" do
+    test "upsert_area_many returns hyphenated ids in the caller's order",
+         %{context: context} do
+      open_demo(context)
+      Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+      Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
+      Catalog.upsert_area_type(context, "demo", %{key: "u", rank: 20})
+
+      ids =
+        Catalog.upsert_area_many(context, "demo", [
+          %{authority_key: "a", area_type_key: "t", code: "one"},
+          %{authority_key: "a", area_type_key: "u", code: "two"},
+          %{authority_key: "a", area_type_key: "t", code: "one"}
+        ])
+
+      assert [first, second, first] = ids
+      assert first != second
+      assert Enum.all?(ids, &String.contains?(&1, "-"))
+      assert Enum.all?(ids, &match?({:ok, _}, Ecto.UUID.cast(&1)))
+
+      # The three attrs are adjacent same-typed strings, so a wrapper that
+      # transposed :area_type_key and :code would still return two distinct
+      # ids. The composed area_key is what says which went where.
+      assert stored_area_keys(context, "demo") == ["a:t:one", "a:u:two"]
+    end
+
+    test "the plural writes cost no round trip at all for an empty batch",
+         %{context: context} do
+      recording = %{context | repo: GeoGenius.RecordingRepo}
+
+      assert Catalog.upsert_area_many(recording, "demo", []) == []
+      assert Catalog.put_area_name_many(recording, []) == []
+      assert Catalog.put_area_code_many(recording, []) == []
+      assert Catalog.put_area_in_release_many(recording, Ecto.UUID.generate(), []) == :ok
+      assert Catalog.put_relation_many(recording, Ecto.UUID.generate(), []) == :ok
+
+      refute_received {:query, _sql, _params, _opts}
+    end
+
+    test "an empty batch still refuses a release id that is not a uuid",
+         %{context: context} do
+      assert_raise ArgumentError, fn ->
+        Catalog.put_area_in_release_many(context, "not-a-uuid", [])
+      end
+
+      assert_raise ArgumentError, fn ->
+        Catalog.put_relation_many(context, "not-a-uuid", [])
+      end
+    end
+
+    test "names and codes land in the columns their keys name", %{context: context} do
+      open_demo(context)
+      Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+      Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
+
+      Catalog.upsert_area_many(context, "demo", [
+        %{authority_key: "a", area_type_key: "t", code: "c"}
+      ])
+
+      # Every value here is distinguishable from every other, so a wrapper
+      # that transposed :name with :kind, or :code_type with :code_value,
+      # fails rather than writing a legal-looking row.
+      Catalog.put_area_name_many(context, [
+        %{area_key: "a:t:c", name: "Ville", kind: "alias", locale: "fr"},
+        %{area_key: "a:t:c", name: "Town", kind: "official", locale: nil}
+      ])
+
+      Catalog.put_area_code_many(context, [
+        %{area_key: "a:t:c", code_type: "fips", code_value: "01001"}
+      ])
+
+      assert query_rows(context, """
+             SELECT name, kind, locale FROM geo_genius.area_name
+              WHERE area_id = (SELECT id FROM geo_genius.area WHERE area_key = 'a:t:c')
+              ORDER BY name
+             """) == [["Town", "official", nil], ["Ville", "alias", "fr"]]
+
+      assert query_rows(context, """
+             SELECT code_type, code_value FROM geo_genius.area_code
+              WHERE area_id = (SELECT id FROM geo_genius.area WHERE area_key = 'a:t:c')
+             """) == [["fips", "01001"]]
+    end
+
+    test "a membership batch binds a geography array carrying a nil element",
+         %{context: context} do
+      release_id = open_demo(context)
+      Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+      Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
+
+      Catalog.upsert_area_many(context, "demo", [
+        %{authority_key: "a", area_type_key: "t", code: "placed"},
+        %{authority_key: "a", area_type_key: "t", code: "unplaced"}
+      ])
+
+      assert :ok =
+               Catalog.put_area_in_release_many(context, release_id, [
+                 %{
+                   area_key: "a:t:placed",
+                   centroid: %Geo.Point{coordinates: {0.5, 1.5}, srid: 4326},
+                   attributes: %{"population" => 10}
+                 },
+                 %{area_key: "a:t:unplaced", centroid: nil, attributes: %{}}
+               ])
+
+      assert query_rows(context, """
+             SELECT area.area_key, ST_AsText(membership.centroid::geometry), membership.data
+               FROM geo_genius.release_area membership
+               JOIN geo_genius.area ON area.id = membership.area_id
+              ORDER BY area.area_key
+             """) == [
+               ["a:t:placed", "POINT(0.5 1.5)", %{"population" => 10}],
+               ["a:t:unplaced", nil, %{}]
+             ]
+    end
+
+    test "a relation batch keeps parent and child on the sides it was given",
+         %{context: context} do
+      release_id = open_demo(context)
+      Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+      Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
+
+      Catalog.upsert_area_many(context, "demo", [
+        %{authority_key: "a", area_type_key: "t", code: "over"},
+        %{authority_key: "a", area_type_key: "t", code: "under"}
+      ])
+
+      Catalog.put_area_in_release_many(context, release_id, [
+        %{area_key: "a:t:over", centroid: nil, attributes: %{}},
+        %{area_key: "a:t:under", centroid: nil, attributes: %{}}
+      ])
+
+      assert :ok =
+               Catalog.put_relation_many(context, release_id, [
+                 %{
+                   parent_area_key: "a:t:over",
+                   child_area_key: "a:t:under",
+                   relation_type: "mostly_contains"
+                 }
+               ])
+
+      assert query_rows(context, """
+             SELECT parent.area_key, child.area_key, edge.relation_type
+               FROM geo_genius.relation edge
+               JOIN geo_genius.area parent ON parent.id = edge.parent_area_id
+               JOIN geo_genius.area child ON child.id = edge.child_area_id
+             """) == [["a:t:over", "a:t:under", "mostly_contains"]]
+    end
+
+    test "an area key nothing carries raises rather than shortening the batch",
+         %{context: context} do
+      open_demo(context)
+      Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+      Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
+
+      Catalog.upsert_area_many(context, "demo", [
+        %{authority_key: "a", area_type_key: "t", code: "c"}
+      ])
+
+      assert_raise GeoGenius.CatalogError, fn ->
+        Catalog.put_area_name_many(context, [
+          %{area_key: "a:t:c", name: "Town", kind: "official", locale: nil},
+          %{area_key: "a:t:absent", name: "Nowhere", kind: "official", locale: nil}
+        ])
+      end
+    end
+  end
+
+  defp stored_area_keys(context, collection_key) do
+    context
+    |> query_rows("""
+    SELECT area.area_key FROM geo_genius.area
+      JOIN geo_genius.collection ON collection.id = area.collection_id
+     WHERE collection.key = '#{collection_key}'
+     ORDER BY area.area_key
+    """)
+    |> Enum.map(fn [area_key] -> area_key end)
+  end
+
+  defp query_rows(%Context{repo: repo}, sql) do
+    %Postgrex.Result{rows: rows} = repo.query!(sql, [])
+    rows
+  end
 end

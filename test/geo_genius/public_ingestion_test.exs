@@ -290,6 +290,23 @@ defmodule GeoGenius.PublicIngestionTest do
     assert GeoGenius.await(run_id, 300, @repo_opts) == {:error, :timeout}
   end
 
+  test "await/3 with no explicit timeout resolves through app env, not the library default" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    assert {:ok, run_id} =
+             GeoGenius.import(Keyword.merge(@repo_opts, manifest: manifest, runner: NoopRunner))
+
+    Application.put_env(:geo_genius, :await_timeout, 300)
+    on_exit(fn -> Application.delete_env(:geo_genius, :await_timeout) end)
+
+    # A run that never finishes and no explicit `timeout` argument: this
+    # times out inside the test's own window only because the app-env value
+    # above overrode the thirty-minute library default -- the resolution
+    # `await/3` is supposed to make, not one this test waits out.
+    assert GeoGenius.await(run_id, nil, @repo_opts) == {:error, :timeout}
+  end
+
   test "publish/2 publishes a verified release and published_release/2 reflects it" do
     {collection, release} = fresh_collection!()
     manifest = build_manifest(collection, release)
@@ -343,7 +360,7 @@ defmodule GeoGenius.PublicIngestionTest do
     # fails, which is what a connection dying between the two looks like. A
     # rescue drawn around both reports the committed publication as an error
     # and drops the event.
-    RecordingRepo.fail_on("SELECT manifest FROM")
+    RecordingRepo.fail_on("SELECT collection.key FROM")
 
     assert {:ok, ^release_id} =
              GeoGenius.publish(release_id,
@@ -575,6 +592,17 @@ defmodule GeoGenius.PublicIngestionTest do
     # timeout.
     assert {:ok, %GeoGenius.ImportRun{status: "completed"}} =
              GeoGenius.await(run_id, 2_000, @repo_opts)
+  end
+
+  test "await/3's default timeout resolves an explicit argument over app env over the " <>
+         "library default" do
+    assert GeoGenius.Config.await_timeout([]) == 1_800_000
+
+    Application.put_env(:geo_genius, :await_timeout, 42_000)
+    on_exit(fn -> Application.delete_env(:geo_genius, :await_timeout) end)
+
+    assert GeoGenius.Config.await_timeout([]) == 42_000
+    assert GeoGenius.Config.await_timeout(timeout: 7_000) == 7_000
   end
 
   test "await/3 accepts :infinity without crashing and still observes a later transition" do

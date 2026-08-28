@@ -25,7 +25,7 @@ defmodule GeoGenius.Commands.System do
   @command_not_found 127
   @not_executable 126
   @cd_missing 127
-  @passthrough_opts [:cd, :env, :stderr_to_stdout]
+  @passthrough_opts [:cd, :env]
 
   @impl GeoGenius.Command
   @spec available?(String.t(), keyword()) :: boolean()

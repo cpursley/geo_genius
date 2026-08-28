@@ -402,6 +402,73 @@ defmodule GeoGenius.ManifestTest do
     assert Exception.message(error) =~ "authorities"
   end
 
+  # An entry that names no key or no name cannot register an authority:
+  # `upsert_authority` writes NOT NULL columns, so an entry validated no
+  # further than "is a map" dies as a `CatalogError` naming a SQL function
+  # partway through the import. Checking the entry's own fields is what keeps
+  # the moduledoc's promise that a failure names the field, at load.
+  test "rejects an authorities entry that names no key, naming the field" do
+    map = Map.put(valid_map(), "authorities", [%{}])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "authorities entry key is required"
+  end
+
+  test "rejects an authorities entry that names no name, naming the field" do
+    map = Map.put(valid_map(), "authorities", [%{"key" => "census"}])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "authorities entry name is required"
+  end
+
+  test "rejects an authorities entry whose key is not a string, naming the field" do
+    map = Map.put(valid_map(), "authorities", [%{"key" => 10, "name" => "US Census Bureau"}])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "authorities entry key must be a string, got: 10"
+  end
+
+  # `rank` orders the area types of a collection, and `upsert_area_type`
+  # writes it to an integer column. A quoted rank is the shape a hand-edited
+  # manifest reaches for, and it fails the cast in PL/pgSQL rather than here
+  # unless the entry's fields are checked.
+  test "rejects an area_types entry that names no key, naming the field" do
+    map = Map.put(valid_map(), "area_types", [%{"rank" => 100}])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "area_types entry key is required"
+  end
+
+  test "rejects an area_types entry that names no rank, naming the field" do
+    map = Map.put(valid_map(), "area_types", [%{"key" => "state"}])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "area_types entry rank is required"
+  end
+
+  test "rejects an area_types entry whose rank is not a positive integer, naming the field" do
+    map = Map.put(valid_map(), "area_types", [%{"key" => "state", "rank" => "10"}])
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "area_types entry rank must be a positive integer, got: \"10\""
+  end
+
+  # The first failing entry is the one reported: a later well-formed entry
+  # does not mask an earlier malformed one, and the message says which list
+  # the entry came from rather than only which field.
+  test "reports the first malformed entry of a list whose other entries are valid" do
+    authorities = [
+      %{"key" => "census", "name" => "US Census Bureau"},
+      %{"key" => "usps"},
+      %{"key" => "simplemaps", "name" => "SimpleMaps"}
+    ]
+
+    map = Map.put(valid_map(), "authorities", authorities)
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason == "authorities entry name is required"
+  end
+
   test "rejects a null area_types, instead of raising Enumerable errors on nil" do
     map = Map.put(valid_map(), "area_types", nil)
 

@@ -18,7 +18,9 @@ defmodule GeoGenius.InstallIntegrationTest do
     publish_release rollback_publication retire_releases begin_or_resume_import
     heartbeat_import advance_import fail_import areas_for_point areas_for_geometry
     areas_near areas_by_code search_areas children_of ancestors_of related_areas
+    areas_by_code_many children_of_many ancestors_of_many related_areas_many
     resolve assert_release_mutable assert_area_in_collection area_codes_json release_at
+    assert_seed_keys
     upsert_source upsert_source_release put_artifact record_artifact_observation
     open_release attach_source_release staging_table_name create_staging drop_staging
     analyze_release published_release
@@ -252,6 +254,9 @@ defmodule GeoGenius.InstallIntegrationTest do
 
     assert "published_areas" in view_names("geo_genius"), "missing published_areas view"
     assert "area_match" in type_names("geo_genius"), "missing area_match type"
+
+    assert "seeded_area_match" in type_names("geo_genius"),
+           "missing seeded_area_match type"
 
     names = function_names("geo_genius")
 

@@ -143,7 +143,7 @@ SELECT results_eq(
     geo_genius.staging_table_name((SELECT id FROM geo_genius.import_run LIMIT 1))
   ),
   ARRAY[1],
-  'create_staging does not discard already-staged rows on a resumed run'
+  'create_staging keeps rows already in the table rather than replacing it'
 );
 
 SELECT geo_genius.drop_staging((SELECT id FROM geo_genius.import_run LIMIT 1));

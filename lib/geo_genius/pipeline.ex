@@ -30,7 +30,15 @@ defmodule GeoGenius.Pipeline do
   the run would roll back the very progress `begin_or_resume_import` resumes
   from, and would hold one connection for the length of the slowest phase.
 
-  ## Staging is always dropped
+  ## Staging is emptied before it is written and dropped after
+
+  Every phase runs on every attempt, a resumed run included, so the staging
+  phase re-parses the artifact it staged before rather than reading what is
+  already there. It therefore starts from an empty table for the run --
+  `GeoGenius.Staging.reset/2` -- so an attempt that died where the cleanup
+  below could not run does not leave its rows to be staged a second time
+  beside the new ones, or to be normalized from a source that has since
+  changed.
 
   The staging table is dropped in an `after`, on success and on failure alike.
   Keeping it would only help a retry that reuses the same `run_id`, which
@@ -453,7 +461,7 @@ defmodule GeoGenius.Pipeline do
   end
 
   defp stage(%State{} = state) do
-    Staging.create(state.context, state.run.run_id)
+    Staging.reset(state.context, state.run.run_id)
     counter = :counters.new(1, [])
 
     state.resolved

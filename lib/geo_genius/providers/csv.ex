@@ -54,10 +54,10 @@ defmodule GeoGenius.Providers.CSV do
   alias GeoGenius.Manifest
   alias GeoGenius.Provider
   alias GeoGenius.Provider.Area
-  alias GeoGenius.Providers.Batch
   alias GeoGenius.Providers.CSV.Parsers.Pipe
   alias GeoGenius.Providers.CSV.Parsers.Semicolon
   alias GeoGenius.Providers.CSV.Parsers.Tab
+  alias GeoGenius.Providers.Delimited
   alias GeoGenius.Providers.Fields
   alias GeoGenius.Providers.ManifestOptions
   alias GeoGenius.Staging
@@ -158,46 +158,13 @@ defmodule GeoGenius.Providers.CSV do
   end
 
   defp stage_file(path, parser, coord_columns, artifact, emit) do
-    path
-    |> File.stream!()
-    |> parser.parse_stream(skip_headers: false)
-    |> Stream.chunk_every(@chunk_size)
-    |> Enum.reduce_while(:pending, &stage_chunk(&1, coord_columns, artifact, emit, &2))
-    |> finish()
+    Delimited.stage(path, parser, @chunk_size, emit, &row_for(&1, &2, coord_columns, artifact))
   rescue
     error in File.Error ->
       {:error, Files.format_error(path, error.reason)}
 
     error in NimbleCSV.ParseError ->
       {:error, "could not parse #{path} as delimited text: #{Exception.message(error)}"}
-  end
-
-  defp finish(:pending), do: :ok
-  defp finish({:headers, _headers}), do: :ok
-  defp finish({:error, _reason} = error), do: error
-
-  defp stage_chunk([headers | rows], coord_columns, artifact, emit, :pending) do
-    stage_rows(rows, headers, coord_columns, artifact, emit)
-  end
-
-  defp stage_chunk(chunk, coord_columns, artifact, emit, {:headers, headers}) do
-    stage_rows(chunk, headers, coord_columns, artifact, emit)
-  end
-
-  defp stage_chunk(_chunk, _coord_columns, _artifact, _emit, {:error, _reason} = error),
-    do: {:halt, error}
-
-  defp stage_rows([], headers, _coord_columns, _artifact, _emit), do: {:cont, {:headers, headers}}
-
-  defp stage_rows(values_rows, headers, coord_columns, artifact, emit) do
-    case Batch.rows(values_rows, &row_for(headers, &1, coord_columns, artifact)) do
-      {:ok, rows} ->
-        :ok = emit.(rows)
-        {:cont, {:headers, headers}}
-
-      {:error, _reason} = error ->
-        {:halt, error}
-    end
   end
 
   defp row_for(headers, values, coord_columns, artifact) do

@@ -6,12 +6,12 @@ defmodule GeoGenius.MixHelpers do
   @setup_switches [repo: :string, prefix: :string, with_extensions: :boolean]
   @upgrade_switches [repo: :string, prefix: :string, from: :integer, to: :integer]
 
+  @doc "Strictly parses setup-task Repo, prefix, and extension-flag arguments."
   @spec parse_setup_args([String.t()]) :: %{
           repo: module() | nil,
           prefix: String.t(),
           with_extensions: boolean()
         }
-  @doc "Strictly parses setup-task Repo, prefix, and extension-flag arguments."
   def parse_setup_args(args) do
     opts = parse_strict!(args, @setup_switches)
 
@@ -22,13 +22,13 @@ defmodule GeoGenius.MixHelpers do
     }
   end
 
+  @doc "Strictly parses an adjacent-upgrade task invocation."
   @spec parse_upgrade_args([String.t()]) :: %{
           repo: module() | nil,
           prefix: String.t(),
           from: non_neg_integer(),
           to: pos_integer()
         }
-  @doc "Strictly parses an adjacent-upgrade task invocation."
   def parse_upgrade_args(args) do
     opts = parse_strict!(args, @upgrade_switches)
     from = required_integer!(opts, :from)
@@ -46,16 +46,16 @@ defmodule GeoGenius.MixHelpers do
     }
   end
 
-  @spec validate_prefix!(String.t()) :: String.t()
   @doc "Validates a PostgreSQL prefix, raising a `Mix.raise/1` error for an invalid one."
+  @spec validate_prefix!(String.t()) :: String.t()
   def validate_prefix!(prefix) do
     Config.validate_prefix!(prefix)
   rescue
     ArgumentError -> Mix.raise("invalid PostgreSQL prefix: #{inspect(prefix)}")
   end
 
-  @spec start_repo(module()) :: {boolean(), pid()}
   @doc "Starts a Repo if it is not already running, returning whether this call started it."
+  @spec start_repo(module()) :: {boolean(), pid()}
   def start_repo(repo) do
     {:ok, _} = Application.ensure_all_started(:ecto_sql)
     {:ok, _} = Application.ensure_all_started(:postgrex)
@@ -70,8 +70,8 @@ defmodule GeoGenius.MixHelpers do
     end
   end
 
-  @spec resolve_repo(module() | nil) :: module()
   @doc "Resolves an explicit Repo or the first Repo configured by the host project."
+  @spec resolve_repo(module() | nil) :: module()
   def resolve_repo(repo) when is_atom(repo) and not is_nil(repo), do: repo
 
   def resolve_repo(nil) do
@@ -89,7 +89,6 @@ defmodule GeoGenius.MixHelpers do
     end
   end
 
-  @spec validate_transition!(non_neg_integer(), pos_integer(), pos_integer()) :: :ok
   @doc """
   Validates that a requested transition is available in the package catalog.
 
@@ -97,6 +96,7 @@ defmodule GeoGenius.MixHelpers do
   target any available version. An upgrade of an existing install must be
   adjacent, one version at a time.
   """
+  @spec validate_transition!(non_neg_integer(), pos_integer(), pos_integer()) :: :ok
   def validate_transition!(0, to, current) when to > current do
     Mix.raise("target version #{to} is unavailable; current version is #{current}")
   end
@@ -113,9 +113,9 @@ defmodule GeoGenius.MixHelpers do
 
   def validate_transition!(_from, _to, _current), do: :ok
 
+  @doc "Builds the exact pinned migration callback body shared by all generators."
   @spec migration_body(String.t(), non_neg_integer(), pos_integer(), pos_integer(), boolean()) ::
           String.t()
-  @doc "Builds the exact pinned migration callback body shared by all generators."
   def migration_body(prefix, from, to, current_version, with_extensions) do
     validate_transition!(from, to, current_version)
 
@@ -137,8 +137,8 @@ defmodule GeoGenius.MixHelpers do
       "def down, do: GeoGenius.Migration.down(prefix: #{inspect(prefix)}, version: #{from})\n"
   end
 
-  @spec render_wrapper(String.t(), keyword()) :: String.t()
   @doc "Replaces an exact empty Ecto scaffold with a pinned GeoGenius migration wrapper."
+  @spec render_wrapper(String.t(), keyword()) :: String.t()
   def render_wrapper(generated, opts) do
     prefix = Keyword.fetch!(opts, :prefix)
     from = Keyword.fetch!(opts, :from)
@@ -161,8 +161,8 @@ defmodule GeoGenius.MixHelpers do
     end
   end
 
-  @spec without_ecto_editor((-> result)) :: result when result: term()
   @doc "Runs a callback with `ECTO_EDITOR` cleared, then restores its exact previous state."
+  @spec without_ecto_editor((-> result)) :: result when result: term()
   def without_ecto_editor(fun) when is_function(fun, 0) do
     previous = System.get_env("ECTO_EDITOR")
     System.delete_env("ECTO_EDITOR")
@@ -174,9 +174,9 @@ defmodule GeoGenius.MixHelpers do
     end
   end
 
+  @doc "Generates and safely rewrites exactly one host-owned Ecto migration file."
   @spec generate_wrapper!(module(), String.t(), String.t(), non_neg_integer(), pos_integer()) ::
           String.t()
-  @doc "Generates and safely rewrites exactly one host-owned Ecto migration file."
   def generate_wrapper!(repo, migration_name, prefix, from, to) do
     generate_wrapper!(repo, migration_name, prefix, from, to, [])
   end
@@ -229,7 +229,6 @@ defmodule GeoGenius.MixHelpers do
     Mix.Task.reenable("ecto.gen.migration")
   end
 
-  @spec parse_strict!([String.t()], keyword()) :: keyword()
   @doc """
   Strictly parses one task invocation, raising for anything the task did not declare.
 
@@ -237,6 +236,7 @@ defmodule GeoGenius.MixHelpers do
   mistakes on a task that changes what every host of a catalog sees, so
   neither is accepted silently.
   """
+  @spec parse_strict!([String.t()], keyword()) :: keyword()
   def parse_strict!(args, switches) do
     case OptionParser.parse(args, strict: switches) do
       {opts, [], []} -> opts
@@ -245,13 +245,13 @@ defmodule GeoGenius.MixHelpers do
     end
   end
 
-  @spec repo_option(String.t() | nil) :: module() | nil
   @doc "Resolves a `--repo` string into a module, leaving an absent one as nil."
+  @spec repo_option(String.t() | nil) :: module() | nil
   def repo_option(nil), do: nil
   def repo_option(name), do: Module.concat([name])
 
-  @spec required!(keyword(), atom()) :: String.t()
   @doc "Reads a required string option, raising a message naming the option when it is absent."
+  @spec required!(keyword(), atom()) :: String.t()
   def required!(opts, key) do
     case Keyword.fetch(opts, key) do
       {:ok, value} when is_binary(value) -> value
@@ -259,7 +259,6 @@ defmodule GeoGenius.MixHelpers do
     end
   end
 
-  @spec release_label(String.t() | nil) :: String.t()
   @doc """
   Renders a release id for operator output, naming an absent publication.
 
@@ -267,10 +266,10 @@ defmodule GeoGenius.MixHelpers do
   collection that has published nothing as `nil`, neither of which is what an
   operator reading a terminal is looking at.
   """
+  @spec release_label(String.t() | nil) :: String.t()
   def release_label(nil), do: "none"
   def release_label(release_id) when is_binary(release_id), do: release_id
 
-  @spec reason_message(term()) :: String.t()
   @doc """
   Renders a failure reason as one line for `Mix.raise/1`.
 
@@ -279,6 +278,7 @@ defmodule GeoGenius.MixHelpers do
   runner backend chose for an enqueue failure, so all three shapes reach a
   task's error path.
   """
+  @spec reason_message(term()) :: String.t()
   def reason_message(reason) when is_exception(reason), do: Exception.message(reason)
   def reason_message(reason) when is_binary(reason), do: reason
   def reason_message(reason), do: inspect(reason)

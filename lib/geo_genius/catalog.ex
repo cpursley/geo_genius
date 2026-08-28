@@ -84,6 +84,33 @@ defmodule GeoGenius.Catalog do
     ])
   end
 
+  @doc """
+  Creates or updates every area in `areas`, returning their ids in the order
+  they were given.
+
+  Each map carries `:authority_key`, `:area_type_key`, and `:code`. The three
+  cross as parallel arrays and are written by one statement, so a batch costs
+  one round trip rather than one per area, and `upsert_area/3` is this
+  function with a one-element list. An area named twice in one batch -- the
+  county every city row of that county describes -- is written once and its id
+  returned at both positions.
+
+  Returns `[]` without touching the database for an empty list.
+  """
+  @spec upsert_area_many(Context.t(), String.t(), [map()]) :: [Ecto.UUID.t()]
+  def upsert_area_many(context, collection_key, areas)
+
+  def upsert_area_many(%Context{}, _collection_key, []), do: []
+
+  def upsert_area_many(%Context{} = context, collection_key, areas) do
+    scalar_list(context, "upsert_area_many", "$1, $2, $3, $4", [
+      collection_key,
+      Enum.map(areas, &Map.fetch!(&1, :authority_key)),
+      Enum.map(areas, &Map.fetch!(&1, :area_type_key)),
+      Enum.map(areas, &Map.fetch!(&1, :code))
+    ])
+  end
+
   @doc "Sets one of an area's names, returning the name row's id."
   @spec put_area_name(Context.t(), String.t(), map()) :: Ecto.UUID.t()
   def put_area_name(%Context{} = context, area_key, attrs) do
@@ -92,6 +119,30 @@ defmodule GeoGenius.Catalog do
       Map.fetch!(attrs, :name),
       Map.fetch!(attrs, :kind),
       Map.get(attrs, :locale)
+    ])
+  end
+
+  @doc """
+  Sets every name in `names`, returning the name rows' ids in the order they
+  were given.
+
+  Each map carries `:area_key`, `:name`, `:kind`, and an optional `:locale`.
+  This is `put_area_name/3` over a whole batch, in one round trip; `:locale`
+  is the one field that may be `nil`.
+
+  Returns `[]` without touching the database for an empty list.
+  """
+  @spec put_area_name_many(Context.t(), [map()]) :: [Ecto.UUID.t()]
+  def put_area_name_many(context, names)
+
+  def put_area_name_many(%Context{}, []), do: []
+
+  def put_area_name_many(%Context{} = context, names) do
+    scalar_list(context, "put_area_name_many", "$1, $2, $3, $4", [
+      Enum.map(names, &Map.fetch!(&1, :area_key)),
+      Enum.map(names, &Map.fetch!(&1, :name)),
+      Enum.map(names, &Map.fetch!(&1, :kind)),
+      Enum.map(names, &Map.get(&1, :locale))
     ])
   end
 
@@ -106,6 +157,28 @@ defmodule GeoGenius.Catalog do
   end
 
   @doc """
+  Sets every external code in `codes`, returning the code rows' ids in the
+  order they were given.
+
+  Each map carries `:area_key`, `:code_type`, and `:code_value`. This is
+  `put_area_code/3` over a whole batch, in one round trip.
+
+  Returns `[]` without touching the database for an empty list.
+  """
+  @spec put_area_code_many(Context.t(), [map()]) :: [Ecto.UUID.t()]
+  def put_area_code_many(context, codes)
+
+  def put_area_code_many(%Context{}, []), do: []
+
+  def put_area_code_many(%Context{} = context, codes) do
+    scalar_list(context, "put_area_code_many", "$1, $2, $3", [
+      Enum.map(codes, &Map.fetch!(&1, :area_key)),
+      Enum.map(codes, &Map.fetch!(&1, :code_type)),
+      Enum.map(codes, &Map.fetch!(&1, :code_value))
+    ])
+  end
+
+  @doc """
   Places an area into a release with its centroid and release-scoped
   attributes.
   """
@@ -116,6 +189,34 @@ defmodule GeoGenius.Catalog do
       area_key,
       Map.fetch!(attrs, :centroid),
       Map.get(attrs, :attributes, %{})
+    ])
+  end
+
+  @doc """
+  Places every area in `memberships` into one release, in one round trip.
+
+  Each map carries `:area_key`, `:centroid`, and optional `:attributes`.
+  Membership is last-write-wins, so an area named twice in one batch keeps the
+  last of the two, exactly as two `put_area_in_release/4` calls would leave it.
+
+  Returns `:ok` without touching the database for an empty list, having
+  validated `release_id` first, so a malformed release id fails the way it
+  would for a batch that had rows.
+  """
+  @spec put_area_in_release_many(Context.t(), Ecto.UUID.t(), [map()]) :: :ok
+  def put_area_in_release_many(context, release_id, memberships)
+
+  def put_area_in_release_many(%Context{}, release_id, []) do
+    dump_uuid(release_id)
+    :ok
+  end
+
+  def put_area_in_release_many(%Context{} = context, release_id, memberships) do
+    void(context, "put_area_in_release_many", "$1, $2, $3, $4", [
+      dump_uuid(release_id),
+      Enum.map(memberships, &Map.fetch!(&1, :area_key)),
+      Enum.map(memberships, &Map.fetch!(&1, :centroid)),
+      Enum.map(memberships, &Map.get(&1, :attributes, %{}))
     ])
   end
 
@@ -142,6 +243,33 @@ defmodule GeoGenius.Catalog do
       Map.fetch!(attrs, :parent_area_key),
       Map.fetch!(attrs, :child_area_key),
       Map.fetch!(attrs, :relation_type)
+    ])
+  end
+
+  @doc """
+  Asserts every relation in `relations` within one release, in one round trip.
+
+  Each map carries `:parent_area_key`, `:child_area_key`, and
+  `:relation_type`. A pair asserted twice in one batch keeps the last
+  `:relation_type`, the way two `put_relation/3` calls would leave it.
+
+  Returns `:ok` without touching the database for an empty list, having
+  validated `release_id` first.
+  """
+  @spec put_relation_many(Context.t(), Ecto.UUID.t(), [map()]) :: :ok
+  def put_relation_many(context, release_id, relations)
+
+  def put_relation_many(%Context{}, release_id, []) do
+    dump_uuid(release_id)
+    :ok
+  end
+
+  def put_relation_many(%Context{} = context, release_id, relations) do
+    void(context, "put_relation_many", "$1, $2, $3, $4", [
+      dump_uuid(release_id),
+      Enum.map(relations, &Map.fetch!(&1, :parent_area_key)),
+      Enum.map(relations, &Map.fetch!(&1, :child_area_key)),
+      Enum.map(relations, &Map.fetch!(&1, :relation_type))
     ])
   end
 
@@ -397,15 +525,40 @@ defmodule GeoGenius.Catalog do
   `"source_release_key"`, `"collection_key"`, `"logical_name"`, `"url"`,
   `"operator_supplied"`, `"format"`, `"expected_sha256"`, `"expected_bytes"`,
   `"observed_sha256"`, `"observed_bytes"`, `"validated_at"`, and `"metadata"`.
-  The two uuid columns are cast to text.
+  The two uuid columns are cast to text. Ordered by `logical_name`, so a caller
+  reading a release twice sees the same sequence: the view carries no ordering
+  of its own, and a caller that needs one has no way to add it.
   """
   @spec release_artifacts(Context.t(), Ecto.UUID.t()) :: [map()]
   def release_artifacts(%Context{} = context, release_id) do
     sql =
       "SELECT #{@artifact_columns} FROM \"#{context.prefix}\".release_artifacts " <>
-        "WHERE release_id = $1"
+        "WHERE release_id = $1 ORDER BY logical_name"
 
     read(context, sql, [dump_uuid(release_id)], "release_artifacts", &rows_to_maps/1)
+  end
+
+  @doc """
+  The key of the collection a release belongs to, or `nil` for a release id the
+  catalog does not carry.
+
+  A release id reaching the catalog from outside -- one a host stored, or one
+  passed as a `:release_id` option -- says nothing about which collection it
+  belongs to, and every release-scoped read filters on the id alone. This is
+  how a caller checks that the id it was handed is a release of the collection
+  it means, rather than reading another collection's rows under its own name.
+  """
+  @spec release_collection_key(Context.t(), Ecto.UUID.t()) :: String.t() | nil
+  def release_collection_key(%Context{} = context, release_id) do
+    sql =
+      "SELECT collection.key FROM \"#{context.prefix}\".release " <>
+        "JOIN \"#{context.prefix}\".collection ON collection.id = release.collection_id " <>
+        "WHERE release.id = $1"
+
+    read(context, sql, [dump_uuid(release_id)], "release_collection_key", fn
+      %Postgrex.Result{rows: [[collection_key]]} -> collection_key
+      %Postgrex.Result{rows: []} -> nil
+    end)
   end
 
   @doc "Creates a release's staging table, returning its name."
@@ -437,6 +590,18 @@ defmodule GeoGenius.Catalog do
   defp scalar(%Context{} = context, function, placeholders, params, opts \\ []) do
     sql =
       "SELECT #{function}::text AS #{function} " <>
+        "FROM \"#{context.prefix}\".#{function}(#{placeholders}) AS #{function}"
+
+    single(context.repo, sql, params, function, opts)
+  end
+
+  # The plural writes return one id per input position as a uuid[]. Casting the
+  # whole array to text[] in SQL means Postgrex decodes it as the list of
+  # hyphenated strings every other id crosses this module as, rather than as a
+  # list of raw sixteen-byte binaries.
+  defp scalar_list(%Context{} = context, function, placeholders, params, opts \\ []) do
+    sql =
+      "SELECT #{function}::text[] AS #{function} " <>
         "FROM \"#{context.prefix}\".#{function}(#{placeholders}) AS #{function}"
 
     single(context.repo, sql, params, function, opts)

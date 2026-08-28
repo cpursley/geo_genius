@@ -15,6 +15,10 @@ defmodule GeoGenius.PublicApiTest do
     {:children_of, ["k"], []},
     {:ancestors_of, ["k"], []},
     {:related_areas, ["k"], []},
+    {:children_of_many, [["k"]], []},
+    {:ancestors_of_many, [["k"]], []},
+    {:related_areas_many, [["k"]], []},
+    {:areas_by_code_many, ["slug", ["alpha"]], []},
     {:release_at, [~U[2026-01-01 00:00:00Z]], [collection: "demo"]}
   ]
 
@@ -73,6 +77,30 @@ defmodule GeoGenius.PublicApiTest do
     @impl true
     def related_areas(context, area_key, opts) do
       send(self(), {:related_areas, context, [area_key, opts]})
+      []
+    end
+
+    @impl true
+    def children_of_many(context, area_keys, opts) do
+      send(self(), {:children_of_many, context, [area_keys, opts]})
+      []
+    end
+
+    @impl true
+    def ancestors_of_many(context, area_keys, opts) do
+      send(self(), {:ancestors_of_many, context, [area_keys, opts]})
+      []
+    end
+
+    @impl true
+    def related_areas_many(context, area_keys, opts) do
+      send(self(), {:related_areas_many, context, [area_keys, opts]})
+      []
+    end
+
+    @impl true
+    def areas_by_code_many(context, code_type, code_values, opts) do
+      send(self(), {:areas_by_code_many, context, [code_type, code_values, opts]})
       []
     end
 
@@ -173,6 +201,20 @@ defmodule GeoGenius.PublicApiTest do
     assert [] = GeoGenius.related_areas("k", probe: :sentinel)
     assert_received {:related_areas, context, ["k", [probe: :sentinel]]}
     assert context.store == RecordingStore
+  end
+
+  test "the plural reads pass their seed list and opts through" do
+    assert [] = GeoGenius.children_of_many(["a", "b"], probe: :sentinel)
+    assert_received {:children_of_many, _, [["a", "b"], [probe: :sentinel]]}
+
+    assert [] = GeoGenius.ancestors_of_many(["a", "b"], probe: :sentinel)
+    assert_received {:ancestors_of_many, _, [["a", "b"], [probe: :sentinel]]}
+
+    assert [] = GeoGenius.related_areas_many(["a", "b"], probe: :sentinel)
+    assert_received {:related_areas_many, _, [["a", "b"], [probe: :sentinel]]}
+
+    assert [] = GeoGenius.areas_by_code_many("fips", ["01", "02"], probe: :sentinel)
+    assert_received {:areas_by_code_many, _, ["fips", ["01", "02"], [probe: :sentinel]]}
   end
 
   test "release_at passes as_of and the required :collection option" do

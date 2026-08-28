@@ -45,6 +45,14 @@ defmodule GeoGenius.StoreTest do
     @impl true
     def related_areas(_context, _area_key, _opts), do: []
     @impl true
+    def children_of_many(_context, _area_keys, _opts), do: []
+    @impl true
+    def ancestors_of_many(_context, _area_keys, _opts), do: []
+    @impl true
+    def related_areas_many(_context, _area_keys, _opts), do: []
+    @impl true
+    def areas_by_code_many(_context, _code_type, _code_values, _opts), do: []
+    @impl true
     def release_at(_context, _as_of, _opts), do: nil
   end
 

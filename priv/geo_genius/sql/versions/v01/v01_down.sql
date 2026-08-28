@@ -7,13 +7,28 @@ DROP FUNCTION IF EXISTS $SCHEMA$.resolve(
 
 -- Hierarchy traversal
 
+DROP FUNCTION IF EXISTS $SCHEMA$.related_areas_many(
+  text[], text[], uuid, boolean);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.related_areas(
   text, text[], uuid, boolean);
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.ancestors_of_many(
+  text[], text[], text[], integer, uuid, boolean);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.ancestors_of(
   text, text[], text[], integer, uuid, boolean);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.children_of_many(
+  text[], text[], text[], integer, uuid, boolean);
 
 --SPLIT--
 
@@ -26,6 +41,11 @@ DROP FUNCTION IF EXISTS $SCHEMA$.children_of(
 
 DROP FUNCTION IF EXISTS $SCHEMA$.search_areas(
   text, text[], text[], integer, uuid, boolean);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.areas_by_code_many(
+  text, text[], text[], text[], uuid, boolean, text, integer);
 
 --SPLIT--
 
@@ -51,11 +71,22 @@ DROP FUNCTION IF EXISTS $SCHEMA$.areas_for_point(
 
 --SPLIT--
 
+DROP TYPE IF EXISTS $SCHEMA$.seeded_area_match;
+
+--SPLIT--
+
 DROP TYPE IF EXISTS $SCHEMA$.area_match;
 
 --SPLIT--
 
--- Published read views
+DROP FUNCTION IF EXISTS $SCHEMA$.assert_seed_keys(text[], text);
+
+--SPLIT--
+
+-- Read views, dropped published-before-base so every RESTRICT dependency is
+-- already gone by the time its base view is reached: published_area_relations
+-- depends on release_relations, the codes and names pairs on each other and on
+-- release_areas, and published_areas on release_areas.
 
 DROP VIEW IF EXISTS $SCHEMA$.published_boundaries;
 
@@ -65,11 +96,23 @@ DROP VIEW IF EXISTS $SCHEMA$.published_area_relations;
 
 --SPLIT--
 
+DROP VIEW IF EXISTS $SCHEMA$.release_relations;
+
+--SPLIT--
+
 DROP VIEW IF EXISTS $SCHEMA$.published_area_names;
 
 --SPLIT--
 
+DROP VIEW IF EXISTS $SCHEMA$.release_area_names;
+
+--SPLIT--
+
 DROP VIEW IF EXISTS $SCHEMA$.published_area_codes;
+
+--SPLIT--
+
+DROP VIEW IF EXISTS $SCHEMA$.release_area_codes;
 
 --SPLIT--
 
@@ -163,7 +206,15 @@ DROP FUNCTION IF EXISTS $SCHEMA$.put_relation(uuid, text, text, text);
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.put_relation_many(uuid, text[], text[], text[]);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release(uuid, text, geography, jsonb);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release_many(uuid, text[], geography[], jsonb[]);
 
 --SPLIT--
 
@@ -175,11 +226,39 @@ DROP FUNCTION IF EXISTS $SCHEMA$.put_area_code(text, text, text);
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_code_many(text[], text[], text[]);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.put_area_name(text, text, text, text);
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_name_many(text[], text[], text[], text[]);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.upsert_area(text, text, text, text);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.upsert_area_many(text, text[], text[], text[]);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.assert_resolved(text, text);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.lock_areas(bigint[]);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.area_lock_key(uuid, text);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.assert_write_arrays(integer[], integer[], text[]);
 
 --SPLIT--
 

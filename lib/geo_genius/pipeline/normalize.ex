@@ -20,6 +20,21 @@ defmodule GeoGenius.Pipeline.Normalize do
   window, so no background heartbeat process is needed -- and not having one
   means there is no second process whose death could be mistaken for a dead
   worker.
+
+  **A page is written as a set, not as rows.** The page is turned into areas
+  first and written afterwards, as one statement for the batch's areas, one
+  for its names, one for its codes and one for its memberships, through the
+  `*_many` counterparts of the scalar catalog writes. A source that
+  denormalises a hierarchy describes the same county in every city row of it,
+  so a batch names far fewer distinct areas than it has rows, and one statement
+  per area would spend a round trip on every repeat. Boundaries stay one call per
+  boundary: `GeoGenius.Catalog.put_boundary/4` validates and repairs a
+  geometry, replaces the area's boundary and its subdivided parts, and
+  recomputes the centroid from what it stored.
+
+  Collecting the whole page before writing any of it also means a provider's
+  own errors -- an illegal name kind, an unstaged artifact -- are found before
+  the batch is written rather than partway through it.
   """
 
   alias GeoGenius.Catalog
@@ -45,10 +60,17 @@ defmodule GeoGenius.Pipeline.Normalize do
     |> State.with_metrics(fn {:ok, counts} -> %{state | metrics: counts} end)
   end
 
+  # The page is collected first and written afterwards: the four set writes
+  # below each need the whole batch, and the collecting pass is where a
+  # provider's own errors surface, before any of the batch has been written.
   defp normalize_batch(rows, state, {:ok, counts}) do
-    case Enum.reduce_while(rows, {:ok, counts}, &normalize_row(&1, state, &2)) do
-      {:ok, counts} -> heartbeat(state, counts)
-      {:error, _reason} = error -> {:halt, error}
+    case Enum.reduce_while(rows, {:ok, {counts, []}}, &collect_row(&1, state, &2)) do
+      {:ok, {counts, collected}} ->
+        collected |> Enum.reverse() |> write_batch(state)
+        heartbeat(state, counts)
+
+      {:error, _reason} = error ->
+        {:halt, error}
     end
   end
 
@@ -57,46 +79,47 @@ defmodule GeoGenius.Pipeline.Normalize do
     {:cont, {:ok, counts}}
   end
 
-  defp normalize_row(row, state, {:ok, counts}) do
+  defp collect_row(row, state, {:ok, {counts, collected}}) do
     case state.provider.normalize(state.manifest, row) do
       :skip ->
-        {:cont, {:ok, bump(counts, "skipped")}}
+        {:cont, {:ok, {bump(counts, "skipped"), collected}}}
 
       {:ok, %Area{} = area} ->
-        continue(write_area(state, row, area, counts))
+        continue(collect_areas(state, row, [area], counts, collected))
 
       {:ok, areas} when is_list(areas) ->
-        continue(write_areas(state, row, areas, counts))
+        continue(collect_areas(state, row, areas, counts, collected))
 
       {:error, reason} ->
         {:halt, {:error, "#{inspect(state.provider)} could not normalize a row: #{reason}"}}
     end
   end
 
-  defp continue({:ok, _counts} = written), do: {:cont, written}
+  defp continue({:ok, _collected} = accumulated), do: {:cont, accumulated}
   defp continue({:error, _reason} = error), do: {:halt, error}
 
   # Folds the row's areas in order, stopping at the first that cannot be
-  # written so a later area never masks an earlier failure.
-  defp write_areas(state, row, areas, counts) do
-    Enum.reduce_while(areas, {:ok, counts}, fn area, {:ok, acc} ->
-      case write_area(state, row, area, acc) do
+  # collected so a later area never masks an earlier failure.
+  defp collect_areas(state, row, areas, counts, collected) do
+    Enum.reduce_while(areas, {:ok, {counts, collected}}, fn area, {:ok, accumulated} ->
+      case collect_area(state, row, area, accumulated) do
         {:ok, next} -> {:cont, {:ok, next}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
   end
 
-  # `upsert_area/3` returns a uuid, but every write after it takes the area
-  # key, so it is composed through `Area.key/1`, which is the one Elixir-side
-  # statement of the format PostgreSQL composes `area_key` from. The pipeline
-  # test asserts the two agree rather than trusting that they do.
-  defp write_area(state, row, area, counts) do
+  # `Area.key/1` is the one Elixir-side statement of the format PostgreSQL
+  # composes `area_key` from, and every write after the area itself takes that
+  # key rather than the id `upsert_area_many/3` returns. The pipeline test
+  # asserts the two agree rather than trusting that they do.
+  defp collect_area(state, row, area, {counts, collected}) do
     area_key = Area.key(area)
 
     with :ok <- validate_names(state, area, area_key),
-         :ok <- validate_codes(state, area, area_key) do
-      put_area(state, row, area, area_key, counts)
+         :ok <- validate_codes(state, area, area_key),
+         {:ok, source_release_id} <- boundary_source(state, row, area) do
+      {:ok, {count_area(counts, area), [{area_key, area, source_release_id} | collected]}}
     end
   end
 
@@ -130,61 +153,85 @@ defmodule GeoGenius.Pipeline.Normalize do
 
   defp invalid_code_type?(%Area.Code{code_type: code_type}), do: not is_binary(code_type)
 
-  defp put_area(state, row, area, area_key, counts) do
-    Catalog.upsert_area(state.context, state.run.collection_key, %{
-      authority_key: area.authority_key,
-      area_type_key: area.area_type_key,
-      code: area.code
-    })
-
-    Enum.each(area.names, &put_name(state, area_key, &1))
-    Enum.each(area.codes, &put_code(state, area_key, &1))
-
-    Catalog.put_area_in_release(state.context, state.run.release_id, area_key, %{
-      centroid: area.centroid,
-      attributes: area.attributes
-    })
-
-    put_boundary(state, row, area, area_key, counts)
-  end
-
-  defp put_name(state, area_key, %Area.Name{} = name) do
-    Catalog.put_area_name(state.context, area_key, %{
-      name: name.name,
-      kind: Atom.to_string(name.kind),
-      locale: name.locale
-    })
-  end
-
-  defp put_code(state, area_key, %Area.Code{} = code) do
-    Catalog.put_area_code(state.context, area_key, %{
-      code_type: code.code_type,
-      code_value: code.code_value
-    })
-  end
-
-  defp put_boundary(_state, _row, %Area{geometry: nil}, _area_key, counts) do
-    {:ok, bump(counts, "areas")}
-  end
+  # An area carrying no geometry is attributed to no source release: its
+  # membership is written and no boundary is.
+  defp boundary_source(_state, _row, %Area{geometry: nil}), do: {:ok, nil}
 
   # A boundary is attributed to the source release the artifact it was staged
   # from belongs to, which is why the download phase carries that mapping
-  # forward. `put_boundary/4` also recomputes the centroid from the geometry,
-  # so it runs after `put_area_in_release/4` rather than before it.
-  defp put_boundary(state, row, area, area_key, counts) do
+  # forward.
+  defp boundary_source(state, row, %Area{}) do
     case Map.fetch(state.sources, row.artifact) do
       {:ok, source_release_id} ->
-        Catalog.put_boundary(state.context, state.run.release_id, area_key, %{
-          source_release_id: source_release_id,
-          geometry: area.geometry
-        })
-
-        {:ok, counts |> bump("areas") |> bump("boundaries")}
+        {:ok, source_release_id}
 
       :error ->
         {:error,
          "staged row names artifact #{inspect(row.artifact)}, which this run did not stage"}
     end
+  end
+
+  defp count_area(counts, %Area{geometry: nil}), do: bump(counts, "areas")
+  defp count_area(counts, %Area{}), do: counts |> bump("areas") |> bump("boundaries")
+
+  # The order the catalog needs: an area exists before its names, codes and
+  # membership name it, and `put_boundary/4` recomputes the centroid
+  # `put_area_in_release_many/3` has just written, so boundaries come last.
+  defp write_batch(collected, state) do
+    Catalog.upsert_area_many(
+      state.context,
+      state.run.collection_key,
+      Enum.map(collected, &area_attrs/1)
+    )
+
+    Catalog.put_area_name_many(state.context, Enum.flat_map(collected, &name_attrs/1))
+    Catalog.put_area_code_many(state.context, Enum.flat_map(collected, &code_attrs/1))
+
+    Catalog.put_area_in_release_many(
+      state.context,
+      state.run.release_id,
+      Enum.map(collected, &membership_attrs/1)
+    )
+
+    Enum.each(collected, &put_boundary(state, &1))
+  end
+
+  defp area_attrs({_area_key, %Area{} = area, _source_release_id}) do
+    %{
+      authority_key: area.authority_key,
+      area_type_key: area.area_type_key,
+      code: area.code
+    }
+  end
+
+  defp name_attrs({area_key, %Area{names: names}, _source_release_id}) do
+    Enum.map(names, fn %Area.Name{} = name ->
+      %{
+        area_key: area_key,
+        name: name.name,
+        kind: Atom.to_string(name.kind),
+        locale: name.locale
+      }
+    end)
+  end
+
+  defp code_attrs({area_key, %Area{codes: codes}, _source_release_id}) do
+    Enum.map(codes, fn %Area.Code{} = code ->
+      %{area_key: area_key, code_type: code.code_type, code_value: code.code_value}
+    end)
+  end
+
+  defp membership_attrs({area_key, %Area{} = area, _source_release_id}) do
+    %{area_key: area_key, centroid: area.centroid, attributes: area.attributes}
+  end
+
+  defp put_boundary(_state, {_area_key, %Area{geometry: nil}, _source_release_id}), do: :ok
+
+  defp put_boundary(state, {area_key, %Area{} = area, source_release_id}) do
+    Catalog.put_boundary(state.context, state.run.release_id, area_key, %{
+      source_release_id: source_release_id,
+      geometry: area.geometry
+    })
   end
 
   defp bump(counts, key), do: Map.update!(counts, key, &(&1 + 1))

@@ -1,6 +1,6 @@
 defmodule GeoGenius.Providers.SimpleMapsPipelineTest do
   @moduledoc """
-  Drives both real SimpleMaps fixture files through `GeoGenius.import/1` and
+  Drives both SimpleMaps fixture files through `GeoGenius.import/1` and
   into the catalog, from the manifest this package ships.
 
   The shipped `us_simplemaps` manifest is the one place the authority set can
@@ -145,7 +145,8 @@ defmodule GeoGenius.Providers.SimpleMapsPipelineTest do
 
       # The Freely Associated States and the military mail constructs carry no
       # ANSI code, so they key under the USPS rather than the Census. The ZIP
-      # sample carries 96941 (Pohnpei, FM), which is what puts a state there.
+      # sample carries a Freely Associated State row keyed FM, which is what
+      # puts a state there.
       assert {"usps", "state"} in pairs
     end
   end

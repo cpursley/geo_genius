@@ -63,8 +63,8 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     assert Enum.all?(rows, &is_nil(&1.geom))
 
     first = hd(rows)
-    assert first.payload["city"] == "Los Angeles"
-    assert first.payload["county_fips_all"] == "06037"
+    assert first.payload["city"] == "Fernbridge"
+    assert first.payload["county_fips_all"] == "50101"
 
     # A column no callback reads yet -- proves the payload carries the
     # source's full 91-column shape rather than a hand-picked subset.
@@ -73,7 +73,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     # uscities names its counties column "county_name_all" (singular
     # "name"); uszips names the equivalent column "county_names_all"
     # (plural). Normalization reads this exact key.
-    assert first.payload["county_name_all"] == "Los Angeles"
+    assert first.payload["county_name_all"] == "Fernbridge County"
     refute Map.has_key?(first.payload, "county_names_all")
   end
 
@@ -84,22 +84,22 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     {result, rows} = collect(fn emit -> SimpleMaps.stage(manifest, artifact, @zips, emit, []) end)
 
     assert result == :ok
-    assert length(rows) == 14
+    assert length(rows) == 15
     assert Enum.all?(rows, &(&1.artifact == "uszips"))
     assert Enum.all?(rows, &is_nil(&1.geom))
 
-    multi_county = Enum.find(rows, &(&1.payload["zip"] == "01002"))
+    multi_county = Enum.find(rows, &(&1.payload["zip"] == "50102"))
 
     # Pins that NimbleCSV's doubled-quote escaping is unwound, not merely
     # that the comma inside the quoted field survived. A payload still
-    # carrying `""25015""` would satisfy a substring check on "25011" but
+    # carrying `""40401""` would satisfy a substring check on "40402" but
     # fail a later JSON decode of this column.
-    assert multi_county.payload["county_weights"] == ~s({"25015": 93.26, "25011": 6.74})
+    assert multi_county.payload["county_weights"] == ~s({"40401": 93.26, "40402": 6.74})
 
     # uszips names its counties column "county_names_all" (plural
     # "names"); uscities names the equivalent column "county_name_all"
     # (singular).
-    assert multi_county.payload["county_names_all"] == "Hampshire|Franklin"
+    assert multi_county.payload["county_names_all"] == "Southridge County|Northgate County"
     refute Map.has_key?(multi_county.payload, "county_name_all")
   end
 
@@ -122,48 +122,48 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   end
 
   test "a city row yields the city, its county, and its state" do
-    areas = normalize_row!("uscities", city_payload("Los Angeles"))
+    areas = normalize_row!("uscities", city_payload("Fernbridge"))
 
     assert areas |> Enum.map(& &1.area_type_key) |> Enum.sort() == ["city", "county", "state"]
 
     city = area_of_type(areas, "city")
     assert city.authority_key == "simplemaps"
-    assert city.code == "1840020491"
-    assert city.centroid == %Geo.Point{coordinates: {-118.4068, 34.1141}, srid: 4326}
-    assert %Area.Name{name: "Los Angeles", kind: :official} in city.names
+    assert city.code == "9900000001"
+    assert city.centroid == %Geo.Point{coordinates: {-96.7522, 42.3551}, srid: 4326}
+    assert %Area.Name{name: "Fernbridge", kind: :official} in city.names
     assert city.codes == []
 
     county = area_of_type(areas, "county")
     assert county.authority_key == "census"
-    assert county.code == "06037"
+    assert county.code == "50101"
     assert is_nil(county.centroid)
-    assert %Area.Name{name: "Los Angeles", kind: :official} in county.names
-    assert %Area.Code{code_type: "county_fips", code_value: "06037"} in county.codes
+    assert %Area.Name{name: "Fernbridge County", kind: :official} in county.names
+    assert %Area.Code{code_type: "county_fips", code_value: "50101"} in county.codes
 
     state = area_of_type(areas, "state")
     assert state.authority_key == "census"
-    assert state.code == "CA"
+    assert state.code == "VT"
     assert is_nil(state.centroid)
-    assert %Area.Name{name: "California", kind: :official} in state.names
-    assert %Area.Code{code_type: "ansi_state", code_value: "CA"} in state.codes
+    assert %Area.Name{name: "Vermont", kind: :official} in state.names
+    assert %Area.Code{code_type: "ansi_state", code_value: "VT"} in state.codes
   end
 
   test "a multi-county city yields one county per county_fips_all entry" do
-    areas = normalize_row!("uscities", city_payload("Kansas City"))
+    areas = normalize_row!("uscities", city_payload("Millhaven"))
 
     counties =
       areas |> Enum.filter(&(&1.area_type_key == "county")) |> Enum.map(& &1.code) |> Enum.sort()
 
-    assert counties == ["29037", "29047", "29095", "29165"]
+    assert counties == ["29201", "29202", "29203", "29204"]
   end
 
   test "county names pair positionally with county_fips_all" do
-    areas = normalize_row!("uscities", city_payload("Kansas City"))
+    areas = normalize_row!("uscities", city_payload("Millhaven"))
 
-    assert county_name(areas, "29095") == "Jackson"
-    assert county_name(areas, "29047") == "Clay"
-    assert county_name(areas, "29165") == "Platte"
-    assert county_name(areas, "29037") == "Cass"
+    assert county_name(areas, "29201") == "Journey County"
+    assert county_name(areas, "29202") == "Clearwater County"
+    assert county_name(areas, "29203") == "Palisade County"
+    assert county_name(areas, "29204") == "Ashgrove County"
   end
 
   # Both real multi-county rows above name their counties in the same order
@@ -173,7 +173,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # by fips, so this row fails if the two lists are sorted before pairing.
   test "county names pair by position even where name order inverts fips order" do
     payload =
-      "Kansas City"
+      "Millhaven"
       |> city_payload()
       |> Map.put("county_fips", "51510")
       |> Map.put("county_fips_all", "51510|51013")
@@ -191,10 +191,10 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # no name.
   test "a name list shorter than county_fips_all fails validation" do
     payload =
-      "Kansas City"
+      "Millhaven"
       |> city_payload()
-      |> Map.put("county_fips_all", "29095|29047|29165")
-      |> Map.put("county_name_all", "Jackson|Clay")
+      |> Map.put("county_fips_all", "29201|29202|29203")
+      |> Map.put("county_name_all", "Journey County|Clearwater County")
 
     row = %Staging.Row{artifact: "uscities", payload: payload, geom: nil}
 
@@ -206,64 +206,64 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # uszips spells the column "county_names_all"; reading the uscities
   # spelling here would leave every ZIP's counties nameless.
   test "a zip row reads its county names from the plural county_names_all column" do
-    areas = normalize_row!("uszips", zip_payload("01002"))
+    areas = normalize_row!("uszips", zip_payload("50102"))
 
-    assert county_name(areas, "25015") == "Hampshire"
-    assert county_name(areas, "25011") == "Franklin"
+    assert county_name(areas, "40401") == "Southridge County"
+    assert county_name(areas, "40402") == "Northgate County"
   end
 
   test "a county_fips_all repeating a fips yields that county once" do
     payload =
-      "Kansas City"
+      "Millhaven"
       |> city_payload()
-      |> Map.put("county_fips_all", "29095|29047|29095")
-      |> Map.put("county_name_all", "Jackson|Clay|Jackson")
+      |> Map.put("county_fips_all", "29201|29202|29201")
+      |> Map.put("county_name_all", "Journey County|Clearwater County|Journey County")
 
     areas = normalize_row!("uscities", payload)
 
     codes = areas |> Enum.filter(&(&1.area_type_key == "county")) |> Enum.map(& &1.code)
-    assert codes == ["29095", "29047"]
+    assert codes == ["29201", "29202"]
   end
 
   test "city_ascii and city_alt become aliases, not second official names" do
-    payload = "Cañon City" |> city_payload() |> Map.put("city_alt", "Canyon City")
+    payload = "Cañón Vista" |> city_payload() |> Map.put("city_alt", "Canyon City")
     city = "uscities" |> normalize_row!(payload) |> area_of_type("city")
 
     assert Enum.count(city.names, &(&1.kind == :official)) == 1
-    assert %Area.Name{name: "Cañon City", kind: :official} in city.names
-    assert %Area.Name{name: "Canon City", kind: :alias} in city.names
+    assert %Area.Name{name: "Cañón Vista", kind: :official} in city.names
+    assert %Area.Name{name: "Canon Vista", kind: :alias} in city.names
     assert %Area.Name{name: "Canyon City", kind: :alias} in city.names
   end
 
   test "a city_ascii equal to the official name adds no alias" do
-    areas = normalize_row!("uscities", city_payload("Los Angeles"))
+    areas = normalize_row!("uscities", city_payload("Fernbridge"))
 
     assert area_of_type(areas, "city").names == [
-             %Area.Name{name: "Los Angeles", kind: :official}
+             %Area.Name{name: "Fernbridge", kind: :official}
            ]
   end
 
   test "a zip row yields the zip, its counties, and its state but no city" do
-    areas = normalize_row!("uszips", zip_payload("90001"))
+    areas = normalize_row!("uszips", zip_payload("99001"))
 
     assert "city" not in Enum.map(areas, & &1.area_type_key)
 
     zip = area_of_type(areas, "zip")
     assert zip.authority_key == "usps"
-    assert zip.code == "90001"
-    assert zip.centroid == %Geo.Point{coordinates: {-118.24904, 33.97365}, srid: 4326}
-    assert %Area.Code{code_type: "usps_zip", code_value: "90001"} in zip.codes
+    assert zip.code == "99001"
+    assert zip.centroid == %Geo.Point{coordinates: {-96.7587, 42.3602}, srid: 4326}
+    assert %Area.Code{code_type: "usps_zip", code_value: "99001"} in zip.codes
 
     # A ZIP row's `city` column is the mailing name USPS prefers for that
     # ZIP, not a city this row describes.
-    assert %Area.Name{name: "Los Angeles", kind: :mailing} in zip.names
+    assert %Area.Name{name: "Fernbridge", kind: :mailing} in zip.names
 
-    assert area_of_type(areas, "county").code == "06037"
-    assert area_of_type(areas, "state").code == "CA"
+    assert area_of_type(areas, "county").code == "50101"
+    assert area_of_type(areas, "state").code == "VT"
   end
 
   test "state and county centroids stay nil rather than being invented" do
-    areas = normalize_row!("uscities", city_payload("Los Angeles"))
+    areas = normalize_row!("uscities", city_payload("Fernbridge"))
 
     for area <- areas, area.area_type_key in ["state", "county"] do
       assert is_nil(area.centroid), "#{area.area_type_key} must not carry a synthetic centroid"
@@ -277,7 +277,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
           {"lat", "34.1abc"},
           {"lng", "-118 W"}
         ] do
-      payload = "Los Angeles" |> city_payload() |> Map.put(column, value)
+      payload = "Fernbridge" |> city_payload() |> Map.put(column, value)
       city = "uscities" |> normalize_row!(payload) |> area_of_type("city")
 
       assert is_nil(city.centroid), "#{column}=#{inspect(value)} must not yield a centroid"
@@ -285,7 +285,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   end
 
   test "the city carries the whole row; the county and state it implies carry none of it" do
-    payload = city_payload("Los Angeles")
+    payload = city_payload("Fernbridge")
     areas = normalize_row!("uscities", payload)
 
     assert area_of_type(areas, "city").attributes == payload
@@ -294,7 +294,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   end
 
   test "the zip carries the whole row; the county and state it implies carry none of it" do
-    payload = zip_payload("90001")
+    payload = zip_payload("99001")
     areas = normalize_row!("uszips", payload)
 
     assert area_of_type(areas, "zip").attributes == payload
@@ -312,19 +312,19 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # merely on the same key.
   test "a county derived from a city row and from a zip row is the same area" do
     from_city =
-      "uscities" |> normalize_row!(city_payload("Los Angeles")) |> area_of_type("county")
+      "uscities" |> normalize_row!(city_payload("Fernbridge")) |> area_of_type("county")
 
-    from_zip = "uszips" |> normalize_row!(zip_payload("90001")) |> area_of_type("county")
+    from_zip = "uszips" |> normalize_row!(zip_payload("99001")) |> area_of_type("county")
 
-    assert from_city.code == "06037"
+    assert from_city.code == "50101"
     assert from_city == from_zip
   end
 
   test "a state derived from a city row and from a zip row is the same area" do
-    from_city = "uscities" |> normalize_row!(city_payload("Los Angeles")) |> area_of_type("state")
-    from_zip = "uszips" |> normalize_row!(zip_payload("90001")) |> area_of_type("state")
+    from_city = "uscities" |> normalize_row!(city_payload("Fernbridge")) |> area_of_type("state")
+    from_zip = "uszips" |> normalize_row!(zip_payload("99001")) |> area_of_type("state")
 
-    assert from_city.code == "CA"
+    assert from_city.code == "VT"
     assert from_city == from_zip
   end
 
@@ -336,30 +336,30 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # in identical order.
   test "a multi-county row converges on the same counties from either file" do
     overridden =
-      "90001"
+      "99001"
       |> zip_payload()
-      |> Map.put("county_fips", "17031")
-      |> Map.put("county_fips_all", "17031|17043")
-      |> Map.put("county_names_all", "Cook|DuPage")
-      |> Map.put("county_weights", ~s({"17031": 82.5, "17043": 17.5}))
+      |> Map.put("county_fips", "17301")
+      |> Map.put("county_fips_all", "17301|17302")
+      |> Map.put("county_names_all", "Anchor County|Bramblewood County")
+      |> Map.put("county_weights", ~s({"17301": 82.5, "17302": 17.5}))
 
-    from_city = "uscities" |> normalize_row!(city_payload("Chicago")) |> counties_of()
+    from_city = "uscities" |> normalize_row!(city_payload("Twin Rivers")) |> counties_of()
     from_zip = "uszips" |> normalize_row!(overridden) |> counties_of()
 
-    assert Enum.map(from_city, & &1.code) == ["17031", "17043"]
+    assert Enum.map(from_city, & &1.code) == ["17301", "17302"]
     assert from_city == from_zip
   end
 
   test "a single-county city asserts state->county and county->city, both contains" do
-    edges = asserted_edges("uscities", city_payload("Los Angeles"))
+    edges = asserted_edges("uscities", city_payload("Fernbridge"))
 
-    assert {"census:state:CA", "census:county:06037", "contains"} in edges
-    assert {"census:county:06037", "simplemaps:city:1840020491", "contains"} in edges
+    assert {"census:state:VT", "census:county:50101", "contains"} in edges
+    assert {"census:county:50101", "simplemaps:city:9900000001", "contains"} in edges
     assert length(edges) == 2
   end
 
   test "a multi-county city asserts overlaps, never contains" do
-    edges = asserted_edges("uscities", city_payload("Kansas City"))
+    edges = asserted_edges("uscities", city_payload("Millhaven"))
 
     city_edges = Enum.filter(edges, fn {_parent, child, _type} -> child =~ "simplemaps:city:" end)
 
@@ -370,7 +370,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # A county's FIPS is assigned within its state, so no county spans two and
   # a state contains every county on the row however many there are.
   test "state-to-county stays contains however many counties the row names" do
-    edges = asserted_edges("uscities", city_payload("Kansas City"))
+    edges = asserted_edges("uscities", city_payload("Millhaven"))
 
     county_edges = Enum.filter(edges, fn {_parent, child, _type} -> child =~ "census:county:" end)
 
@@ -385,7 +385,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # name USPS prefers for that ZIP rather than a containment the row can
   # assert in either direction.
   test "a zip asserts county->zip and state->county, never city->zip" do
-    edges = asserted_edges("uszips", zip_payload("90001"))
+    edges = asserted_edges("uszips", zip_payload("99001"))
 
     refute Enum.any?(edges, fn {parent, _child, _type} -> parent =~ "simplemaps:city:" end)
     refute Enum.any?(edges, fn {_parent, child, _type} -> child =~ "simplemaps:city:" end)
@@ -394,11 +394,11 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
              parent =~ "census:county:" and child =~ "usps:zip:"
            end)
 
-    assert {"census:county:06037", "usps:zip:90001", "contains"} in edges
+    assert {"census:county:50101", "usps:zip:99001", "contains"} in edges
   end
 
   test "a multi-county zip asserts overlaps on every county it touches" do
-    edges = asserted_edges("uszips", zip_payload("01002"))
+    edges = asserted_edges("uszips", zip_payload("50102"))
 
     zip_edges = Enum.filter(edges, fn {_parent, child, _type} -> child =~ "usps:zip:" end)
 
@@ -415,12 +415,12 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     edges =
       Enum.flat_map(
         [
-          {"uscities", city_payload("Los Angeles")},
-          {"uscities", city_payload("Kansas City")},
-          {"uszips", zip_payload("90001")},
-          {"uszips", zip_payload("01002")},
-          {"uszips", zip_payload("09002")},
-          {"uszips", zip_payload("96941")}
+          {"uscities", city_payload("Fernbridge")},
+          {"uscities", city_payload("Millhaven")},
+          {"uszips", zip_payload("99001")},
+          {"uszips", zip_payload("50102")},
+          {"uszips", zip_payload("09001")},
+          {"uszips", zip_payload("70099")}
         ],
         fn {artifact, payload} -> asserted_edges(artifact, payload) end
       )
@@ -438,18 +438,18 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # that is the whole truth the row carries: it is in AE and in no county.
   # The equivalent `uscities` row is a validation error instead -- not
   # because its edge would be missing, but because every city does sit in a
-  # county, so a city row naming none is corruption. The fixture row is cut
-  # from the real download, blank columns and all.
+  # county, so a city row naming none is corruption. The row's blank county
+  # columns mirror the shape a real download carries for this case.
   test "a zip in no county hangs off its state directly" do
-    areas = normalize_row!("uszips", zip_payload("09002"))
+    areas = normalize_row!("uszips", zip_payload("09001"))
 
     assert areas |> Enum.map(& &1.area_type_key) |> Enum.sort() == ["state", "zip"]
-    assert area_of_type(areas, "zip").code == "09002"
+    assert area_of_type(areas, "zip").code == "09001"
 
     # The state is the only parent such a ZIP has, and one edge to it is
     # truer than no parent at all.
-    assert asserted_edges("uszips", zip_payload("09002")) == [
-             {"usps:state:AE", "usps:zip:09002", "contains"}
+    assert asserted_edges("uszips", zip_payload("09001")) == [
+             {"usps:state:AE", "usps:zip:09001", "contains"}
            ]
 
     # The real row carries no coordinates and no `state_name` either, so the
@@ -461,7 +461,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # state-to-zip edge beside them would assert a second path to the same
   # place.
   test "a zip in a county has no direct state-to-zip edge" do
-    for zip <- ["90001", "01002"] do
+    for zip <- ["99001", "50102"] do
       edges = asserted_edges("uszips", zip_payload(zip))
 
       refute Enum.any?(edges, fn {parent, child, _type} ->
@@ -475,7 +475,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # Census assigns it no ANSI code. Keying it under `census` with an
   # `ansi_state` code would assert two things no source says.
   test "a military state keys under usps and carries no ansi code" do
-    state = "uszips" |> normalize_row!(zip_payload("09002")) |> area_of_type("state")
+    state = "uszips" |> normalize_row!(zip_payload("09001")) |> area_of_type("state")
 
     assert state.authority_key == "usps"
     assert state.code == "AE"
@@ -494,7 +494,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # `state_name`, and it gets that name the way every other state does --
   # only the authority and the code type differ.
   test "a freely associated state keys under usps but keeps its name" do
-    areas = normalize_row!("uszips", zip_payload("96941"))
+    areas = normalize_row!("uszips", zip_payload("70099"))
     state = area_of_type(areas, "state")
 
     assert state.authority_key == "usps"
@@ -502,42 +502,138 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     assert %Area.Code{code_type: "usps_state", code_value: "FM"} in state.codes
     refute Enum.any?(state.codes, &(&1.code_type == "ansi_state"))
 
-    assert %Area.Name{name: "Federated States of Micronesia", kind: :official} in state.names
+    assert %Area.Name{name: "Coral Compact", kind: :official} in state.names
 
     # A real row producing a cross-authority parent edge, rather than a
     # constructed one: this ZIP is in no county either.
-    assert asserted_edges("uszips", zip_payload("96941")) == [
-             {"usps:state:FM", "usps:zip:96941", "contains"}
+    assert asserted_edges("uszips", zip_payload("70099")) == [
+             {"usps:state:FM", "usps:zip:70099", "contains"}
            ]
   end
 
   test "an ordinary state still keys under census with its ansi code" do
-    state = "uscities" |> normalize_row!(city_payload("Los Angeles")) |> area_of_type("state")
+    state = "uscities" |> normalize_row!(city_payload("Fernbridge")) |> area_of_type("state")
 
     assert state.authority_key == "census"
-    assert state.code == "CA"
-    assert %Area.Code{code_type: "ansi_state", code_value: "CA"} in state.codes
+    assert state.code == "VT"
+    assert %Area.Code{code_type: "ansi_state", code_value: "VT"} in state.codes
     refute Enum.any?(state.codes, &(&1.code_type == "usps_state"))
   end
 
-  # The only edge whose parent authority is not the default for its type.
-  # `edges/1` reads its keys off the `%Area{}` structs `areas/1` builds, so
-  # the authority follows the key with nothing to keep in step -- this pins
-  # that it does. The row is constructed rather than found: no AA, AE or AP
-  # row of the real file names a county, so no real row produces this edge.
-  test "a military state's edges name it under usps, not census" do
+  # No FIPS numbers AA, AE or AP -- they are USPS constructs for military
+  # mail, not places -- so no county can be assigned within one, and a row
+  # pairing the two says something the county's own code contradicts. The row
+  # is constructed rather than found: no military row of the real file names a
+  # county. Where one did, its state column is the value not to believe.
+  test "a military zip that names a county files it under the county's own state" do
     payload =
-      "09002"
+      "09001"
       |> zip_payload()
-      |> Map.put("county_fips", "06037")
-      |> Map.put("county_fips_all", "06037")
-      |> Map.put("county_names_all", "Los Angeles")
-      |> Map.put("county_weights", ~s({"06037": 100}))
+      |> Map.put("county_fips", "50101")
+      |> Map.put("county_fips_all", "50101")
+      |> Map.put("county_names_all", "Fernbridge County")
+      |> Map.put("county_weights", ~s({"50101": 100}))
 
     edges = asserted_edges("uszips", payload)
 
-    assert {"usps:state:AE", "census:county:06037", "contains"} in edges
-    refute Enum.any?(edges, fn {parent, _child, _type} -> parent == "census:state:AE" end)
+    assert {"census:state:VT", "census:county:50101", "contains"} in edges
+
+    refute Enum.any?(edges, fn {parent, child, _type} ->
+             parent =~ "state:AE" and child == "census:county:50101"
+           end)
+  end
+
+  # ZIP 20041 is Dulles-area mail: a District of Columbia address delivered
+  # to Loudoun County, Virginia. The row's `state_id` says DC and its
+  # `county_fips` says 51107, and both are true of the row -- one describes
+  # the address, the other the county. Only the second describes the county,
+  # and 150 of the source's 3,233 counties are named on rows of more than one
+  # state.
+  test "a county hangs under the state its FIPS names, not the state on the row" do
+    edges = asserted_edges("uszips", zip_payload("20041"))
+
+    assert {"census:state:VA", "census:county:51107", "contains"} in edges
+    refute {"census:state:DC", "census:county:51107", "contains"} in edges
+  end
+
+  # `GeoGenius.Catalog.put_relation/3` requires both areas to be members of
+  # the release, so a state a row hangs a county under has to be a state that
+  # row produced. Reading it off another row's Virginia would work until an
+  # import whose only Virginia row is this one.
+  test "the state a county's FIPS names is an area the row yields" do
+    areas = normalize_row!("uszips", zip_payload("20041"))
+    states = Enum.filter(areas, &(&1.area_type_key == "state"))
+
+    assert Enum.map(states, & &1.code) == ["DC", "VA"]
+
+    virginia = Enum.find(states, &(&1.code == "VA"))
+    assert virginia.authority_key == "census"
+    assert %Area.Code{code_type: "ansi_state", code_value: "VA"} in virginia.codes
+
+    # `state_name` on this row is "District of Columbia", which is the name of
+    # the other state it yields. Copying it across would label Virginia with
+    # it; no row here names Virginia, so nothing here names it.
+    assert virginia.names == []
+  end
+
+  # The row's own state is still the row's own state: it names the ZIP's
+  # address, and dropping it would lose the only statement the source makes
+  # about where the mail goes.
+  test "a row whose county lies elsewhere still yields the state it names" do
+    areas = normalize_row!("uszips", zip_payload("20041"))
+
+    district = Enum.find(areas, &(&1.area_type_key == "state" and &1.code == "DC"))
+
+    assert %Area.Name{name: "District of Columbia", kind: :official} in district.names
+  end
+
+  # A row that agrees with itself yields one state, not the same one twice
+  # under two derivations.
+  test "a county in the row's own state adds no second state" do
+    areas = normalize_row!("uszips", zip_payload("99001"))
+
+    assert areas |> Enum.filter(&(&1.area_type_key == "state")) |> Enum.map(& &1.code) == ["VT"]
+  end
+
+  # 51107 is Loudoun County and 24031 is Montgomery County, Maryland: one ZIP
+  # touching counties in two states files each under its own, rather than
+  # both under whichever the row happens to name.
+  test "a zip crossing a state line files each county under its own state" do
+    payload =
+      "20041"
+      |> zip_payload()
+      |> Map.put("county_fips_all", "51107|24031")
+      |> Map.put("county_names_all", "Loudoun County|Montgomery County")
+      |> Map.put("county_weights", ~s({"51107": 80.0, "24031": 20.0}))
+
+    edges = asserted_edges("uszips", payload)
+
+    assert {"census:state:VA", "census:county:51107", "contains"} in edges
+    assert {"census:state:MD", "census:county:24031", "contains"} in edges
+
+    areas = normalize_row!("uszips", payload)
+    states = areas |> Enum.filter(&(&1.area_type_key == "state")) |> Enum.map(& &1.code)
+
+    assert states == ["DC", "VA", "MD"]
+  end
+
+  # The row states two things about the county and they contradict each
+  # other. Only the FIPS is about the county, and here it names no state at
+  # all, so there is nothing left to hang the county from -- and the row's own
+  # state column is the value already known to be describing something else.
+  # The county keeps the edge that does not depend on the answer.
+  test "a county whose FIPS names no state gets no state parent at all" do
+    payload =
+      "20041"
+      |> zip_payload()
+      |> Map.put("county_fips", "99107")
+      |> Map.put("county_fips_all", "99107")
+      |> Map.put("county_names_all", "Nowhere County")
+      |> Map.put("county_weights", ~s({"99107": 100}))
+
+    edges = asserted_edges("uszips", payload)
+
+    assert edges == [{"census:county:99107", "usps:zip:20041", "contains"}]
   end
 
   test "a row from an artifact this provider does not parse asserts no edges" do
@@ -552,20 +648,20 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   end
 
   test "a blank id is an error rather than a city keyed on an empty code" do
-    assert {:error, message} = blank_field_error("uscities", city_payload("Los Angeles"), "id")
+    assert {:error, message} = blank_field_error("uscities", city_payload("Fernbridge"), "id")
     assert message =~ ~s("id")
   end
 
   test "a blank zip is an error rather than a zip keyed on an empty code" do
-    assert {:error, message} = blank_field_error("uszips", zip_payload("90001"), "zip")
+    assert {:error, message} = blank_field_error("uszips", zip_payload("99001"), "zip")
     assert message =~ ~s("zip")
   end
 
   test "a blank state_id is an error on either file" do
     assert {:error, cities_message} =
-             blank_field_error("uscities", city_payload("Los Angeles"), "state_id")
+             blank_field_error("uscities", city_payload("Fernbridge"), "state_id")
 
-    assert {:error, zips_message} = blank_field_error("uszips", zip_payload("90001"), "state_id")
+    assert {:error, zips_message} = blank_field_error("uszips", zip_payload("99001"), "state_id")
 
     assert cities_message =~ ~s("state_id")
     assert zips_message =~ ~s("state_id")
@@ -574,12 +670,12 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # An import halts on the first row it cannot normalize, so the error has to
   # name the row as well as the column.
   test "a blank-column error names the row it halted on" do
-    assert {:error, message} = blank_field_error("uscities", city_payload("Los Angeles"), "id")
-    assert message =~ "city=Los Angeles"
-    assert message =~ "state_id=CA"
+    assert {:error, message} = blank_field_error("uscities", city_payload("Fernbridge"), "id")
+    assert message =~ "city=Fernbridge"
+    assert message =~ "state_id=VT"
 
-    assert {:error, zip_message} = blank_field_error("uszips", zip_payload("90001"), "state_id")
-    assert zip_message =~ "zip=90001"
+    assert {:error, zip_message} = blank_field_error("uszips", zip_payload("99001"), "state_id")
+    assert zip_message =~ "zip=99001"
   end
 
   # A required column goes blank when the download is corrupt or truncated,
@@ -588,7 +684,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # run, so each value it names is capped rather than copied whole.
   test "a blank-column error caps each value it names" do
     swallowed = String.duplicate("a", 500)
-    payload = "Los Angeles" |> city_payload() |> Map.put("city", swallowed)
+    payload = "Fernbridge" |> city_payload() |> Map.put("city", swallowed)
 
     assert {:error, message} = blank_field_error("uscities", payload, "id")
 
@@ -600,7 +696,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # row can carry none of them and the error still has to say something.
   test "a row carrying none of the columns that describe it says so" do
     payload =
-      "Los Angeles"
+      "Fernbridge"
       |> city_payload()
       |> Map.merge(%{"city" => "", "state_id" => ""})
 

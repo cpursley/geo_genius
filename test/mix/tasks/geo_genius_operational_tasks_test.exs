@@ -221,8 +221,11 @@ defmodule GeoGenius.OperationalTasksTest do
                ])
     end
 
-    test "geo_genius.import defaults its flags and await timeout" do
-      assert %{publish: false, await: false, timeout: 300_000, owner: nil} =
+    # An absent --timeout parses to nil rather than to a number of its own:
+    # a value here would win against `GeoGenius.await/3`'s resolution and put
+    # `config :geo_genius, :await_timeout` out of the task's reach entirely.
+    test "geo_genius.import defaults its flags and leaves the await timeout unresolved" do
+      assert %{publish: false, await: false, timeout: nil, owner: nil} =
                Import.parse_args(["--collection", "demo", "--release", "r1"])
     end
 
@@ -919,6 +922,30 @@ defmodule GeoGenius.OperationalTasksTest do
       # `GeoGenius.await(run_id)` waits the 300_000ms default instead, which
       # is invisible in the message and invisible in the outcome -- the run
       # times out either way. Elapsed time is the only witness.
+      run_id = run_id!(context(), collection, release)
+      assert exception.message == "GeoGenius import run #{run_id} did not finish within 300ms"
+      assert elapsed < 10_000
+    end
+
+    @tag timeout: 20_000
+    test "geo_genius.import honours the configured await timeout when --timeout is absent" do
+      {collection, release} = seeded_manifest!()
+
+      Application.put_env(:geo_genius, :await_timeout, 300)
+      on_exit(fn -> Application.delete_env(:geo_genius, :await_timeout) end)
+
+      started = System.monotonic_time(:millisecond)
+
+      exception =
+        assert_raise Mix.Error, fn ->
+          Import.run(~w(--collection #{collection} --release #{release} --await) ++ repo_args())
+        end
+
+      elapsed = System.monotonic_time(:millisecond) - started
+
+      # A task carrying a default of its own passes it to `await/3` as an
+      # explicit argument, which wins the resolution -- so the configured
+      # value never applies and the wait runs to the library ceiling instead.
       run_id = run_id!(context(), collection, release)
       assert exception.message == "GeoGenius import run #{run_id} did not finish within 300ms"
       assert elapsed < 10_000

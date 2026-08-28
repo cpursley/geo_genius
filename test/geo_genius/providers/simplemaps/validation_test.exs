@@ -18,21 +18,21 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   @zips Path.expand("../../../support/fixtures/simplemaps/uszips_sample.csv", __DIR__)
 
   test "a primary county_fips missing from county_fips_all fails" do
-    payload = %{city_payload() | "county_fips" => "06037", "county_fips_all" => "06075"}
+    payload = %{city_payload() | "county_fips" => "50101", "county_fips_all" => "50199"}
 
     assert {:error, message} = Validation.check(row("uscities", payload))
-    assert message =~ "county_fips 06037"
+    assert message =~ "county_fips 50101"
     assert message =~ "county_fips_all"
   end
 
   test "county_fips_all and county_name_all of differing length fails" do
-    # Kansas City's real primary is "29095" (Jackson), so the shortened list
-    # below still carries its primary and the failure is the length
+    # Millhaven's primary is "29201" (Journey County), so the shortened
+    # list below still carries its primary and the failure is the length
     # mismatch this test is about, not the primary-inclusion rule.
     payload = %{
-      city_payload("Kansas City")
-      | "county_fips_all" => "29095|29037",
-        "county_name_all" => "Jackson"
+      city_payload("Millhaven")
+      | "county_fips_all" => "29201|29204",
+        "county_name_all" => "Journey County"
     }
 
     assert {:error, message} = Validation.check(row("uscities", payload))
@@ -43,8 +43,8 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   test "a zip whose county_weights keys differ from its county set fails" do
     payload = %{
       zip_payload()
-      | "county_fips_all" => "06037",
-        "county_weights" => ~s({"06075": 100})
+      | "county_fips_all" => "50101",
+        "county_weights" => ~s({"50199": 100})
     }
 
     assert {:error, message} = Validation.check(row("uszips", payload))
@@ -52,7 +52,7 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   end
 
   test "a county_weights that is not valid JSON fails" do
-    payload = %{zip_payload() | "county_weights" => ~s({"06037": )}
+    payload = %{zip_payload() | "county_weights" => ~s({"50101": )}
 
     assert {:error, message} = Validation.check(row("uszips", payload))
     assert message =~ "county_weights"
@@ -82,7 +82,7 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
 
     assert {:error, message} = Validation.check(row("uscities", payload))
     assert message =~ "county_fips_all names no county"
-    assert message =~ "city=Los Angeles"
+    assert message =~ "city=Fernbridge"
   end
 
   # A military APO ZIP delivers to an overseas address in no US county, so
@@ -90,7 +90,7 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   # real file's 41,551 rows look like this; failing them would abort a real
   # import on the first one.
   test "a uszips row naming no county passes" do
-    payload = zip_payload("09002")
+    payload = zip_payload("09001")
 
     assert payload["county_fips_all"] == ""
     assert payload["county_weights"] == ""
@@ -106,7 +106,7 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
 
     assert {:error, message} = Validation.check(row("uszips", payload))
     assert message =~ "county_weights is blank"
-    assert message =~ "06037"
+    assert message =~ "50101"
   end
 
   # The fourth combination of the two columns, and the only one with no rule
@@ -255,8 +255,8 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
 
   defp row(artifact, payload), do: %Staging.Row{artifact: artifact, payload: payload, geom: nil}
 
-  defp city_payload(city \\ "Los Angeles"), do: staged_payload(@cities, "uscities", "city", city)
-  defp zip_payload(zip \\ "90001"), do: staged_payload(@zips, "uszips", "zip", zip)
+  defp city_payload(city \\ "Fernbridge"), do: staged_payload(@cities, "uscities", "city", city)
+  defp zip_payload(zip \\ "99001"), do: staged_payload(@zips, "uszips", "zip", zip)
 
   # Payloads come from staging the real sample files rather than being
   # written by hand, so a payload this test mutates still starts from every

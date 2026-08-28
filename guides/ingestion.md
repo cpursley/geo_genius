@@ -291,6 +291,10 @@ names a city, but only as the mailing name the USPS prefers for that ZIP, so tha
 a `:mailing` name on the ZIP rather than a city area of its own -- the `uscities` file is
 where a city gets its identity.
 
+A row whose counties do not all lie in the state it names yields those states too, one
+area each, read from the county FIPS prefixes. They carry a code and no name: `state_name`
+on the row describes the row's state, not theirs.
+
 ### Three authorities, and the six state codes that key under the USPS
 
 The manifest must declare all three. An area naming an authority the collection does not
@@ -338,6 +342,14 @@ state-to-county edge per county it names, and a county-to-child edge per county:
 `contains` when the row names one county, `overlaps` when it names several, since a place
 crossing county lines is contained by neither. No edge is ever asserted between a city and
 a ZIP in either direction -- a ZIP crosses city lines and neither one contains the other.
+
+**A county's state comes from its own FIPS, never from the row's `state_id` column.** A
+five-digit county FIPS begins with the two-digit FIPS of the state that assigns it, and
+that is the only statement about the county's state a row cannot get wrong: ZIP `20041`
+is a District of Columbia address for county `51107`, which is in Virginia, and 150 of the
+source's 3,233 counties are named on rows of more than one state. A county whose prefix
+names no state `GeoGenius.Providers.SimpleMaps.Fips` carries gets no state parent at all,
+since the row's own column is the value already known to be describing something else.
 
 A row naming no county asserts one edge instead: its state contains the ZIP directly.
 That is the only parent such a row names, and hanging it there is truer than leaving it
@@ -512,14 +524,33 @@ against the manifest's expectation. Measures `artifacts`, `downloaded`, `cached`
 trusting what the previous phase believed, which is what makes it a check.
 
 `staging` calls the provider's `stage/5` for each artifact and writes the emitted rows
-into an unlogged table of this run's own.
+into an unlogged table of this run's own. The table is emptied first: a resumed run stages
+afresh, and an attempt killed where its cleanup could not run leaves rows behind under the
+same run id.
 
 `normalizing` reads the staged rows back in batches, calls the provider's `normalize/2`
 on each, and writes the areas, names, codes, membership, and boundaries through
 `GeoGenius.Catalog`.
 
+A batch is collected in full and then written as a set: one statement for its areas, one
+for its names, one for its codes, one for its memberships, through the
+[set writes](sql_api.md#set-writes). Boundaries are still one statement each. A source that
+denormalises a hierarchy names the same county in every city row of it, so a batch
+describes far fewer distinct areas than it has rows, and one statement per area spends a
+round trip on every repeat. Measured on the US SimpleMaps import -- 150,622 staged rows,
+466,262 area writes over 153,917 distinct areas -- this phase costs 2,449 statements and
+39.6 s written as sets, against 1,755,328 statements and 994.8 s written one area at a
+time.
+
+Collecting before writing also decides what a provider's own error leaves behind: an
+illegal name kind, or a staged row naming an artifact this run did not stage, fails the
+phase with none of that batch written, rather than partway through it. Earlier batches are
+already committed, which is what makes the phase resumable; nothing opens a transaction
+around a batch.
+
 `relating` rebuilds measured relations from boundary overlap when `relations/1` asks for
-it, and then writes every edge `asserted_relations/2` returns for each staged row. The
+it, and then writes every edge `asserted_relations/2` returns for each staged row, one
+set write per batch the same way `normalizing` writes areas. The
 two compose: a release can carry both. Measures `relations` (only when a rebuild ran) and
 `asserted_relations`, which counts edges asserted rather than distinct edges written --
 two rows asserting the same edge each add one, though the edge itself upserts to a single
@@ -547,6 +578,11 @@ state machine is deliberately resumable, so wrapping the run would roll back the
 a resumed run wants to start from and would hold one connection for the length of the
 slowest phase. The staging table is dropped on success and on failure alike.
 
+A resumed run re-runs every phase from `downloading`, rather than picking up at the phase
+it stopped in. What makes that cheap is the artifact cache, which skips the network; the
+staged rows of the interrupted attempt are discarded rather than reused, so a source that
+changed between attempts cannot leave a deleted row in the release.
+
 ## Reading a run
 
 `GeoGenius.import/1` returns `{:ok, run_id}` once the run is claimed and enqueued. The
@@ -559,7 +595,7 @@ rather than to a process.
 GeoGenius.status(run_id)
 # %GeoGenius.ImportRun{status: "normalizing", stage_metrics: %{"staged" => 1200}, ...}
 
-GeoGenius.await(run_id, 600_000)
+GeoGenius.await(run_id)
 # {:ok, %GeoGenius.ImportRun{status: "completed"}}
 ```
 
@@ -568,6 +604,17 @@ catalog does not carry. `await/3` polls every 250ms until the run finishes or th
 elapses, returning `{:ok, run}`, `{:error, run}` for a run that finished and failed, or
 `{:error, :timeout}`. Both read the `import_run_status` view described in
 [`sql_api.md`](sql_api.md#views).
+
+`await/3`'s `timeout` resolves the explicit argument first, then
+`config :geo_genius, :await_timeout`, then a library default of 1,800,000ms (thirty
+minutes). A full US SimpleMaps import, which carries no boundaries, runs in well under two
+minutes; the thirty are sized for a boundary-carrying collection, which still writes one
+`put_boundary` per area. Pass
+`:infinity` at either level for a caller willing to wait as long as it takes:
+
+```elixir
+GeoGenius.await(run_id, :infinity)
+```
 
 `stage_metrics` accumulates what each phase measured; `progress` is the lease's rolling
 progress object, updated by heartbeats during a phase. A failed run carries the reason on

@@ -96,6 +96,7 @@ defmodule GeoGenius.MixProject do
         "guides/installation.md",
         "guides/reading.md",
         "guides/ingestion.md",
+        "guides/projections.md",
         "guides/sql_api.md",
         "CHANGELOG.md"
       ],
@@ -110,8 +111,16 @@ defmodule GeoGenius.MixProject do
     [
       Reading: [
         GeoGenius.AreaMatch,
+        GeoGenius.SeededMatch,
+        GeoGenius.Published,
+        GeoGenius.Published.Area,
+        GeoGenius.Published.AreaCode,
+        GeoGenius.Published.AreaName,
+        GeoGenius.Published.AreaRelation,
         GeoGenius.Query,
-        GeoGenius.Preflight
+        GeoGenius.Preflight,
+        GeoGenius.ReleaseArtifacts,
+        GeoGenius.ReleaseArtifacts.Artifact
       ],
       Ingestion: [
         GeoGenius.ImportRun,
@@ -155,6 +164,7 @@ defmodule GeoGenius.MixProject do
         GeoGenius.Migrations.V01
       ],
       Exceptions: [
+        GeoGenius.ArtifactError,
         GeoGenius.CatalogError,
         GeoGenius.ImportError,
         GeoGenius.ManifestError,
@@ -173,6 +183,7 @@ defmodule GeoGenius.MixProject do
         GeoGenius.Pipeline.CommandAllowlist,
         GeoGenius.Pipeline.Normalize,
         GeoGenius.Pipeline.State,
+        GeoGenius.Published.Prefix,
         GeoGenius.Providers.Batch,
         GeoGenius.Providers.Fields,
         GeoGenius.Providers.ManifestOptions,

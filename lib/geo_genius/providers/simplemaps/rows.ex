@@ -37,6 +37,14 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   would. Those three exist so their ZIPs have a parent, and a host that wants
   a label for them supplies its own.
 
+  A county belongs to the state its FIPS is assigned within -- the first two
+  digits of a five-digit county FIPS -- and not to whatever state the row
+  carrying it names. The two disagree wherever a mailing address crosses a
+  state line, and `GeoGenius.Providers.SimpleMaps.Fips` is where the prefix is
+  read. A row whose county lies in another state yields that state as an area
+  of its own beside the row's, so the hierarchy `edges/1` asserts from the
+  same prefix can only name areas `areas/1` produced.
+
   A county and a state are read out of columns rather than off rows of their
   own, so they carry only what those columns say: their code, their name, and
   their FIPS or ANSI code. They get no centroid, because the row's `lat`/`lng`
@@ -63,6 +71,7 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   alias GeoGenius.Provider.Area.Code
   alias GeoGenius.Provider.Area.Name
   alias GeoGenius.Providers.Fields
+  alias GeoGenius.Providers.SimpleMaps.Fips
   alias GeoGenius.Providers.SimpleMaps.Validation
   alias GeoGenius.Staging
 
@@ -110,6 +119,11 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   `county_weights` naming a county set that disagrees with it -- is an error
   before anything is built from it.
 
+  A row whose counties do not all lie in the state it names yields the states
+  they do lie in as well, one area each, read from their FIPS prefixes. A ZIP
+  in the District of Columbia naming a county in Virginia describes Virginia,
+  however little of it, and the county has to hang somewhere.
+
   A row whose city, ZIP, or state code is blank is an error rather than an
   area: `area_key` is `<authority>:<area_type>:<code>`, so a blank code would
   put every such row under one shared, meaningless key.
@@ -136,7 +150,9 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
          {:ok, state_id} <- require_field(payload, "state_id") do
       counties = counties(payload, @cities_county_names)
 
-      {:ok, [city(id, payload) | counties] ++ [state(state_id, payload)]}
+      {:ok,
+       [city(id, payload) | counties] ++
+         [state(state_id, payload) | county_states(counties, state_id)]}
     end
   end
 
@@ -145,7 +161,9 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
          {:ok, state_id} <- require_field(payload, "state_id") do
       counties = counties(payload, @zips_county_names)
 
-      {:ok, counties ++ [zip(code, payload), state(state_id, payload)]}
+      {:ok,
+       counties ++
+         [zip(code, payload), state(state_id, payload) | county_states(counties, state_id)]}
     end
   end
 
@@ -170,7 +188,10 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
 
   A `uscities` row asserts one state-to-county edge per county it names and
   one county-to-city edge per county; a `uszips` row asserts the same
-  state-to-county edges and a county-to-zip edge per county. A ZIP row's
+  state-to-county edges and a county-to-zip edge per county. The state on a
+  county's edge is the one its own FIPS prefix names, never the one the row
+  carrying it does, and a county whose prefix names no state this provider
+  knows gets no state edge at all rather than a false one. A ZIP row's
   `city` column is the mailing name USPS prefers for that ZIP, so no edge is
   asserted between a city and a ZIP in either direction -- a ZIP crosses city
   lines, and neither one contains the other.
@@ -221,19 +242,58 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   end
 
   # A county FIPS is assigned within a state and its first two digits name
-  # that state, so a state contains every county on the row however many
-  # there are. The city or ZIP is contained only where the row names one
-  # county; a row naming several describes a place crossing county lines,
-  # which each of those counties overlaps rather than contains.
-  defp hierarchy(counties, payload, child_key) do
-    state_key = key_of(payload, "state_id", &state/2)
+  # that state, so each county hangs under the state its own code states
+  # rather than under the one the row's `state_id` column carries: ZIP 20041
+  # is a District of Columbia address for county 51107, which is in Virginia,
+  # and 150 of the source's 3,233 counties are named on rows of more than one
+  # state. The city or ZIP is contained only where the row names one county;
+  # a row naming several describes a place crossing county lines, which each
+  # of those counties overlaps rather than contains.
+  defp hierarchy(counties, _payload, child_key) do
     child_type = child_relation_type(counties)
 
     Enum.flat_map(counties, fn county ->
       county_key = Area.key(county)
 
-      edge(state_key, county_key, "contains") ++ edge(county_key, child_key, child_type)
+      edge(state_key_of(county), county_key, "contains") ++
+        edge(county_key, child_key, child_type)
     end)
+  end
+
+  # A county whose FIPS names no state this provider carries a code for gets
+  # no state parent, rather than the row's own state: the row's column
+  # describes the row's address, which is a different claim, and it is wrong
+  # about the county often enough to be why the prefix is read at all.
+  # `edge/3` drops a nil parent, so the county keeps its child edge and loses
+  # only the assertion nothing supports.
+  defp state_key_of(county) do
+    case county_state(county) do
+      nil -> nil
+      state -> Area.key(state)
+    end
+  end
+
+  # The state a county belongs to, built through the same `state/2` every
+  # other state area is, so a derived one carries the authority, code type and
+  # key the row's own would. It carries no name: `state_name` on the row
+  # describes the row's state, and copying it onto a different state would
+  # label Virginia "District of Columbia".
+  defp county_state(%Area{code: fips}) do
+    case Fips.state_code(fips) do
+      nil -> nil
+      code -> state(code, %{})
+    end
+  end
+
+  # The states a row's counties lie in that the row itself does not name.
+  # `GeoGenius.Catalog.put_relation/3` requires both ends of an edge to be
+  # members of the release, so the state a county hangs under has to be an
+  # area this row produced, not one another row is assumed to have produced.
+  defp county_states(counties, state_id) do
+    counties
+    |> Enum.map(&county_state/1)
+    |> Enum.reject(&(is_nil(&1) or &1.code == state_id))
+    |> Enum.uniq_by(& &1.code)
   end
 
   defp child_relation_type([_county]), do: "contains"

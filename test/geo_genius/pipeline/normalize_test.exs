@@ -8,6 +8,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   alias GeoGenius.Pipeline.State
   alias GeoGenius.Provider.Area
   alias GeoGenius.Provider.Area.Name
+  alias GeoGenius.RecordingRepo
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
 
@@ -196,22 +197,20 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     assert Enum.count(keys, &(&1 == "demo_auth:state:CA")) == 1
   end
 
-  test "a bad name kind on the second area fails the row's normalization outright" do
+  test "a bad name kind on the second area fails the batch outright" do
     state = normalize_fixture(SecondAreaBadKindProvider, [%{"city" => "LA", "state" => "CA"}])
 
     assert {:error, reason} = Normalize.normalize(state)
     assert reason =~ "demo_auth:state:CA"
     assert reason =~ ":bogus"
 
-    # The rejected area was never written -- it fails validation before any
-    # write for it happens -- while the row's earlier, valid area landed
-    # ahead of it, since a row is not written as one transaction.
-    keys = area_keys_in_release(state)
-    refute "demo_auth:state:CA" in keys
-    assert "demo_auth:city:LA" in keys
+    # A batch is collected before any of it is written, so the area the
+    # provider described legally, ahead of the one it did not, is not written
+    # either: the phase fails having written nothing.
+    assert area_keys_in_release(state) == []
   end
 
-  test "a bad name kind stops the row's remaining areas from being written" do
+  test "a bad name kind leaves no area of the batch written, before it or after" do
     payloads = [%{"city" => "LA", "state" => "CA", "zip" => "90001"}]
     state = normalize_fixture(MiddleAreaBadKindProvider, payloads)
 
@@ -219,12 +218,37 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     assert reason =~ "demo_auth:state:CA"
 
     keys = area_keys_in_release(state)
-    assert "demo_auth:city:LA" in keys
+    refute "demo_auth:city:LA" in keys
     refute "demo_auth:state:CA" in keys
-
-    # The area after the rejected one never reaches a write, so a row's
-    # failure cannot be half-applied past the point it failed at.
     refute "demo_auth:zip:90001" in keys
+  end
+
+  test "a batch costs one statement per kind of write, not one per area" do
+    rows = Enum.map(1..40, &%{"city" => "city-#{&1}", "state" => "CA"})
+    state = normalize_fixture(MultiAreaProvider, rows)
+    recording = %{state | context: %{state.context | repo: RecordingRepo}}
+
+    assert {:ok, %State{metrics: metrics}} = Normalize.normalize(recording)
+    assert metrics["areas"] == 80
+
+    written =
+      recorded_statements()
+      |> Enum.filter(&String.contains?(&1, "geo_genius"))
+      |> Enum.map(&statement_name/1)
+      |> Enum.frequencies()
+
+    # 40 rows describing 80 areas, in one batch: without the set writes this
+    # would be 40 upserts, 40 name writes and 40 membership writes for the
+    # cities alone, and as many again for the state each row repeats.
+    assert written["upsert_area_many"] == 1
+    assert written["put_area_name_many"] == 1
+    assert written["put_area_in_release_many"] == 1
+    refute Map.has_key?(written, "upsert_area")
+    refute Map.has_key?(written, "put_area_name")
+    refute Map.has_key?(written, "put_area_in_release")
+
+    # No codes were described, so no statement was issued for them at all.
+    refute Map.has_key?(written, "put_area_code_many")
   end
 
   # Registers a collection carrying `provider`'s own area types under a
@@ -293,5 +317,25 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
       )
 
     Enum.map(rows, fn [area_key] -> area_key end)
+  end
+
+  # Every statement RecordingRepo saw, in the order it saw them. Normalize runs
+  # in the calling process, so the records are already in this test's mailbox.
+  defp recorded_statements do
+    receive do
+      {:query, sql, _params, _opts} -> [sql | recorded_statements()]
+    after
+      0 -> []
+    end
+  end
+
+  # The catalog function a statement calls, which is what the count above is
+  # about: `SELECT "geo_genius".upsert_area_many($1, ...)` names
+  # `upsert_area_many`.
+  defp statement_name(sql) do
+    case Regex.run(~r/"geo_genius"\.(\w+)\(/, sql) do
+      [_match, function] -> function
+      nil -> sql
+    end
   end
 end

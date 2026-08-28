@@ -1,12 +1,16 @@
 defmodule GeoGenius.Stores.Postgres do
   @moduledoc """
-  The shipped store. Every read is one call to a SQL function in the installed
-  schema, with every optional argument bound explicitly.
+  Every read is one call to a SQL function in the installed schema, with every
+  optional argument bound explicitly, so a read never inherits a default from
+  the database that differs from the one the library documents.
+
+  A host reaches this through `GeoGenius.Context`; configuring `:store` is what
+  replaces it.
   """
 
   @behaviour GeoGenius.Store
 
-  alias GeoGenius.{AreaMatch, Context, QueryError}
+  alias GeoGenius.{AreaMatch, Context, QueryError, SeededMatch}
 
   # One projection serves every read. `AreaMatch` enforces `:area_key` and maps
   # by column name, so a read that projected a subset would fail on its first
@@ -32,6 +36,12 @@ defmodule GeoGenius.Stores.Postgres do
   coverage_of_area::double precision AS coverage_of_area,
   score::double precision AS score
   """
+
+  # The plural reads return seeded_area_match, which is the same sixteen
+  # columns behind the seed that produced the row. `SeededMatch` finds the seed
+  # by name and hands the rest to `AreaMatch`, so the two projections stay one
+  # definition rather than two lists that could drift.
+  @seeded_projection "seed_key,\n" <> @projection
 
   @impl GeoGenius.Store
   def areas_for_point(%Context{} = context, lon, lat, opts) do
@@ -143,6 +153,54 @@ defmodule GeoGenius.Stores.Postgres do
   end
 
   @impl GeoGenius.Store
+  def children_of_many(%Context{} = context, area_keys, opts) do
+    call_seeded(context, "children_of_many", "$1, $2, $3, $4, $5, $6", [
+      area_keys,
+      opts[:types],
+      opts[:classifications],
+      Keyword.get(opts, :max_depth, 1),
+      release_id(opts),
+      include_retired(opts)
+    ])
+  end
+
+  @impl GeoGenius.Store
+  def ancestors_of_many(%Context{} = context, area_keys, opts) do
+    call_seeded(context, "ancestors_of_many", "$1, $2, $3, $4, $5, $6", [
+      area_keys,
+      opts[:types],
+      opts[:classifications],
+      Keyword.get(opts, :max_depth, 1),
+      release_id(opts),
+      include_retired(opts)
+    ])
+  end
+
+  @impl GeoGenius.Store
+  def related_areas_many(%Context{} = context, area_keys, opts) do
+    call_seeded(context, "related_areas_many", "$1, $2, $3, $4", [
+      area_keys,
+      opts[:classifications],
+      release_id(opts),
+      include_retired(opts)
+    ])
+  end
+
+  @impl GeoGenius.Store
+  def areas_by_code_many(%Context{} = context, code_type, code_values, opts) do
+    call_seeded(context, "areas_by_code_many", "$1, $2, $3, $4, $5, $6, $7, $8", [
+      code_type,
+      code_values,
+      opts[:collections],
+      opts[:types],
+      release_id(opts),
+      include_retired(opts),
+      opts[:parent_area_key],
+      Keyword.get(opts, :parent_max_depth, 1)
+    ])
+  end
+
+  @impl GeoGenius.Store
   def release_at(%Context{} = context, %DateTime{} = as_of, opts) do
     collection =
       case Keyword.fetch(opts, :collection) do
@@ -194,17 +252,36 @@ defmodule GeoGenius.Stores.Postgres do
   def dump_uuid(<<_::128>> = release_id), do: release_id
   def dump_uuid(release_id) when is_binary(release_id), do: Ecto.UUID.dump!(release_id)
 
+  # The two shapes a row-returning read comes back in: area_match for the
+  # singular reads, seeded_area_match for the plural ones. Each names its own
+  # projection and the module that maps it; everything else about the call is
+  # identical.
+  defp call(context, function, placeholders, params) do
+    query(context, function, placeholders, params, @projection, &AreaMatch.from_result/1)
+  end
+
+  defp call_seeded(context, function, placeholders, params) do
+    query(context, function, placeholders, params, @seeded_projection, &SeededMatch.from_result/1)
+  end
+
   # `GeoGenius.Context.new/1` validates the prefix, so a context built through
   # it carries an identifier already proven safe to interpolate. A `%Context{}`
   # assembled as a struct literal skips that validation, and this interpolation
   # trusts whatever such a context carries. Everything a caller supplies as
   # data travels as a bound parameter regardless.
-  defp call(%Context{repo: repo, prefix: prefix}, function, placeholders, params) do
+  defp query(
+         %Context{repo: repo, prefix: prefix},
+         function,
+         placeholders,
+         params,
+         projection,
+         map
+       ) do
     GeoGenius.Telemetry.span(function, %{prefix: prefix}, fn ->
-      sql = "SELECT #{@projection} FROM \"#{prefix}\".#{function}(#{placeholders})"
+      sql = "SELECT #{projection} FROM \"#{prefix}\".#{function}(#{placeholders})"
 
       case run(repo, sql, params) do
-        {:ok, result} -> AreaMatch.from_result(result)
+        {:ok, result} -> map.(result)
         {:error, reason} -> raise QueryError, function: function, reason: reason
       end
     end)

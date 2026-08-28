@@ -25,7 +25,7 @@ defmodule GeoGenius do
     end
   end
 
-  alias GeoGenius.{AreaMatch, Context, Store}
+  alias GeoGenius.{AreaMatch, Context, ReleaseArtifacts, SeededMatch, Store}
 
   @doc """
   Areas whose boundary covers a point.
@@ -47,7 +47,7 @@ defmodule GeoGenius do
     context.store.areas_for_geometry(context, geometry, opts)
   end
 
-  @doc "Areas within a radius of a point, nearest first. Accepts `:limit`."
+  @doc "Areas within a radius of a point, nearest first. Accepts `:limit`, `nil` for none."
   @spec areas_near(Store.numeric(), Store.numeric(), Store.numeric(), keyword()) ::
           [AreaMatch.t()]
   def areas_near(lon, lat, radius_m, opts \\ []) do
@@ -68,7 +68,7 @@ defmodule GeoGenius do
     context.store.areas_by_code(context, code_type, code_value, opts)
   end
 
-  @doc "Areas ranked by name similarity. Accepts `:limit`."
+  @doc "Areas ranked by name similarity. Accepts `:limit`, `nil` for none."
   @spec search_areas(String.t(), keyword()) :: [AreaMatch.t()]
   def search_areas(query, opts \\ []) do
     context = Context.new(opts)
@@ -115,6 +115,65 @@ defmodule GeoGenius do
   end
 
   @doc """
+  Areas below each of these, one call instead of one call per key.
+
+  Every row carries the seed it came from in `GeoGenius.SeededMatch`'s
+  `:seed_key`, because a result mixes rows from every seed. A seed with no
+  children contributes no row rather than an empty one, and the rows come back
+  in the order the seeds were given. Takes the same options as
+  `children_of/2`.
+
+  Resolving a list this way collapses N round trips to one, which is the whole
+  of what it saves: the SQL still runs the singular read once per seed, and
+  the planner cannot push a predicate into a `SETOF` function either way. A
+  caller that wants to join catalog areas against its own tables, or aggregate
+  over them, wants `GeoGenius.Query`'s composable path instead of this.
+
+      GeoGenius.children_of_many(county_keys)
+      |> Enum.group_by(& &1.seed_key, & &1.match)
+  """
+  @spec children_of_many(Store.seeds(), keyword()) :: [SeededMatch.t()]
+  def children_of_many(area_keys, opts \\ []) do
+    context = Context.new(opts)
+    context.store.children_of_many(context, area_keys, opts)
+  end
+
+  @doc """
+  Areas above each of these, one call instead of one call per key. Seed
+  attribution and options match `children_of_many/2`.
+  """
+  @spec ancestors_of_many(Store.seeds(), keyword()) :: [SeededMatch.t()]
+  def ancestors_of_many(area_keys, opts \\ []) do
+    context = Context.new(opts)
+    context.store.ancestors_of_many(context, area_keys, opts)
+  end
+
+  @doc """
+  Areas related to each of these in either direction, one call instead of one
+  call per key. Seed attribution and options match `children_of_many/2`.
+  """
+  @spec related_areas_many(Store.seeds(), keyword()) :: [SeededMatch.t()]
+  def related_areas_many(area_keys, opts \\ []) do
+    context = Context.new(opts)
+    context.store.related_areas_many(context, area_keys, opts)
+  end
+
+  @doc """
+  Areas carrying any of these code values under one code type, one call
+  instead of one call per value.
+
+  The seed here is the code value, not an area key, so `:seed_key` holds the
+  value that found each row. Options match `areas_by_code/3`, including
+  `:parent_area_key` and `:parent_max_depth`, which apply to every value in
+  the list.
+  """
+  @spec areas_by_code_many(String.t(), Store.seeds(), keyword()) :: [SeededMatch.t()]
+  def areas_by_code_many(code_type, code_values, opts \\ []) do
+    context = Context.new(opts)
+    context.store.areas_by_code_many(context, code_type, code_values, opts)
+  end
+
+  @doc """
   The release a collection had published at a moment, or nil if it had
   published nothing yet. Requires `:collection`.
 
@@ -127,10 +186,17 @@ defmodule GeoGenius do
     context.store.release_at(context, as_of, opts)
   end
 
-  alias GeoGenius.{Catalog, CatalogError, ImportRun, Manifest, ManifestError, Registration}
+  alias GeoGenius.{
+    Catalog,
+    CatalogError,
+    Config,
+    ImportRun,
+    Manifest,
+    ManifestError,
+    Registration
+  }
 
   @default_stale_after_seconds 900
-  @default_await_timeout 300_000
   @await_poll_interval 250
   @default_publish_timeout 900_000
 
@@ -186,16 +252,23 @@ defmodule GeoGenius do
 
   Returns `{:ok, run}` once `GeoGenius.ImportRun.finished?/1` is true and the
   run succeeded, `{:error, run}` once it finished and failed, and
-  `{:error, :timeout}` once `timeout` (default 300,000ms) elapses with
-  neither. Polls the catalog every 250ms rather than monitoring a process:
-  the run may be executing on another node entirely, and the durable row in
-  PostgreSQL is the only thing both sides can see.
+  `{:error, :timeout}` once `timeout` elapses with neither. Polls the catalog
+  every 250ms rather than monitoring a process: the run may be executing on
+  another node entirely, and the durable row in PostgreSQL is the only thing
+  both sides can see.
+
+  `timeout` resolves in this order: the argument given here, then
+  `config :geo_genius, :await_timeout`, then the library default of
+  1,800,000ms (thirty minutes) -- comfortably past the ~17 minutes a full US
+  SimpleMaps import takes, without blocking a caller that never says
+  otherwise for the length of a genuinely hung run. `:infinity` is accepted
+  at every level for a caller willing to wait as long as it takes.
   """
-  @spec await(Ecto.UUID.t(), timeout(), keyword()) ::
+  @spec await(Ecto.UUID.t(), timeout() | nil, keyword()) ::
           {:ok, ImportRun.t()} | {:error, ImportRun.t()} | {:error, :timeout}
-  def await(run_id, timeout \\ @default_await_timeout, opts \\ []) do
+  def await(run_id, timeout \\ nil, opts \\ []) do
     context = Context.new(opts)
-    poll_run(context, run_id, deadline_at(timeout))
+    poll_run(context, run_id, deadline_at(timeout || Config.await_timeout(opts)))
   end
 
   @doc """
@@ -275,6 +348,31 @@ defmodule GeoGenius do
     context = Context.new(opts)
     Catalog.published_release(context, collection_key)
   end
+
+  @doc """
+  Every artifact the collection's published release was built from, with where
+  each one resolves to on this machine, ordered by logical name.
+
+  `:release_id` reads a release other than the published one, which is how a
+  host fills a projection for a release before it goes live. See
+  `GeoGenius.ReleaseArtifacts` and `guides/projections.md`.
+  """
+  @spec release_artifacts(String.t(), keyword()) ::
+          {:ok, [ReleaseArtifacts.Artifact.t()]} | {:error, GeoGenius.ArtifactError.t()}
+  defdelegate release_artifacts(collection_key, opts \\ []), to: ReleaseArtifacts, as: :list
+
+  @doc """
+  The local file one artifact of a release resolves to.
+
+  Returns `{:error, %GeoGenius.ArtifactError{reason: :not_cached}}` naming both
+  the expected path and the cache key when nothing is there yet, rather than a
+  path to a file that does not exist.
+  """
+  @spec artifact_path(String.t(), String.t(), keyword()) ::
+          {:ok, Path.t()} | {:error, GeoGenius.ArtifactError.t()}
+  defdelegate artifact_path(collection_key, logical_name, opts \\ []),
+    to: ReleaseArtifacts,
+    as: :path
 
   defp resolve_manifest(opts) do
     case Keyword.get(opts, :manifest) do
@@ -421,10 +519,7 @@ defmodule GeoGenius do
   # collection key and a warning rather than an error the caller would read as
   # a publication that did not happen.
   defp release_collection_key(context, release_id) do
-    case Catalog.release_manifest(context, release_id) do
-      %{"collection" => collection_key} -> collection_key
-      _not_found -> nil
-    end
+    Catalog.release_collection_key(context, release_id)
   rescue
     error in [CatalogError] ->
       Logger.warning(

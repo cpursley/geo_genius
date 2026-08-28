@@ -2,6 +2,94 @@
 
 ## Unreleased
 
+### Reading
+
+- **`:limit` accepts `nil` to mean no cap** on `GeoGenius.areas_near/4`,
+  `GeoGenius.search_areas/2` and `GeoGenius.Query.search_areas/2`, and `result_limit`
+  accepts an explicit `NULL` on the `areas_near` and `search_areas` SQL functions.
+  Both defaulted a `nil` to 50, so a caller that narrows the result afterwards -- by a
+  scope the catalog does not model -- had to name a number large enough to stand in for
+  the whole set. Omitting the option, or the argument, still means 50.
+  **Reinstall the schema.**
+- **Four set-keyed reads: `children_of_many/2`, `ancestors_of_many/2`,
+  `related_areas_many/2`, and `areas_by_code_many/3`,** each taking a list where the
+  singular beside it takes a string, and each backed by a SQL function of the same name.
+  Resolving a list previously cost one round trip per element; a page issuing one call per
+  city paid several thousand. The plural result for `[a, b]` is the singular results for
+  `a` and then `b`, concatenated in the array's order; a seed that matched nothing
+  contributes no rows; an empty list returns nothing in one call; a `nil` list, or a `nil`
+  element inside one, raises. Measured over a 4,000-area release with 1,000 seeds on
+  loopback: 445ms for 1,000 singular calls against 52ms for one plural call.
+- **`%GeoGenius.SeededMatch{}`** pairs the seed a row came from with the ordinary
+  `%GeoGenius.AreaMatch{}`, which is unchanged. The plural reads return it because one
+  result mixes rows from many seeds.
+  `Enum.group_by(result, & &1.seed_key, & &1.match)` regroups them onto the caller's list.
+- **`GeoGenius.Store` gains four callbacks** -- `children_of_many/3`, `ancestors_of_many/3`,
+  `related_areas_many/3`, and `areas_by_code_many/4`. **An out-of-tree store must implement
+  them to keep compiling.**
+- **`seeded_area_match`** is installed beside `area_match`: `seed_key text` followed by
+  `area_match`'s sixteen columns in order.
+- **Three release-scoped base views** -- `release_area_codes`, `release_area_names` and
+  `release_relations` -- join `release_areas`, and the four `published_*` views are now
+  each nothing but their base joined to the publication pointer. A pair projects identical
+  columns in identical order, so one read shape works either side of publication.
+  **`published_area_codes` and `published_area_names` gain a `release_id` column**: their
+  bases carry every release, so `release_id` is what tells apart the rows of an area that
+  several releases carry, and it is the second half of any join back to an areas view.
+  **Reinstall the schema.** `release_id` is inserted at ordinal 2 of both views, matching
+  where `published_areas` has carried it since the catalog was first installed, so the
+  four columns after it shift down by one rather than the new column being appended.
+  A host reading these views by name -- which every read in this library does -- is
+  unaffected. A host doing positional `SELECT *`, `INSERT ... SELECT *`, or reading result
+  columns by index sees those four move. Until the schema is reinstalled,
+  `GeoGenius.Published.AreaCode` and `GeoGenius.Published.AreaName` select a column the
+  installed views do not have, and every read through them fails with
+  `undefined_column`.
+- **No index is shipped on `release_area.data`,** now as a tested decision rather than an
+  omission. No installed function filters or orders by it, GIN cannot serve the ordered
+  read a host actually wants there, and the keys are vendor-defined. `guides/sql_api.md`
+  documents both index shapes a host can add, which predicate each serves, and the
+  guarantee that an index on the partitioned parent reaches every partition a later import
+  creates -- pinned against `create_release_partitions` in pgTAP.
+
+- **`GeoGenius.Published`, a view-backed queryable.** Read-only Ecto schemas over
+  `published_areas`, `published_area_codes`, `published_area_names` and
+  `published_area_relations`, plus composable query functions -- `areas/1`,
+  `children_of/2`, `ancestors_of/2`, `areas_by_code/3`, `codes/1`, `names/1`,
+  `relations/1` -- each returning an `Ecto.Query` selecting whole structs. Two things it
+  fixes for a host that joins or aggregates against the catalog: a plpgsql `SETOF`
+  function is an optimizer barrier, so the whole set materialises before the host's own
+  `WHERE` runs, and `GeoGenius.Query`'s selects project five of `area_match`'s sixteen
+  columns. Every column of every view is exposed here, `release_id` included, so a host
+  projection table keyed `(release_id, area_key)` is joinable at last. Set-keyed: where
+  the function-backed API takes one `area_key`, these take a list. Sources carry Ecto
+  bindings (`:area`, `:relation`, `:code`, `:name`) for composing further. Its
+  `:release_id` option reads a release whether or not its collection publishes it, by
+  swapping every source in the query onto the matching release-scoped base view.
+- **`GeoGenius.Query` is not the join API.** Its moduledoc said it was. It stays correct
+  and unchanged for what a view has no form for: `:max_depth` walks and trigram
+  `search_areas/2`. An unpublished release is served either way.
+
+### Projections
+
+- **`GeoGenius.ReleaseArtifacts`** answers what files a release was built from and where
+  each one is on this machine. `list/2` returns every artifact of a release, `fetch/3`
+  one by logical name, and `path/3` a local file. Resolution goes through
+  `GeoGenius.Cache` for both downloaded and operator-supplied artifacts, so a licensed
+  file placed by hand -- which carries a `cache_key` and no `url` -- resolves the same
+  way a download does. `:release_id` reads a release other than the published one, which
+  is how a host fills a projection before the release goes live.
+- **`GeoGenius.ArtifactError`** carries `:reason` -- `:no_published_release`,
+  `:unknown_artifact`, `:invalid_cache_key`, or `:not_cached` -- and, for `:not_cached`,
+  the cache key and the path the artifact was expected at, so an operator reading the
+  message knows where to put the file.
+- **`GeoGenius.Pipeline.Artifacts`** derives its cache keys through
+  `GeoGenius.ReleaseArtifacts.cache_key/1`, so a release is addressed the same way by the
+  import that wrote it and the host that reads it afterwards.
+- **`guides/projections.md`** documents the pattern: a host-owned table keyed
+  `(release_id, area_key)` holding a source's own columns, why it is keyed that way, how
+  to repopulate it for a new release, and how to prune rows for retired ones.
+
 ### Provider contract
 
 - **`asserted_relations/2` is a required callback.** A provider returns the relation edges
@@ -34,6 +122,102 @@
   streaming staged rows in pages and heartbeating the run's lease between them. It measures
   `asserted_relations` beside `relations`.
 
+### Ingestion
+
+- **Five set writes: `upsert_area_many`, `put_area_name_many`, `put_area_code_many`,
+  `put_area_in_release_many`, and `put_relation_many`,** each taking one array per column
+  and pairing them by position, with `GeoGenius.Catalog` wrappers of the same names taking
+  a list of maps. Each scalar write is now that plural form called with one-element
+  arrays, so there is one implementation of what a write means. `put_boundary` has no
+  plural form: it validates and repairs a geometry, replaces the area's boundary and its
+  subdivided parts, and recomputes the centroid, and the dataset that motivated this work
+  carries no boundaries at all.
+- **The normalizing and relating phases write a page as a set.** Normalizing collects a
+  page of staged rows, then issues one statement for its areas, one for its names, one for
+  its codes and one for its memberships; relating issues one for a page's asserted edges.
+  Measured on the US SimpleMaps import (150,622 staged rows, 153,917 areas, 466,262 area
+  writes, 330,297 asserted edges), against the same data on the same machine:
+
+  | Phase       | Before             | After           |
+  |-------------|--------------------|-----------------|
+  | normalizing | 994.8 s, 1,755,328 statements | 39.6 s, 2,449 statements |
+  | relating    | 162.7 s, 331,751 statements   | 20.4 s, 1,254 statements |
+  | whole run   | 1183.5 s           | 85.5 s          |
+
+  The catalog the two runs left is identical, row for row.
+- **A batch that fails leaves none of itself written.** A page is collected before any of
+  it is written, so a provider returning an illegal name kind, or a staged row naming an
+  artifact the run did not stage, fails the phase with nothing of that page written rather
+  than with the areas ahead of the failure already in the catalog. Earlier pages stay
+  committed, which is what keeps the phase resumable.
+- **An unresolved key now names itself.** The plural writes resolve keys by joining, and
+  report an unresolved one through the new `assert_resolved` guard, which raises the same
+  `P0002` that `SELECT ... INTO STRICT` raised but appends the key: `query returned no rows
+  for authority key acme`. Because the scalar writes delegate, they carry the named message
+  too. `put_boundary` and `assert_release_mutable` still raise the bare message.
+- **`assert_write_arrays` refuses a malformed batch.** Arrays that disagree in length raise
+  `22023`, and a null element in a column that requires one raises `22004`. `unnest` pads a
+  short array with nulls rather than failing, so without this a batch assembled from two
+  sources of different lengths would write rows the caller never described. The columns
+  that accept a null element are `put_area_name_many`'s `locales` and
+  `put_area_in_release_many`'s `centroids` and `data`.
+- **One lock order for the whole write path**, through two new helpers: `area_lock_key`,
+  the single definition of what an area serializes on, and `lock_areas`, which takes a
+  batch's locks ascending by that key before the batch touches any row. Both
+  `upsert_area_many` and `put_area_name_many` go through it, and both walk their `area`
+  rows in `area_key` order, so the two agree at both levels. A plural write locks many rows
+  per statement where a scalar locks one, and import leases are scoped to a release, so two
+  releases of one collection normalize at once and the normalizing phase issues an area
+  upsert and a name write for every page: two functions each sorting their own way
+  deadlock over any pair of areas they share. `put_area_code_many`,
+  `put_area_in_release_many` and `put_relation_many` take no advisory lock -- they reach
+  `area` only through foreign keys, which take `FOR KEY SHARE` and cannot conflict with the
+  `FOR NO KEY UPDATE` the other two take -- and each orders its own insert on its own
+  conflict key. A batch holds one advisory lock per distinct area for the length of its
+  statement, so the batch size a caller chooses bounds its share of
+  `max_locks_per_transaction`.
+- **Repeats inside one batch are deduplicated on the constraint key**, since `ON CONFLICT
+  DO UPDATE` raises `21000` when one statement presents the same conflict key twice and a
+  denormalised source repeats the same county in every city row. Where a write is
+  last-write-wins -- release membership and relations -- the last occurrence in the arrays
+  wins, matching what a loop of scalar calls in that order would have left.
+
+- **`GeoGenius.await/3`'s default timeout is now 1,800,000ms (thirty minutes), up from
+  300,000ms (five minutes) -- this changes default behaviour for existing callers.** The
+  previous default did not cover the library's own flagship workload: a full US SimpleMaps
+  import measured at ~17 minutes (1015 seconds), so any caller awaiting one with no explicit
+  `timeout` failed on the default alone. The set writes above have since brought that same
+  import under two minutes, but the default stays where it is: a boundary-carrying
+  collection still writes one `put_boundary` per area, which is the shape the thirty
+  minutes are for. Resolution order is now the `timeout` argument, then
+  `config :geo_genius, :await_timeout`, then the 1,800,000ms library default, via the new
+  `await_timeout/1` resolver in the library's internal config module -- the same
+  per-call-opts-then-app-env-then-default pattern `manifest_paths/1` and the adapter
+  resolvers already use. `:infinity` remains valid at every level. A caller that already
+  passes an explicit `timeout` is unaffected.
+- **`mix geo_genius.import --await` participates in that resolution.** The task carried a
+  `300_000` default of its own and passed it to `await/3` as an explicit argument, which
+  wins the order above, so `config :geo_genius, :await_timeout` could not reach the
+  library's own CLI and it still gave up after five minutes. `--timeout` now parses to nil
+  when absent, and the value the task reports on a timeout is the one the wait used.
+- **A staging pass empties the run's table before it writes to it.** `create_staging` is
+  `CREATE UNLOGGED TABLE IF NOT EXISTS`, and nothing truncated, so an attempt that died
+  where `GeoGenius.Pipeline`'s cleanup could not run -- a killed VM, a lost machine --
+  left its rows staged under the same run id and the next attempt appended to them. A
+  measured import reported 150,622 staged rows into a table holding 301,244. Doubling the
+  work is the mild half; the other half is that the stale rows are normalized too, so a
+  row deleted from the source between attempts is resurrected into the release. The new
+  `GeoGenius.Staging.reset/2` drops and recreates the table, and the staging phase calls
+  it in place of `create/2`. No SQL changed: `create_staging` still keeps what it finds,
+  and a host driving staging through the SQL API calls `drop_staging` before it.
+- **Every `authorities` and `area_types` entry is validated field by field.** An entry
+  naming no `key`, an authority naming no `name`, or an area type whose `rank` is not a
+  positive integer is refused by `GeoGenius.Manifest.load/3` and `from_map/2` with a
+  message naming both the field and the list it came from. Such an entry passed
+  validation and failed several phases later as a `GeoGenius.CatalogError` wrapping a
+  NOT NULL violation or a failed cast inside `upsert_authority`/`upsert_area_type`.
+  **A manifest carrying one now fails at load rather than partway through an import.**
+
 ### SimpleMaps provider
 
 - **`GeoGenius.Providers.SimpleMaps` (`"simplemaps"`)** parses the SimpleMaps US cities and
@@ -48,6 +232,21 @@
   `AP` are USPS military-mail constructs and `FM`, `PW` and `MH` are the Freely Associated
   States, and the Census assigns none of the six an ANSI code. A host looking a state up by
   code queries both `ansi_state` and `usps_state`, or misses those six.
+- **A county hangs under the state its own FIPS names.** A five-digit county FIPS begins
+  with the two-digit FIPS of the state that assigns it, and that prefix -- not the row's
+  `state_id` column -- is what `asserted_relations/2` reads a county's state parent from.
+  The two disagree wherever a mailing address crosses a state line: ZIP `20041` carries
+  `state_id` DC and `county_fips` 51107, which is Loudoun County, Virginia, and 150 of the
+  source's 3,233 counties are named on rows of more than one state. A row whose county
+  lies in another state also yields that state as an area of its own, since
+  `put_relation` requires both ends of an edge to be members of the release. A county
+  whose prefix names no state `GeoGenius.Providers.SimpleMaps.Fips` carries gets no state
+  parent at all rather than a false one.
+- **`GeoGenius.Providers.SimpleMaps.Fips`** states the state FIPS to postal code table the
+  above reads: the fifty states, DC, and the five inhabited territories the Census assigns
+  a state-level FIPS to. Neither source file carries the pair and no single row can
+  establish it, so it is stated in the provider, where the rest of this vendor's US
+  knowledge already lives.
 - **Row-scoped county validation.** A row whose `county_fips`, `county_fips_all`,
   county-name or `county_weights` columns contradict each other fails the release, naming
   the column and the row. Cross-file agreement is deliberately not checked: it cannot be

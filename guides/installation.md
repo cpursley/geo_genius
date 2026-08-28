@@ -448,16 +448,20 @@ Counting areas through the view without that filter is the obvious way to get th
 the count will include areas the collection considers gone.
 
 `published_area_codes`, `published_area_names`, and `published_boundaries` carry no
-`retired_at` column of their own - each is `published_areas` joined out to `area_code`,
-`area_name`, or `boundary` on `area_id`, and retirement state is not among the columns that
-join carries forward. `WHERE retired_at IS NULL` applied directly to one of these three fails
-with `undefined_column`. Exclude retired areas from any of them by joining back to
-`published_areas` (or to `geo_genius.area`) on `area_id` and filtering there instead:
+`retired_at` column of their own - each reaches `area_code`, `area_name`, or `boundary` on
+`area_id`, and retirement state is not among the columns that join carries forward.
+`WHERE retired_at IS NULL` applied directly to one of these three fails with
+`undefined_column`. Exclude retired areas from any of them by joining back to
+`published_areas` (or to `geo_genius.area`) and filtering there instead. Join on
+`release_id` as well as `area_id`: the release-scoped bases behind these views carry every
+release, so `area_id` alone is not a unique row there.
 
 ```sql
 SELECT codes.*
   FROM geo_genius.published_area_codes codes
-  JOIN geo_genius.published_areas areas ON areas.area_id = codes.area_id
+  JOIN geo_genius.published_areas areas
+    ON areas.area_id = codes.area_id
+   AND areas.release_id = codes.release_id
  WHERE areas.retired_at IS NULL;
 ```
 

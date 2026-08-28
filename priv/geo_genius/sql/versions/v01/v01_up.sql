@@ -1409,6 +1409,145 @@ $fn$;
 
 --SPLIT--
 
+-- The parallel-array guard the plural writes share. Every plural write takes
+-- one array per column and pairs them by position, so arrays of different
+-- lengths do not fail on their own: unnest pads the shorter ones with nulls
+-- and the batch written is one the caller never assembled. Each array must be
+-- present, and all of them must agree on one length, which is what this
+-- returns.
+--
+-- null_positions carries array_position(column, NULL) for a column whose
+-- elements are required and NULL for a column that accepts a null element, so
+-- which columns are optional is stated where the arrays are rather than
+-- inferred here.
+CREATE FUNCTION $SCHEMA$.assert_write_arrays(
+  lengths integer[],
+  null_positions integer[],
+  labels text[]
+)
+RETURNS integer
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  column_index integer;
+BEGIN
+  FOR column_index IN 1 .. cardinality(lengths) LOOP
+    IF lengths[column_index] IS NULL THEN
+      RAISE EXCEPTION '% are required', labels[column_index] USING ERRCODE = '22004';
+    END IF;
+
+    IF lengths[column_index] <> lengths[1] THEN
+      RAISE EXCEPTION
+        '% and % must carry the same number of elements, and they carry % and %',
+        labels[1], labels[column_index], lengths[1], lengths[column_index]
+        USING ERRCODE = '22023';
+    END IF;
+
+    IF null_positions[column_index] IS NOT NULL THEN
+      RAISE EXCEPTION '% must not contain a null element, and element % is null',
+        labels[column_index], null_positions[column_index]
+        USING ERRCODE = '22004';
+    END IF;
+  END LOOP;
+
+  RETURN lengths[1];
+END;
+$fn$;
+
+--SPLIT--
+
+-- The advisory key one area serializes on. Every write that locks area rows
+-- computes it here, so a batch and a single upsert of the same area take the
+-- same lock and two callers computing it separately cannot disagree.
+CREATE FUNCTION $SCHEMA$.area_lock_key(
+  target_collection_id uuid,
+  composed_key text
+)
+RETURNS bigint
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+  SELECT ('x' || substr(
+    md5('$SCHEMA$.area:' || target_collection_id::text || ':' || composed_key),
+    1, 16))::bit(64)::bigint;
+$fn$;
+
+--SPLIT--
+
+-- Serializes a batch on every area it is about to touch, ascending by lock
+-- key.
+--
+-- One lock order for the whole write path, not one per function. A plural
+-- write locks many area rows per statement where a scalar write locks one, so
+-- two plural writes that each sorted their own way -- one by composed key, one
+-- by area id -- would form a cycle over any pair of areas they share, and a
+-- release-scoped import lease means two releases of one collection normalize
+-- at the same time. Ascending lock key is an order every caller computes
+-- identically from the keys alone, so overlapping batches queue instead. And
+-- because every lock is taken before any row is touched, two batches sharing
+-- an area can never both reach their row writes.
+--
+-- A batch holds one lock per distinct area for the length of its statement, so
+-- a caller's batch size bounds its share of the lock table.
+CREATE FUNCTION $SCHEMA$.lock_areas(lock_keys bigint[])
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  lock_key bigint;
+BEGIN
+  FOR lock_key IN
+    SELECT DISTINCT requested.lock_key
+      FROM unnest(lock_keys) AS requested(lock_key)
+     ORDER BY 1
+  LOOP
+    PERFORM pg_advisory_xact_lock(lock_key);
+  END LOOP;
+END;
+$fn$;
+
+--SPLIT--
+
+-- Reports a key a plural write could not resolve. A plural write joins its
+-- keys against the rows they name, and a join on its own would drop an
+-- unknown key out of the batch and still report success, where the scalar
+-- forms resolve with SELECT ... INTO STRICT and raise. This raises
+-- NO_DATA_FOUND with the SQLSTATE and the wording that resolution raises, and
+-- names the key it could not resolve, which the scalar form cannot.
+CREATE FUNCTION $SCHEMA$.assert_resolved(
+  missing_key text,
+  label text
+)
+RETURNS void
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  IF missing_key IS NOT NULL THEN
+    RAISE EXCEPTION 'query returned no rows for % %', label, missing_key
+      USING ERRCODE = 'P0002';
+  END IF;
+END;
+$fn$;
+
+--SPLIT--
+
+-- One area is a batch of one. The required-argument check stays here rather
+-- than being left to the plural form, because it names the four arguments a
+-- scalar caller passed; the plural form reports the arrays it was given.
 CREATE FUNCTION $SCHEMA$.upsert_area(
   collection_key text,
   authority_key text,
@@ -1421,12 +1560,6 @@ VOLATILE
 SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
-DECLARE
-  target_collection_id uuid;
-  target_authority_id uuid;
-  target_area_type_id uuid;
-  composed_key text;
-  result_id uuid;
 BEGIN
   IF collection_key IS NULL OR authority_key IS NULL
      OR area_type_key IS NULL OR code IS NULL THEN
@@ -1434,44 +1567,144 @@ BEGIN
       USING ERRCODE = '22004';
   END IF;
 
-  SELECT id INTO STRICT target_collection_id
-    FROM $SCHEMA$.collection WHERE key = collection_key;
-
-  SELECT id INTO STRICT target_authority_id
-    FROM $SCHEMA$.authority
-   WHERE collection_id = target_collection_id AND key = authority_key;
-
-  SELECT id INTO STRICT target_area_type_id
-    FROM $SCHEMA$.area_type
-   WHERE collection_id = target_collection_id AND key = area_type_key;
-
-  composed_key := authority_key || ':' || area_type_key || ':' || code;
-
-  -- area carries two unique constraints (identity and area_key) and the same
-  -- speculative-insert race as upsert_area_type above: a concurrent caller
-  -- can block on area_area_key_uq rather than the area_identity_uq arbiter
-  -- and get a bare 23505. Every row that collides on area_key within a
-  -- collection collides on identity too, since area_key is composed from the
-  -- identity, so serializing on the composed key covers both and stays as
-  -- narrow as one area.
-  PERFORM pg_advisory_xact_lock(
-    ('x' || substr(md5('$SCHEMA$.area:' || target_collection_id::text || ':' || composed_key), 1, 16))::bit(64)::bigint
-  );
-
-  INSERT INTO $SCHEMA$.area
-    (collection_id, authority_id, area_type_id, code, area_key)
-  VALUES
-    (target_collection_id, target_authority_id, target_area_type_id, code, composed_key)
-  ON CONFLICT ON CONSTRAINT area_identity_uq
-  DO UPDATE SET updated_at = now()
-  RETURNING id INTO result_id;
-
-  RETURN result_id;
+  RETURN ($SCHEMA$.upsert_area_many(
+    collection_key, ARRAY[authority_key], ARRAY[area_type_key], ARRAY[code]))[1];
 END;
 $fn$;
 
 --SPLIT--
 
+-- Creates or updates one area per position of its three parallel arrays,
+-- returning their ids in that order. upsert_area is this function with
+-- one-element arrays: an import writes areas by the batch, and a separate
+-- statement per area is one round trip per area.
+--
+-- Areas repeat heavily within a batch -- every city row in a county names
+-- that county, and every row in a state names that state -- so the batch is
+-- reduced to one row per identity before it is inserted. ON CONFLICT DO
+-- UPDATE raises 21000 when a single statement presents the same conflict key
+-- twice, and a batch that did not deduplicate would fail on the first county
+-- named by two cities. The returned array still carries one id per input
+-- position, repeats included, so a caller can pair it with the array it sent.
+CREATE FUNCTION $SCHEMA$.upsert_area_many(
+  collection_key text,
+  authority_keys text[],
+  area_type_keys text[],
+  codes text[]
+)
+RETURNS uuid[]
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  target_collection_id uuid;
+  batch_size integer;
+  result uuid[];
+BEGIN
+  IF collection_key IS NULL THEN
+    RAISE EXCEPTION 'collection is required' USING ERRCODE = '22004';
+  END IF;
+
+  batch_size := $SCHEMA$.assert_write_arrays(
+    ARRAY[cardinality(authority_keys), cardinality(area_type_keys), cardinality(codes)],
+    ARRAY[array_position(authority_keys, NULL), array_position(area_type_keys, NULL),
+          array_position(codes, NULL)],
+    ARRAY['authority keys', 'area type keys', 'codes']);
+
+  IF batch_size = 0 THEN
+    RETURN ARRAY[]::uuid[];
+  END IF;
+
+  SELECT id INTO STRICT target_collection_id
+    FROM $SCHEMA$.collection WHERE collection.key = collection_key;
+
+  -- An authority or area type the collection does not carry is refused rather
+  -- than joined away: the join below would drop its rows and return an array
+  -- shorter than the caller sent, which is the silent half of a write that
+  -- did not happen.
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.authority_key)
+       FROM unnest(authority_keys) AS requested(authority_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.authority
+         WHERE authority.collection_id = target_collection_id
+           AND authority.key = requested.authority_key)),
+    'authority key');
+
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.area_type_key)
+       FROM unnest(area_type_keys) AS requested(area_type_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.area_type
+         WHERE area_type.collection_id = target_collection_id
+           AND area_type.key = requested.area_type_key)),
+    'area type key');
+
+  -- The scalar form serializes on one area's composed key, for the reason
+  -- given below the INSERT. A batch needs that protection for every area it
+  -- writes, and it goes through lock_areas so that it and every other write
+  -- that locks area rows take them in one order.
+  PERFORM $SCHEMA$.lock_areas(ARRAY(
+    SELECT $SCHEMA$.area_lock_key(
+             target_collection_id,
+             requested.authority_key || ':' || requested.area_type_key || ':' ||
+               requested.code)
+      FROM unnest(authority_keys, area_type_keys, codes)
+             AS requested(authority_key, area_type_key, code)));
+
+  -- area carries two unique constraints (identity and area_key) and a
+  -- speculative-insert race: a concurrent caller can block on area_area_key_uq
+  -- rather than the area_identity_uq arbiter and get a bare 23505. Every row
+  -- that collides on area_key within a collection collides on identity too,
+  -- since area_key is composed from the identity, so serializing on the
+  -- composed key covers both and stays as narrow as one area.
+  --
+  -- Rows are deduplicated on the identity the arbiter names, not on the
+  -- composed key, so two identities that compose the same area_key stay two
+  -- rows and collide on area_area_key_uq exactly as two scalar calls would.
+  WITH requested AS (
+    SELECT t.ord, t.authority_key, t.area_type_key, t.code,
+           t.authority_key || ':' || t.area_type_key || ':' || t.code AS composed_key
+      FROM unnest(authority_keys, area_type_keys, codes) WITH ORDINALITY
+             AS t(authority_key, area_type_key, code, ord)
+  ),
+  deduplicated AS (
+    SELECT DISTINCT ON (authority_key, area_type_key, code)
+           authority_key, area_type_key, code, composed_key
+      FROM requested
+     ORDER BY authority_key, area_type_key, code, ord DESC
+  ),
+  written AS (
+    INSERT INTO $SCHEMA$.area
+      (collection_id, authority_id, area_type_id, code, area_key)
+    SELECT target_collection_id, authority.id, area_type.id,
+           deduplicated.code, deduplicated.composed_key
+      FROM deduplicated
+      JOIN $SCHEMA$.authority
+        ON authority.collection_id = target_collection_id
+       AND authority.key = deduplicated.authority_key
+      JOIN $SCHEMA$.area_type
+        ON area_type.collection_id = target_collection_id
+       AND area_type.key = deduplicated.area_type_key
+     ORDER BY deduplicated.composed_key
+    ON CONFLICT ON CONSTRAINT area_identity_uq
+    DO UPDATE SET updated_at = now()
+    RETURNING id, area_key
+  )
+  SELECT array_agg(written.id ORDER BY requested.ord)
+    INTO result
+    FROM requested
+    JOIN written ON written.area_key = requested.composed_key;
+
+  RETURN result;
+END;
+$fn$;
+
+--SPLIT--
+
+-- One name is a batch of one, the same way upsert_area is.
 CREATE FUNCTION $SCHEMA$.put_area_name(
   target_area_key text,
   name text,
@@ -1484,30 +1717,120 @@ VOLATILE
 SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
-DECLARE
-  target_area_id uuid;
-  result_id uuid;
 BEGIN
   IF target_area_key IS NULL OR name IS NULL OR kind IS NULL THEN
     RAISE EXCEPTION 'area key, name, and kind are required'
       USING ERRCODE = '22004';
   END IF;
 
-  SELECT id INTO STRICT target_area_id
-    FROM $SCHEMA$.area WHERE area_key = target_area_key;
-
-  INSERT INTO $SCHEMA$.area_name (area_id, name, kind, locale)
-  VALUES (target_area_id, name, kind, locale)
-  ON CONFLICT ON CONSTRAINT area_name_uq
-  DO UPDATE SET name = EXCLUDED.name
-  RETURNING id INTO result_id;
-
-  RETURN result_id;
+  RETURN ($SCHEMA$.put_area_name_many(
+    ARRAY[target_area_key], ARRAY[name], ARRAY[kind], ARRAY[locale]))[1];
 END;
 $fn$;
 
 --SPLIT--
 
+-- Sets one name per position of its four parallel arrays, returning the name
+-- rows' ids in that order. put_area_name is this function with one-element
+-- arrays.
+--
+-- locales is the one column that accepts a null element: a name with no
+-- locale is an unlocalized name, and area_name_uq compares locale NULLS NOT
+-- DISTINCT, so two unlocalized names of the same kind and text are one row.
+-- The deduplication below groups nulls the same way the constraint does.
+CREATE FUNCTION $SCHEMA$.put_area_name_many(
+  target_area_keys text[],
+  names text[],
+  kinds text[],
+  locales text[]
+)
+RETURNS uuid[]
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  batch_size integer;
+  result uuid[];
+BEGIN
+  batch_size := $SCHEMA$.assert_write_arrays(
+    ARRAY[cardinality(target_area_keys), cardinality(names), cardinality(kinds),
+          cardinality(locales)],
+    ARRAY[array_position(target_area_keys, NULL), array_position(names, NULL),
+          array_position(kinds, NULL), NULL],
+    ARRAY['area keys', 'names', 'kinds', 'locales']);
+
+  IF batch_size = 0 THEN
+    RETURN ARRAY[]::uuid[];
+  END IF;
+
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.area_key)
+       FROM unnest(target_area_keys) AS requested(area_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.area WHERE area.area_key = requested.area_key)),
+    'area key');
+
+  -- The area_name statement trigger recomputes official_name for every area
+  -- the insert touched, so writing names updates area rows as well as writing
+  -- name rows. That makes this statement and upsert_area_many two writers of
+  -- one set of area rows, and it takes the same locks through the same helper
+  -- so the two agree on an order. A batch may name areas of more than one
+  -- collection -- area_key is unique across the catalog -- so each area's key
+  -- is computed from its own collection.
+  PERFORM $SCHEMA$.lock_areas(ARRAY(
+    SELECT $SCHEMA$.area_lock_key(area.collection_id, area.area_key)
+      FROM $SCHEMA$.area
+     WHERE area.area_key = ANY(target_area_keys)));
+
+  -- The area rows themselves, ascending by area_key, which is the order
+  -- upsert_area_many's insert reaches them in. The advisory locks above
+  -- already exclude a concurrent batch; this orders the rows against any
+  -- writer that does not take them, and it holds the rows the trigger's own
+  -- UPDATE would otherwise take in whatever order it reaches them.
+  PERFORM area.id
+     FROM $SCHEMA$.area
+    WHERE area.area_key = ANY(target_area_keys)
+    ORDER BY area.area_key
+      FOR NO KEY UPDATE;
+
+  WITH requested AS (
+    SELECT t.ord, area.id AS area_id, t.name, t.kind, t.locale
+      FROM unnest(target_area_keys, names, kinds, locales) WITH ORDINALITY
+             AS t(area_key, name, kind, locale, ord)
+      JOIN $SCHEMA$.area ON area.area_key = t.area_key
+  ),
+  deduplicated AS (
+    SELECT DISTINCT ON (area_id, kind, name, locale) area_id, name, kind, locale
+      FROM requested
+     ORDER BY area_id, kind, name, locale, ord DESC
+  ),
+  written AS (
+    INSERT INTO $SCHEMA$.area_name (area_id, name, kind, locale)
+    SELECT area_id, name, kind, locale
+      FROM deduplicated
+     ORDER BY area_id, kind, name, locale
+    ON CONFLICT ON CONSTRAINT area_name_uq
+    DO UPDATE SET name = EXCLUDED.name
+    RETURNING id, area_id, name, kind, locale
+  )
+  SELECT array_agg(written.id ORDER BY requested.ord)
+    INTO result
+    FROM requested
+    JOIN written
+      ON written.area_id = requested.area_id
+     AND written.kind = requested.kind
+     AND written.name = requested.name
+     AND written.locale IS NOT DISTINCT FROM requested.locale;
+
+  RETURN result;
+END;
+$fn$;
+
+--SPLIT--
+
+-- One code is a batch of one, the same way upsert_area is.
 CREATE FUNCTION $SCHEMA$.put_area_code(
   target_area_key text,
   code_type text,
@@ -1519,25 +1842,87 @@ VOLATILE
 SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
-DECLARE
-  target_area_id uuid;
-  result_id uuid;
 BEGIN
   IF target_area_key IS NULL OR code_type IS NULL OR code_value IS NULL THEN
     RAISE EXCEPTION 'area key, code type, and code value are required'
       USING ERRCODE = '22004';
   END IF;
 
-  SELECT id INTO STRICT target_area_id
-    FROM $SCHEMA$.area WHERE area_key = target_area_key;
+  RETURN ($SCHEMA$.put_area_code_many(
+    ARRAY[target_area_key], ARRAY[code_type], ARRAY[code_value]))[1];
+END;
+$fn$;
 
-  INSERT INTO $SCHEMA$.area_code (area_id, code_type, code_value)
-  VALUES (target_area_id, code_type, code_value)
-  ON CONFLICT ON CONSTRAINT area_code_uq
-  DO UPDATE SET code_value = EXCLUDED.code_value
-  RETURNING id INTO result_id;
+--SPLIT--
 
-  RETURN result_id;
+-- Sets one external code per position of its three parallel arrays, returning
+-- the code rows' ids in that order. put_area_code is this function with
+-- one-element arrays.
+CREATE FUNCTION $SCHEMA$.put_area_code_many(
+  target_area_keys text[],
+  code_types text[],
+  code_values text[]
+)
+RETURNS uuid[]
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  batch_size integer;
+  result uuid[];
+BEGIN
+  batch_size := $SCHEMA$.assert_write_arrays(
+    ARRAY[cardinality(target_area_keys), cardinality(code_types), cardinality(code_values)],
+    ARRAY[array_position(target_area_keys, NULL), array_position(code_types, NULL),
+          array_position(code_values, NULL)],
+    ARRAY['area keys', 'code types', 'code values']);
+
+  IF batch_size = 0 THEN
+    RETURN ARRAY[]::uuid[];
+  END IF;
+
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.area_key)
+       FROM unnest(target_area_keys) AS requested(area_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.area WHERE area.area_key = requested.area_key)),
+    'area key');
+
+  -- area_code carries no trigger, so the only rows this touches are its own.
+  -- The insert is still ordered on the conflict key, so two batches writing an
+  -- overlapping set of codes take their row locks in the same order rather
+  -- than in whatever order each caller's arrays arrived in.
+  WITH requested AS (
+    SELECT t.ord, area.id AS area_id, t.code_type, t.code_value
+      FROM unnest(target_area_keys, code_types, code_values) WITH ORDINALITY
+             AS t(area_key, code_type, code_value, ord)
+      JOIN $SCHEMA$.area ON area.area_key = t.area_key
+  ),
+  deduplicated AS (
+    SELECT DISTINCT ON (area_id, code_type, code_value) area_id, code_type, code_value
+      FROM requested
+     ORDER BY area_id, code_type, code_value, ord DESC
+  ),
+  written AS (
+    INSERT INTO $SCHEMA$.area_code (area_id, code_type, code_value)
+    SELECT area_id, code_type, code_value
+      FROM deduplicated
+     ORDER BY area_id, code_type, code_value
+    ON CONFLICT ON CONSTRAINT area_code_uq
+    DO UPDATE SET code_value = EXCLUDED.code_value
+    RETURNING id, area_id, code_type, code_value
+  )
+  SELECT array_agg(written.id ORDER BY requested.ord)
+    INTO result
+    FROM requested
+    JOIN written
+      ON written.area_id = requested.area_id
+     AND written.code_type = requested.code_type
+     AND written.code_value = requested.code_value;
+
+  RETURN result;
 END;
 $fn$;
 
@@ -1669,6 +2054,7 @@ $fn$;
 
 --SPLIT--
 
+-- One membership is a batch of one, the same way upsert_area is.
 CREATE FUNCTION $SCHEMA$.put_area_in_release(
   target_release_id uuid,
   target_area_key text,
@@ -1681,23 +2067,98 @@ VOLATILE
 SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
-DECLARE
-  target_area_id uuid;
 BEGIN
   IF target_release_id IS NULL OR target_area_key IS NULL THEN
     RAISE EXCEPTION 'release id and area key are required'
       USING ERRCODE = '22004';
   END IF;
 
+  PERFORM $SCHEMA$.put_area_in_release_many(
+    target_release_id, ARRAY[target_area_key], ARRAY[centroid], ARRAY[data]);
+END;
+$fn$;
+
+--SPLIT--
+
+-- Places one area into the release per position of its three parallel arrays.
+-- put_area_in_release is this function with one-element arrays.
+--
+-- Membership is last-write-wins -- the upsert overwrites centroid and data --
+-- so a batch that names the same area twice keeps the last of the two, which
+-- is the row a caller writing them one at a time would have been left with.
+-- That is why the arrays are unnested WITH ORDINALITY: without a position to
+-- order on, the deduplication would keep an arbitrary one.
+CREATE FUNCTION $SCHEMA$.put_area_in_release_many(
+  target_release_id uuid,
+  target_area_keys text[],
+  centroids geography(Point, 4326)[],
+  data jsonb[]
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  batch_size integer;
+  foreign_area_id uuid;
+BEGIN
+  IF target_release_id IS NULL THEN
+    RAISE EXCEPTION 'release id is required' USING ERRCODE = '22004';
+  END IF;
+
+  batch_size := $SCHEMA$.assert_write_arrays(
+    ARRAY[cardinality(target_area_keys), cardinality(centroids), cardinality(data)],
+    ARRAY[array_position(target_area_keys, NULL), NULL, NULL],
+    ARRAY['area keys', 'centroids', 'attributes']);
+
+  IF batch_size = 0 THEN
+    RETURN;
+  END IF;
+
   PERFORM $SCHEMA$.assert_release_mutable(target_release_id);
 
-  SELECT id INTO STRICT target_area_id
-    FROM $SCHEMA$.area WHERE area_key = target_area_key;
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.area_key)
+       FROM unnest(target_area_keys) AS requested(area_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.area WHERE area.area_key = requested.area_key)),
+    'area key');
 
-  PERFORM $SCHEMA$.assert_area_in_collection(target_release_id, target_area_id);
+  -- The invariant helper reports one area against one release, so the first
+  -- area of another collection is handed to it and it raises the message a
+  -- scalar caller already reads.
+  SELECT area.id INTO foreign_area_id
+    FROM $SCHEMA$.area
+    JOIN $SCHEMA$.release ON release.id = target_release_id
+   WHERE area.area_key = ANY(target_area_keys)
+     AND area.collection_id <> release.collection_id
+   ORDER BY area.area_key
+   LIMIT 1;
 
+  IF foreign_area_id IS NOT NULL THEN
+    PERFORM $SCHEMA$.assert_area_in_collection(target_release_id, foreign_area_id);
+  END IF;
+
+  -- The unnested attribute column is named for what it holds rather than for
+  -- the column it lands in: a CTE column named data would be ambiguous against
+  -- this function's own data parameter.
+  WITH requested AS (
+    SELECT t.ord, area.id AS area_id, t.centroid, t.attributes
+      FROM unnest(target_area_keys, centroids, data) WITH ORDINALITY
+             AS t(area_key, centroid, attributes, ord)
+      JOIN $SCHEMA$.area ON area.area_key = t.area_key
+  ),
+  deduplicated AS (
+    SELECT DISTINCT ON (area_id) area_id, centroid, attributes
+      FROM requested
+     ORDER BY area_id, ord DESC
+  )
   INSERT INTO $SCHEMA$.release_area (release_id, area_id, centroid, data)
-  VALUES (target_release_id, target_area_id, centroid, coalesce(data, '{}'::jsonb))
+  SELECT target_release_id, area_id, centroid, coalesce(attributes, '{}'::jsonb)
+    FROM deduplicated
+   ORDER BY area_id
   ON CONFLICT (release_id, area_id)
   DO UPDATE SET
     centroid = EXCLUDED.centroid,
@@ -1712,6 +2173,8 @@ $fn$;
 -- Both areas must already be members of the release; the measured columns
 -- (intersection_area_m2, parent_coverage, child_coverage) are left NULL
 -- because there is no geometry to measure them from.
+--
+-- One relation is a batch of one, the same way upsert_area is.
 CREATE FUNCTION $SCHEMA$.put_relation(
   target_release_id uuid,
   parent_area_key text,
@@ -1724,9 +2187,6 @@ VOLATILE
 SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
-DECLARE
-  target_parent_area_id uuid;
-  target_child_area_id uuid;
 BEGIN
   IF target_release_id IS NULL OR parent_area_key IS NULL
      OR child_area_key IS NULL OR relation_type IS NULL THEN
@@ -1734,34 +2194,95 @@ BEGIN
       USING ERRCODE = '22004';
   END IF;
 
-  IF relation_type NOT IN ('contains', 'mostly_contains', 'overlaps') THEN
-    RAISE EXCEPTION 'unknown relation type %', relation_type USING ERRCODE = '22023';
+  PERFORM $SCHEMA$.put_relation_many(
+    target_release_id, ARRAY[parent_area_key], ARRAY[child_area_key],
+    ARRAY[relation_type]);
+END;
+$fn$;
+
+--SPLIT--
+
+-- Asserts one relation per position of its three parallel arrays.
+-- put_relation is this function with one-element arrays.
+--
+-- A relation is last-write-wins the way membership is, so a pair named twice
+-- in one batch keeps the last relation_type, and the deduplication orders on
+-- the arrays' own positions to find it.
+CREATE FUNCTION $SCHEMA$.put_relation_many(
+  target_release_id uuid,
+  parent_area_keys text[],
+  child_area_keys text[],
+  relation_types text[]
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  batch_size integer;
+  unknown_type text;
+  absent_area_key text;
+BEGIN
+  IF target_release_id IS NULL THEN
+    RAISE EXCEPTION 'release is required' USING ERRCODE = '22004';
+  END IF;
+
+  batch_size := $SCHEMA$.assert_write_arrays(
+    ARRAY[cardinality(parent_area_keys), cardinality(child_area_keys),
+          cardinality(relation_types)],
+    ARRAY[array_position(parent_area_keys, NULL), array_position(child_area_keys, NULL),
+          array_position(relation_types, NULL)],
+    ARRAY['parent area keys', 'child area keys', 'relation types']);
+
+  IF batch_size = 0 THEN
+    RETURN;
+  END IF;
+
+  SELECT min(requested.relation_type) INTO unknown_type
+    FROM unnest(relation_types) AS requested(relation_type)
+   WHERE requested.relation_type NOT IN ('contains', 'mostly_contains', 'overlaps');
+
+  IF unknown_type IS NOT NULL THEN
+    RAISE EXCEPTION 'unknown relation type %', unknown_type USING ERRCODE = '22023';
   END IF;
 
   PERFORM $SCHEMA$.assert_release_mutable(target_release_id);
 
-  SELECT id INTO STRICT target_parent_area_id
-    FROM $SCHEMA$.area WHERE area_key = parent_area_key;
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.area_key)
+       FROM unnest(parent_area_keys || child_area_keys) AS requested(area_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.area WHERE area.area_key = requested.area_key)),
+    'area key');
 
-  SELECT id INTO STRICT target_child_area_id
-    FROM $SCHEMA$.area WHERE area_key = child_area_key;
+  SELECT min(requested.area_key) INTO absent_area_key
+    FROM unnest(parent_area_keys || child_area_keys) AS requested(area_key)
+    JOIN $SCHEMA$.area ON area.area_key = requested.area_key
+   WHERE NOT EXISTS (
+     SELECT 1 FROM $SCHEMA$.release_area
+      WHERE release_area.release_id = target_release_id
+        AND release_area.area_id = area.id);
 
-  IF NOT EXISTS (
-    SELECT 1 FROM $SCHEMA$.release_area
-     WHERE release_id = target_release_id AND area_id = target_parent_area_id
-  ) THEN
-    RAISE EXCEPTION 'area % is not a member of release %', parent_area_key, target_release_id
+  IF absent_area_key IS NOT NULL THEN
+    RAISE EXCEPTION 'area % is not a member of release %', absent_area_key, target_release_id
       USING ERRCODE = '23503';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM $SCHEMA$.release_area
-     WHERE release_id = target_release_id AND area_id = target_child_area_id
-  ) THEN
-    RAISE EXCEPTION 'area % is not a member of release %', child_area_key, target_release_id
-      USING ERRCODE = '23503';
-  END IF;
-
+  WITH requested AS (
+    SELECT t.ord, parent.id AS parent_area_id, child.id AS child_area_id, t.relation_type
+      FROM unnest(parent_area_keys, child_area_keys, relation_types) WITH ORDINALITY
+             AS t(parent_area_key, child_area_key, relation_type, ord)
+      JOIN $SCHEMA$.area parent ON parent.area_key = t.parent_area_key
+      JOIN $SCHEMA$.area child ON child.area_key = t.child_area_key
+  ),
+  deduplicated AS (
+    SELECT DISTINCT ON (parent_area_id, child_area_id)
+           parent_area_id, child_area_id, relation_type
+      FROM requested
+     ORDER BY parent_area_id, child_area_id, ord DESC
+  )
   INSERT INTO $SCHEMA$.relation (
     release_id,
     parent_area_id,
@@ -1771,15 +2292,9 @@ BEGIN
     parent_coverage,
     child_coverage
   )
-  VALUES (
-    target_release_id,
-    target_parent_area_id,
-    target_child_area_id,
-    relation_type,
-    NULL,
-    NULL,
-    NULL
-  )
+  SELECT target_release_id, parent_area_id, child_area_id, relation_type, NULL, NULL, NULL
+    FROM deduplicated
+   ORDER BY parent_area_id, child_area_id
   ON CONFLICT ON CONSTRAINT relation_pkey
   DO UPDATE SET
     relation_type = EXCLUDED.relation_type,
@@ -2760,19 +3275,23 @@ JOIN $SCHEMA$.artifact ON artifact.source_release_id = source_release.id;
 
 --SPLIT--
 
--- Published read views. Every view resolves through publication,
--- so no view takes a release argument and a pointer swap changes what all
--- of them show at once, under MVCC, with no refresh step.
+-- Read views, in release-scoped/published pairs. Each release_* base carries
+-- every release, published or not, and stamps release_id on every row. Each
+-- published_* view is that base joined to publication and nothing else, so a
+-- pointer swap changes what all of them show at once, under MVCC, with no
+-- refresh step, and a caller holding a release id can read that release
+-- through the base before it is ever published.
+--
+-- Pairing them this way means one definition of each column list. It also
+-- means the same host-side query shape works either side of publication: the
+-- pair projects identical columns in identical order.
 
--- release_areas is release-scoped (no publication join): one row per
--- (release, area) membership recorded in release_area, published or not,
--- whether or not the area has a boundary -- geometry is an optional
--- attachment, not a condition of membership.
--- published_areas narrows it to the currently published release per
--- collection; the resolution functions below query release_areas
--- directly so a non-null target_release_id can reach a release that is not
--- (or not yet, or no longer) the published one.
--- The surface hosts join, and the base every published_* view builds on. It
+-- release_areas is one row per (release, area) membership recorded in
+-- release_area, whether or not the area has a boundary -- geometry is an
+-- optional attachment, not a condition of membership. The resolution
+-- functions below query it directly so a non-null target_release_id can reach
+-- a release that is not (or not yet, or no longer) the published one.
+-- The surface hosts join, and the base the other three bases build on. It
 -- reads only columns: the official name is denormalized onto area and kept
 -- current by a trigger, because resolving it here per row costs an index probe
 -- for every row of every scan a host runs.
@@ -2816,35 +3335,74 @@ JOIN $SCHEMA$.publication ON publication.release_id = release_areas.release_id;
 
 --SPLIT--
 
-CREATE VIEW $SCHEMA$.published_area_codes AS
+-- Codes and names hang off the area, and an area belongs to as many releases
+-- as carry it, so both bases project release_id: without it the same code
+-- comes back once per release with nothing on the row to say which release it
+-- is speaking for, and a caller joining back to release_areas on area_id
+-- alone would pair a code of one release with an area of another. The
+-- published counterparts project it too, so one schema reads either source
+-- and the release-scoped join predicate is available on both.
+CREATE VIEW $SCHEMA$.release_area_codes AS
 SELECT
-  published_areas.collection_key,
-  published_areas.area_key,
-  published_areas.area_id,
+  release_areas.collection_key,
+  release_areas.release_id,
+  release_areas.area_key,
+  release_areas.area_id,
   area_code.code_type,
   area_code.code_value
-FROM $SCHEMA$.published_areas
-JOIN $SCHEMA$.area_code ON area_code.area_id = published_areas.area_id;
+FROM $SCHEMA$.release_areas
+JOIN $SCHEMA$.area_code ON area_code.area_id = release_areas.area_id;
+
+--SPLIT--
+
+CREATE VIEW $SCHEMA$.published_area_codes AS
+SELECT
+  release_area_codes.collection_key,
+  release_area_codes.release_id,
+  release_area_codes.area_key,
+  release_area_codes.area_id,
+  release_area_codes.code_type,
+  release_area_codes.code_value
+FROM $SCHEMA$.release_area_codes
+JOIN $SCHEMA$.publication ON publication.release_id = release_area_codes.release_id;
+
+--SPLIT--
+
+CREATE VIEW $SCHEMA$.release_area_names AS
+SELECT
+  release_areas.collection_key,
+  release_areas.release_id,
+  release_areas.area_key,
+  release_areas.area_id,
+  area_name.name,
+  area_name.kind,
+  area_name.locale
+FROM $SCHEMA$.release_areas
+JOIN $SCHEMA$.area_name ON area_name.area_id = release_areas.area_id;
 
 --SPLIT--
 
 CREATE VIEW $SCHEMA$.published_area_names AS
 SELECT
-  published_areas.collection_key,
-  published_areas.area_key,
-  published_areas.area_id,
-  area_name.name,
-  area_name.kind,
-  area_name.locale
-FROM $SCHEMA$.published_areas
-JOIN $SCHEMA$.area_name ON area_name.area_id = published_areas.area_id;
+  release_area_names.collection_key,
+  release_area_names.release_id,
+  release_area_names.area_key,
+  release_area_names.area_id,
+  release_area_names.name,
+  release_area_names.kind,
+  release_area_names.locale
+FROM $SCHEMA$.release_area_names
+JOIN $SCHEMA$.publication ON publication.release_id = release_area_names.release_id;
 
 --SPLIT--
 
-CREATE VIEW $SCHEMA$.published_area_relations AS
+-- The collection key comes through release, not through publication, which is
+-- the whole difference between this and its published counterpart: an edge of
+-- an unpublished release still belongs to a collection.
+CREATE VIEW $SCHEMA$.release_relations AS
 SELECT
   collection.key AS collection_key,
-  publication.release_id,
+  relation.release_id,
   relation.parent_area_id,
   parent_area.area_key AS parent_area_key,
   relation.child_area_id,
@@ -2853,11 +3411,28 @@ SELECT
   relation.intersection_area_m2,
   relation.parent_coverage,
   relation.child_coverage
-FROM $SCHEMA$.publication
-JOIN $SCHEMA$.collection ON collection.id = publication.collection_id
-JOIN $SCHEMA$.relation ON relation.release_id = publication.release_id
+FROM $SCHEMA$.relation
+JOIN $SCHEMA$.release ON release.id = relation.release_id
+JOIN $SCHEMA$.collection ON collection.id = release.collection_id
 JOIN $SCHEMA$.area parent_area ON parent_area.id = relation.parent_area_id
 JOIN $SCHEMA$.area child_area ON child_area.id = relation.child_area_id;
+
+--SPLIT--
+
+CREATE VIEW $SCHEMA$.published_area_relations AS
+SELECT
+  release_relations.collection_key,
+  release_relations.release_id,
+  release_relations.parent_area_id,
+  release_relations.parent_area_key,
+  release_relations.child_area_id,
+  release_relations.child_area_key,
+  release_relations.relation_type,
+  release_relations.intersection_area_m2,
+  release_relations.parent_coverage,
+  release_relations.child_coverage
+FROM $SCHEMA$.release_relations
+JOIN $SCHEMA$.publication ON publication.release_id = release_relations.release_id;
 
 --SPLIT--
 
@@ -2883,6 +3458,77 @@ JOIN $SCHEMA$.area ON area.id = boundary.area_id;
 -- The area_match type and spatial resolution functions
 
 CREATE TYPE $SCHEMA$.area_match AS (
+  collection_key text,
+  release_id uuid,
+  area_key text,
+  authority text,
+  area_type text,
+  type_rank integer,
+  name text,
+  codes jsonb,
+  centroid geography(Point, 4326),
+  attributes jsonb,
+  match_method text,
+  distance_m numeric,
+  intersection_area_m2 numeric,
+  coverage_of_input numeric,
+  coverage_of_area numeric,
+  score numeric
+);
+
+--SPLIT--
+
+-- The seed guard the plural reads below share. Their seed argument is
+-- required, exactly as the singular reads' single seed is, and a null element
+-- inside the array is rejected rather than skipped: a skipped element would
+-- contribute no rows and no error, losing one seed out of thousands without
+-- a trace.
+CREATE FUNCTION $SCHEMA$.assert_seed_keys(
+  seed_keys text[],
+  label text
+)
+RETURNS void
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  IF seed_keys IS NULL THEN
+    RAISE EXCEPTION '% are required', label USING ERRCODE = '22004';
+  END IF;
+
+  IF array_position(seed_keys, NULL) IS NOT NULL THEN
+    RAISE EXCEPTION '% must not contain a null element', label
+      USING ERRCODE = '22004';
+  END IF;
+END;
+$fn$;
+
+--SPLIT--
+
+-- area_match with the seed that produced the row in front of it. The plural
+-- reads resolve many seeds in one call, so the seed has to travel with each
+-- row: without it a caller cannot tell which of its thousands of inputs a
+-- given row answers.
+--
+-- The sixteen trailing columns repeat area_match's definitions in
+-- area_match's order, and that repetition is deliberate. PostgreSQL composite
+-- types do not compose: a type cannot be declared as area_match plus one
+-- column. The alternative shape,
+-- RETURNS TABLE(seed_key text, match $SCHEMA$.area_match), nests a composite
+-- inside a result column, which every client then has to decode -- Postgrex
+-- decodes a nested composite poorly, and it would complicate the decoding
+-- path shared with every caller of the singular reads. Flat and duplicated is
+-- the cheaper of the two costs; test/pgtap/schema/test_install.sql pins both
+-- column lists so the two cannot drift apart unnoticed.
+--
+-- The seed column is seed_key, not seed_area_key: three of the four plural
+-- reads are seeded by an area key, areas_by_code_many is seeded by a code
+-- value, and one type serves all four.
+CREATE TYPE $SCHEMA$.seeded_area_match AS (
+  seed_key text,
   collection_key text,
   release_id uuid,
   area_key text,
@@ -3083,6 +3729,12 @@ $fn$;
 -- release_areas directly (not published_areas) so a non-null
 -- target_release_id can reach a release that is not the currently
 -- published one, matching areas_for_point and areas_for_geometry.
+--
+-- The two that take a result_limit pass it to LIMIT unwrapped, so an
+-- explicit NULL is PostgreSQL's LIMIT ALL. A caller that narrows what came
+-- back -- by a scope these functions do not model -- asks for the whole
+-- ranked set that way, rather than naming a number that stands in for one.
+-- Omitting the argument still takes the parameter default of 50.
 
 CREATE FUNCTION $SCHEMA$.areas_near(
   lon double precision,
@@ -3170,7 +3822,7 @@ BEGIN
       THEN ST_Distance(boundary.geom::geography, probe)
       ELSE ST_Distance(area.centroid, probe)
     END
-  LIMIT coalesce(result_limit, 50);
+  LIMIT result_limit;
 END;
 $fn$;
 
@@ -3255,7 +3907,61 @@ $fn$;
 
 --SPLIT--
 
+-- Every plural read delegates to the singular read beside it, once per
+-- seed, the way resolve delegates to each strategy rather than reimplementing
+-- it. One definition of what the read means serves both, and the plural
+-- result for an array is exactly the singular results concatenated in the
+-- array's order.
+--
+-- What that removes is the round trip, not the per-seed lookup: a caller
+-- resolving three thousand seeds pays one call instead of three thousand.
+-- These are SETOF plpgsql functions, so the planner cannot push a predicate
+-- into them; a caller that wants to join or aggregate against catalog areas
+-- wants GeoGenius.Query's composable, view-backed path instead of either
+-- shape here.
+--
+-- CROSS JOIN, not LEFT JOIN: a seed that matched nothing contributes no rows
+-- rather than one row whose every area column is null, which a caller would
+-- have to filter out and which nothing in the type distinguishes from a real
+-- match.
+CREATE FUNCTION $SCHEMA$.areas_by_code_many(
+  target_code_type text,
+  target_code_values text[],
+  collections text[] DEFAULT NULL,
+  types text[] DEFAULT NULL,
+  target_release_id uuid DEFAULT NULL,
+  include_retired boolean DEFAULT false,
+  parent_area_key text DEFAULT NULL,
+  parent_max_depth integer DEFAULT 1
+)
+RETURNS SETOF $SCHEMA$.seeded_area_match
+LANGUAGE plpgsql
+STABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  IF target_code_type IS NULL THEN
+    RAISE EXCEPTION 'code type is required' USING ERRCODE = '22004';
+  END IF;
 
+  PERFORM $SCHEMA$.assert_seed_keys(target_code_values, 'code values');
+
+  -- areas_by_code leaves its rows unordered, so the plural pins an order the
+  -- singular does not have to: seed order first, then area_key, which is
+  -- unique within one code lookup.
+  RETURN QUERY
+  SELECT seed.seed_key, matched.*
+  FROM unnest(target_code_values) WITH ORDINALITY AS seed(seed_key, seed_ord)
+  CROSS JOIN LATERAL $SCHEMA$.areas_by_code(
+    target_code_type, seed.seed_key, collections, types, target_release_id,
+    include_retired, parent_area_key, parent_max_depth) matched
+  ORDER BY seed.seed_ord, matched.area_key;
+END;
+$fn$;
+
+--SPLIT--
 
 CREATE FUNCTION $SCHEMA$.search_areas(
   query text,
@@ -3351,7 +4057,7 @@ BEGIN
     SELECT *
     FROM eligible
     ORDER BY score DESC, matched_name, area_key
-    LIMIT coalesce(result_limit, 50)
+    LIMIT result_limit
   )
   SELECT
     top.collection_key,
@@ -3471,6 +4177,39 @@ $fn$;
 
 --SPLIT--
 
+CREATE FUNCTION $SCHEMA$.children_of_many(
+  parent_area_keys text[],
+  types text[] DEFAULT NULL,
+  classifications text[] DEFAULT NULL,
+  max_depth integer DEFAULT 1,
+  target_release_id uuid DEFAULT NULL,
+  include_retired boolean DEFAULT false
+)
+RETURNS SETOF $SCHEMA$.seeded_area_match
+LANGUAGE plpgsql
+STABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  PERFORM $SCHEMA$.assert_seed_keys(parent_area_keys, 'parent area keys');
+
+  -- children_of collapses its walk to one row per area_key, so ordering on
+  -- the seed's position and then area_key reproduces the singular's order
+  -- inside each seed's block.
+  RETURN QUERY
+  SELECT seed.seed_key, walked.*
+  FROM unnest(parent_area_keys) WITH ORDINALITY AS seed(seed_key, seed_ord)
+  CROSS JOIN LATERAL $SCHEMA$.children_of(
+    seed.seed_key, types, classifications, max_depth, target_release_id,
+    include_retired) walked
+  ORDER BY seed.seed_ord, walked.area_key;
+END;
+$fn$;
+
+--SPLIT--
+
 CREATE FUNCTION $SCHEMA$.ancestors_of(
   child_area_key text,
   types text[] DEFAULT NULL,
@@ -3550,6 +4289,36 @@ $fn$;
 
 --SPLIT--
 
+CREATE FUNCTION $SCHEMA$.ancestors_of_many(
+  child_area_keys text[],
+  types text[] DEFAULT NULL,
+  classifications text[] DEFAULT NULL,
+  max_depth integer DEFAULT 1,
+  target_release_id uuid DEFAULT NULL,
+  include_retired boolean DEFAULT false
+)
+RETURNS SETOF $SCHEMA$.seeded_area_match
+LANGUAGE plpgsql
+STABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  PERFORM $SCHEMA$.assert_seed_keys(child_area_keys, 'child area keys');
+
+  RETURN QUERY
+  SELECT seed.seed_key, walked.*
+  FROM unnest(child_area_keys) WITH ORDINALITY AS seed(seed_key, seed_ord)
+  CROSS JOIN LATERAL $SCHEMA$.ancestors_of(
+    seed.seed_key, types, classifications, max_depth, target_release_id,
+    include_retired) walked
+  ORDER BY seed.seed_ord, walked.area_key;
+END;
+$fn$;
+
+--SPLIT--
+
 CREATE FUNCTION $SCHEMA$.related_areas(
   target_area_key text,
   classifications text[] DEFAULT NULL,
@@ -3612,6 +4381,33 @@ BEGIN
     ON area.area_id = related.area_id AND area.release_id = related.release_id
   WHERE (include_retired OR area.retired_at IS NULL)
   ORDER BY area.area_key, area.type_rank;
+END;
+$fn$;
+
+--SPLIT--
+
+CREATE FUNCTION $SCHEMA$.related_areas_many(
+  target_area_keys text[],
+  classifications text[] DEFAULT NULL,
+  target_release_id uuid DEFAULT NULL,
+  include_retired boolean DEFAULT false
+)
+RETURNS SETOF $SCHEMA$.seeded_area_match
+LANGUAGE plpgsql
+STABLE
+PARALLEL SAFE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  PERFORM $SCHEMA$.assert_seed_keys(target_area_keys, 'area keys');
+
+  RETURN QUERY
+  SELECT seed.seed_key, related.*
+  FROM unnest(target_area_keys) WITH ORDINALITY AS seed(seed_key, seed_ord)
+  CROSS JOIN LATERAL $SCHEMA$.related_areas(
+    seed.seed_key, classifications, target_release_id, include_retired) related
+  ORDER BY seed.seed_ord, related.area_key;
 END;
 $fn$;
 

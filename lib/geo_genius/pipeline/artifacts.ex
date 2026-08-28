@@ -16,13 +16,13 @@ defmodule GeoGenius.Pipeline.Artifacts do
   bytes nobody reviewed.
   """
 
-  alias GeoGenius.Cache
   alias GeoGenius.Catalog
   alias GeoGenius.CatalogError
   alias GeoGenius.Context
   alias GeoGenius.Downloader
   alias GeoGenius.Manifest
   alias GeoGenius.Pipeline.State
+  alias GeoGenius.ReleaseArtifacts
 
   @doc """
   Resolves every artifact the release composes to a local file, recording what
@@ -112,37 +112,18 @@ defmodule GeoGenius.Pipeline.Artifacts do
     end
   end
 
-  # A manifest-supplied key is validated the same way a derived one is: a
-  # manifest is reviewed, not trusted, and a segment carrying a separator
-  # would place the file outside the cache root. The metadata itself comes out
-  # of jsonb rather than out of manifest validation, so its shape is checked
-  # here too -- splitting a number would raise where a named error belongs.
-  defp cache_key(%{"metadata" => %{"cache_key" => supplied}} = artifact)
-       when is_binary(supplied) do
-    validated_key(artifact, String.split(supplied, "/"))
-  end
-
-  defp cache_key(%{"metadata" => %{"cache_key" => supplied}} = artifact) do
-    {:error,
-     "artifact #{artifact["logical_name"]} carries a cache_key that is not a string: " <>
-       inspect(supplied)}
-  end
-
+  # `GeoGenius.ReleaseArtifacts.cache_key/1` owns the derivation, so an
+  # artifact a host later resolves is addressed exactly as the import that
+  # wrote it addressed it. It returns the detail alone; the artifact's own name
+  # is added here, where the message reaches a run's `error` column.
   defp cache_key(artifact) do
-    validated_key(artifact, [
-      artifact["collection_key"],
-      artifact["source_key"],
-      artifact["source_release_key"],
-      artifact["logical_name"]
-    ])
-  end
+    case ReleaseArtifacts.cache_key(artifact) do
+      {:ok, key} ->
+        {:ok, key}
 
-  defp validated_key(artifact, segments) do
-    {:ok, Cache.key(segments)}
-  rescue
-    error in ArgumentError ->
-      {:error,
-       "artifact #{artifact["logical_name"]} has no usable cache key: #{Exception.message(error)}"}
+      {:error, detail} ->
+        {:error, "artifact #{artifact["logical_name"]} has no usable cache key: #{detail}"}
+    end
   end
 
   defp from_cache(state, artifact, path) do

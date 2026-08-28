@@ -1,6 +1,6 @@
 BEGIN;
 
-SELECT plan(12);
+SELECT plan(13);
 
 SELECT has_schema('geo_genius', 'geo_genius schema exists');
 SELECT has_view('geo_genius', 'geo_genius_version', 'version tracking view exists');
@@ -53,6 +53,28 @@ SELECT is(
     'coverage_of_area', 'score'
   ],
   'area_match column order is unchanged'
+);
+
+-- seeded_area_match repeats area_match's columns after its own seed_key, and
+-- the plural reads project one straight into the other. A column added to
+-- area_match alone, or reordered in one and not the other, would transpose
+-- values with no behavioural test to catch it.
+SELECT is(
+  (SELECT array_agg(attname::text ORDER BY attnum)
+     FROM pg_attribute
+    WHERE attrelid = (SELECT typrelid FROM pg_type
+                       WHERE typname = 'seeded_area_match'
+                         AND typnamespace = 'geo_genius'::regnamespace)
+      AND attnum > 0 AND NOT attisdropped),
+  ARRAY['seed_key'] || (
+    SELECT array_agg(attname::text ORDER BY attnum)
+      FROM pg_attribute
+     WHERE attrelid = (SELECT typrelid FROM pg_type
+                        WHERE typname = 'area_match'
+                          AND typnamespace = 'geo_genius'::regnamespace)
+       AND attnum > 0 AND NOT attisdropped
+  ),
+  'seeded_area_match is seed_key followed by area_match''s columns in order'
 );
 
 -- Nothing GeoGenius installs runs with the definer's rights, and every
@@ -114,7 +136,8 @@ SELECT is(
       AND p.proname = ANY(ARRAY[
         'areas_for_point', 'areas_for_geometry', 'areas_near', 'areas_by_code',
         'search_areas', 'resolve', 'children_of', 'ancestors_of', 'related_areas',
-        'published_release', 'verify_release'])),
+        'areas_by_code_many', 'children_of_many', 'ancestors_of_many',
+        'related_areas_many', 'published_release', 'verify_release'])),
   ARRAY['ss'],
   'every documented read function is STABLE PARALLEL SAFE'
 );
