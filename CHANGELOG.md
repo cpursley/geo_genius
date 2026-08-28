@@ -122,6 +122,66 @@
   streaming staged rows in pages and heartbeating the run's lease between them. It measures
   `asserted_relations` beside `relations`.
 
+### Providers
+
+- **`implied_areas`, a manifest option on both generic providers,** lets a source row
+  describe parent areas it names only by code in other columns, and asserts an edge from
+  each of them to the row's own area. A source that carries a grouping code on every
+  record describes that grouping as well as the record, and staging the same file a second
+  time under a second manifest to reach it was the only way to get those areas before.
+  Each entry names an `"area_type"`, the column carrying the code -- `"code_property"` for
+  `GeoGenius.Providers.GeoJSON`, `"code_column"` for `GeoGenius.Providers.CSV` -- a
+  `"names"` map from code to display name, an optional `"authority"`, and an optional
+  `"relation"` defaulting to `"contains"`. An implied area carries no geometry and no
+  centroid, since a grouping a source names only by code has no shape of its own there,
+  and areas implied by several rows converge on `area_key` exactly as areas returned by
+  `normalize/2` always have. A blank code implies nothing and is not an error, because a
+  column populated for most rows and blank for a few is ordinary; a populated code with no
+  entry in `"names"` fails the release, because keying an area with no name would publish
+  an unlabelled one.
+- **`validate_options/1`, an optional provider callback,** is handed a manifest's whole
+  `options` map at load, once every key `required_options/0` names is known to be present,
+  and the error it returns becomes a `GeoGenius.ManifestError` naming the field. This is
+  where a provider checks the options only it understands: the option vocabulary is
+  per-provider, so the same document can be valid under one provider and invalid under
+  another, and manifest validation cannot check a provider's own keys on its behalf. The
+  shipped generic providers validate their `implied_areas` entries through it, so a
+  missing `"area_type"`, an unknown `"relation"`, a malformed `"names"` map, or an entry
+  written in the other provider's vocabulary now fails at load rather than per row,
+  partway through normalizing an artifact already downloaded and staged.
+  `GeoGenius.Providers.Shapefile` delegates to `GeoGenius.Providers.GeoJSON`, since it
+  names its options in the converted document's vocabulary. The callback is optional: a
+  provider that exports none is unaffected. Providers still validate what they read at the
+  point they read it, because a `%GeoGenius.Manifest{}` built in Elixir never passes
+  through `GeoGenius.Manifest.from_map/2`.
+- **A source names the provider that stages it,** and a source that names none inherits the
+  release's own `provider`, so every existing manifest is unchanged. One release can now
+  draw on sources in different formats -- a delimited file and a shapefile archive in the
+  same release, converging on `area_key`. `artifacts/1` is asked once per source with the
+  manifest narrowed to that source; `stage/5` dispatches on the artifact; `normalize/2` and
+  `asserted_relations/2` dispatch on the row's artifact; `relations/1` is the union, so
+  relations are rebuilt when any provider asks. Manifest validation now checks
+  `required_options/0` and `validate_options/1` for every provider a manifest names, and the
+  missing-key message names the provider that wanted it. A source's `provider` was
+  previously registered and round-tripped but never read.
+
+### Breaking
+
+- **`GeoGenius.Pipeline.State` no longer carries `:provider`.** A run resolves several, so
+  the field is replaced by `providers` (the distinct modules, in source declaration order)
+  and `artifact_providers` (logical name to module). This is an internal pipeline struct
+  with no documented construction path outside the library.
+
+- **The `area_types/0` provider callback is removed.** It promised that a manifest
+  declaring no `area_types` would fall back to the provider's own, and nothing anywhere
+  read it: no call site existed in the pipeline, in registration, or in any shipped
+  provider, and the documented fallback was never implemented, so a manifest that relied
+  on it registered no area types at all. **An out-of-tree provider should delete its
+  `area_types/0` implementation**, whose `@impl` now warns that the behaviour specifies no
+  such callback, and any manifest that leaned on the fallback must declare its
+  `area_types` itself. `GeoGenius.Provider.no_area_types/0`, the shared body the shipped
+  providers delegated to, is removed with it.
+
 ### Ingestion
 
 - **Five set writes: `upsert_area_many`, `put_area_name_many`, `put_area_code_many`,

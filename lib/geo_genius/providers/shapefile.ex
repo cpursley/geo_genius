@@ -21,7 +21,7 @@ defmodule GeoGenius.Providers.Shapefile do
     4. Delegates the parse of the converted document to
        `GeoGenius.Providers.GeoJSON.stage/5`.
 
-  `normalize/2`, `required_options/0`, `area_types/0`, `artifacts/1`,
+  `normalize/2`, `required_options/0`, `artifacts/1`,
   `relations/1`, and `asserted_relations/2` all delegate to
   `GeoGenius.Providers.GeoJSON` unchanged: a converted shapefile is a GeoJSON
   `FeatureCollection` by the time anything downstream of `ogr2ogr` sees it,
@@ -84,14 +84,14 @@ defmodule GeoGenius.Providers.Shapefile do
   @converted_filename "converted.json"
 
   @impl Provider
-  @doc "Delegates to `GeoGenius.Providers.GeoJSON.area_types/0`: a converted shapefile carries no fixed hierarchy of its own."
-  @spec area_types() :: [Manifest.area_type()]
-  defdelegate area_types(), to: GeoJSON
-
-  @impl Provider
   @doc "Delegates to `GeoGenius.Providers.GeoJSON.required_options/0`: the manifest options a shapefile release names are read from the converted GeoJSON document."
   @spec required_options() :: [String.t()]
   defdelegate required_options(), to: GeoJSON
+
+  @impl Provider
+  @doc "Delegates to `GeoGenius.Providers.GeoJSON.validate_options/1`: a shapefile release names its options in the converted GeoJSON document's vocabulary."
+  @spec validate_options(map()) :: :ok | {:error, String.t()}
+  defdelegate validate_options(options), to: GeoJSON
 
   @impl Provider
   @doc "Delegates to `GeoGenius.Providers.GeoJSON.artifacts/1`: every artifact declared across the manifest's sources, all of them shapefile archives."

@@ -46,8 +46,8 @@ defmodule GeoGenius.Pipeline.Normalize do
   @empty_counts %{"areas" => 0, "boundaries" => 0, "skipped" => 0}
 
   @doc """
-  Streams the run's staged rows through the provider and writes what comes
-  back.
+  Streams the run's staged rows through the provider that staged each one and
+  writes what comes back.
 
   Measures `"areas"`, `"boundaries"`, and `"skipped"`.
   """
@@ -80,19 +80,34 @@ defmodule GeoGenius.Pipeline.Normalize do
   end
 
   defp collect_row(row, state, {:ok, {counts, collected}}) do
-    case state.provider.normalize(state.manifest, row) do
+    case Map.fetch(state.artifact_providers, row.artifact) do
+      {:ok, provider} -> collect_with(provider, row, state, counts, collected)
+      :error -> {:halt, {:error, unknown_artifact(row)}}
+    end
+  end
+
+  defp collect_with(provider, row, state, counts, collected) do
+    case provider.normalize(state.manifest, row) do
       :skip ->
         {:cont, {:ok, {bump(counts, "skipped"), collected}}}
 
       {:ok, %Area{} = area} ->
-        continue(collect_areas(state, row, [area], counts, collected))
+        continue(collect_areas(provider, state, row, [area], counts, collected))
 
       {:ok, areas} when is_list(areas) ->
-        continue(collect_areas(state, row, areas, counts, collected))
+        continue(collect_areas(provider, state, row, areas, counts, collected))
 
       {:error, reason} ->
-        {:halt, {:error, "#{inspect(state.provider)} could not normalize a row: #{reason}"}}
+        {:halt, {:error, "#{inspect(provider)} could not normalize a row: #{reason}"}}
     end
+  end
+
+  # A staged row names the artifact it came from, and the run's providers are
+  # keyed by that name. A row naming an artifact this run did not stage is a
+  # resumed run whose manifest changed underneath it, not a provider defect, so
+  # it fails naming the artifact rather than raising a `KeyError`.
+  defp unknown_artifact(row) do
+    "staged row names artifact #{inspect(row.artifact)}, which no provider in this run stages"
   end
 
   defp continue({:ok, _collected} = accumulated), do: {:cont, accumulated}
@@ -100,9 +115,9 @@ defmodule GeoGenius.Pipeline.Normalize do
 
   # Folds the row's areas in order, stopping at the first that cannot be
   # collected so a later area never masks an earlier failure.
-  defp collect_areas(state, row, areas, counts, collected) do
+  defp collect_areas(provider, state, row, areas, counts, collected) do
     Enum.reduce_while(areas, {:ok, {counts, collected}}, fn area, {:ok, accumulated} ->
-      case collect_area(state, row, area, accumulated) do
+      case collect_area(provider, state, row, area, accumulated) do
         {:ok, next} -> {:cont, {:ok, next}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -113,24 +128,24 @@ defmodule GeoGenius.Pipeline.Normalize do
   # composes `area_key` from, and every write after the area itself takes that
   # key rather than the id `upsert_area_many/3` returns. The pipeline test
   # asserts the two agree rather than trusting that they do.
-  defp collect_area(state, row, area, {counts, collected}) do
+  defp collect_area(provider, state, row, area, {counts, collected}) do
     area_key = Area.key(area)
 
-    with :ok <- validate_names(state, area, area_key),
-         :ok <- validate_codes(state, area, area_key),
+    with :ok <- validate_names(provider, area, area_key),
+         :ok <- validate_codes(provider, area, area_key),
          {:ok, source_release_id} <- boundary_source(state, row, area) do
       {:ok, {count_area(counts, area), [{area_key, area, source_release_id} | collected]}}
     end
   end
 
-  defp validate_names(state, %Area{names: names}, area_key) do
+  defp validate_names(provider, %Area{names: names}, area_key) do
     case Enum.find(names, &invalid_kind?/1) do
       nil ->
         :ok
 
       %Area.Name{kind: kind} ->
         {:error,
-         "#{inspect(state.provider)} returned name kind #{inspect(kind)} for area " <>
+         "#{inspect(provider)} returned name kind #{inspect(kind)} for area " <>
            "#{area_key}; expected one of #{Enum.map_join(@name_kinds, ", ", &inspect/1)}"}
     end
   end
@@ -139,14 +154,14 @@ defmodule GeoGenius.Pipeline.Normalize do
 
   # A code type is deliberately open -- FIPS, GNIS, ZIP, and whatever the next
   # authority calls its own identifier -- so only its shape can be checked.
-  defp validate_codes(state, %Area{codes: codes}, area_key) do
+  defp validate_codes(provider, %Area{codes: codes}, area_key) do
     case Enum.find(codes, &invalid_code_type?/1) do
       nil ->
         :ok
 
       %Area.Code{code_type: code_type} ->
         {:error,
-         "#{inspect(state.provider)} returned code type #{inspect(code_type)} for area " <>
+         "#{inspect(provider)} returned code type #{inspect(code_type)} for area " <>
            "#{area_key}; a code type must be a string"}
     end
   end

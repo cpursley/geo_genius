@@ -31,18 +31,6 @@ defmodule GeoGenius.Providers.SimpleMaps do
   # heartbeats the run's lease from inside that call.
   @chunk_size 1_000
 
-  @area_types [
-    %{key: "state", rank: 10},
-    %{key: "county", rank: 20},
-    %{key: "city", rank: 30},
-    %{key: "zip", rank: 40}
-  ]
-
-  @impl Provider
-  @doc "The fixed US hierarchy this dataset describes."
-  @spec area_types() :: [Manifest.area_type()]
-  def area_types, do: @area_types
-
   @impl Provider
   @doc "Reads its columns by name, so a manifest supplies no options."
   @spec required_options() :: [String.t()]

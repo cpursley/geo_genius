@@ -79,10 +79,11 @@ Every authority an area is keyed under must be declared here, since an area nami
 the collection does not carry is refused.
 
 `authorities` is required and must name at least one. That is stricter than
-`area_types`, which may be omitted: a provider supplies its own ranked hierarchy from
-`area_types/0` when the manifest declares none, and nothing supplies authorities. A
-manifest declaring none can therefore register no area at all, and rejecting it at load
-names the field rather than failing partway through normalization. `area_types` declares
+`area_types`, which may be declared as an empty list: a manifest declaring no area
+types registers none, and a release that normalizes an area whose type it never declared
+fails. Nothing else supplies either. A manifest with no authorities can therefore
+register no area at all, and rejecting it at load names the field rather than failing
+partway through normalization. `area_types` declares
 the ranked types this collection uses, low rank containing high.
 
 `GeoGenius.Providers.GeoJSON` and `GeoGenius.Providers.CSV` key every area they emit
@@ -122,8 +123,11 @@ are validated, because a segment carrying a separator would put the file outside
 cache root.
 
 `options` is the provider's own configuration and nothing outside the provider reads it.
-Manifest validation checks that every key the provider's `required_options/0` names is
-present, so a manifest missing one is rejected before any release row exists rather than
+Manifest validation checks that every key `required_options/0` names is present, and then
+hands the whole map to `validate_options/1`, if it exports one, to check the options only
+it understands. Both run for **every provider the manifest names** -- the release's own
+and each source's -- and both run before any release row exists, so a manifest that is
+missing a required key or carries a malformed option is rejected at load rather than
 several phases into a run.
 
 `GeoGenius.Manifest.to_map/1` produces exactly the document above, and
@@ -166,17 +170,35 @@ with `ogr2ogr` before parsing the result as GeoJSON, and
 `GeoGenius.Providers.SimpleMaps` (`"simplemaps"`), which has a section of its own
 [below](#the-simplemaps-provider).
 
-`GeoGenius.Provider` declares seven callbacks.
+`GeoGenius.Provider` declares six callbacks every provider implements, and one optional
+seventh.
 
-`area_types/0` returns the ranked hierarchy this provider's collections use when a
-manifest declares none. The GeoJSON, CSV and shapefile providers have none of their own,
-so they delegate to `GeoGenius.Provider.no_area_types/0` and let the manifest decide.
-SimpleMaps parses two fixed files and returns the four-level hierarchy they describe.
+A source may name its own `provider`, and a source that names none inherits the release's.
+That is what lets one release draw on sources in different formats: a delimited file staged
+by the CSV provider beside an archive staged by the shapefile provider, converging on
+`area_key` so one area carries what each source contributed. The pipeline asks `artifacts/1`
+once per source with the manifest narrowed to that source, dispatches `stage/5` on the
+artifact, and dispatches `normalize/2` and `asserted_relations/2` on the row's own artifact.
+`relations/1` is the union: relations are rebuilt when any of a release's providers asks for
+it, so a source whose areas nest spatially is still measured beside a source that carries no
+geometry at all.
+
+One caveat follows from `options` being release-level while the option vocabulary is
+per-provider: an `implied_areas` entry names its code key in one provider's suffix, so a
+release cannot share one between a CSV source and a GeoJSON source. A provider that reads
+no options at all -- `GeoGenius.Providers.SimpleMaps` -- composes with any of them.
 
 `required_options/0` returns the `options` keys manifest validation insists on. The
 GeoJSON provider requires `"area_type"` and `"code_property"`; the CSV provider requires
 `"area_type"` and `"code_column"`. SimpleMaps reads its columns by name and requires
 none.
+
+`validate_options/1` is the optional one. A provider that exports it is handed the whole
+`options` map at load, once the required keys are known to be present, and the error it
+returns becomes a manifest error naming the field. This is where a provider checks what
+only it understands -- the shipped generic providers validate their `implied_areas`
+entries here. A provider that exports none contributes no checks beyond the required
+keys.
 
 `artifacts/1` returns the artifacts, across the manifest's sources, this provider will
 stage. The shipped providers stage every declared artifact and so delegate to
@@ -196,6 +218,50 @@ itself.
 `{:ok, %GeoGenius.Provider.Area{}}`. It is pure: no adapters, no environment, no
 database. Return `:skip` for a row that carries no area, such as a summary record or a
 feature with no usable code, since that is an expected shape rather than a failure.
+
+A row may also imply areas identified by *other* columns on itself. A record carrying a
+grouping code -- a statistical grouping on an administrative record, an administrative
+parent on a place record -- describes that grouping as well as itself, and the GeoJSON
+and CSV providers read those columns from an `implied_areas` manifest option rather than
+requiring a provider of your own:
+
+```json
+"options": {
+  "area_type": "place",
+  "code_property": "code",
+  "implied_areas": [
+    {
+      "area_type": "cluster",
+      "code_property": "CLUSTER",
+      "names": { "1": "Outer Cluster", "2": "Inner Cluster" },
+      "relation": "contains"
+    }
+  ]
+}
+```
+
+Each entry names the area type to imply, the column carrying its code, a `names` map from
+code to display name, an optional `authority` override, and an optional `relation`
+defaulting to `"contains"`. The code key follows the provider's own vocabulary:
+`code_property` under GeoJSON and shapefile manifests, `code_column` under CSV ones.
+
+These entries are validated at load, through `validate_options/1`, so a missing
+`area_type`, an unknown `relation`, a `names` map that is not an object, or an entry
+written in the other provider's vocabulary is rejected before anything is downloaded. The
+providers validate again as they read, because a `%GeoGenius.Manifest{}` built in Elixir
+never passes through `GeoGenius.Manifest.from_map/2`.
+
+An implied area carries no geometry and no centroid: a grouping a source names only by
+code has no shape of its own there, and deriving one from the row's geometry would claim
+the grouping's boundary is one member's boundary. A blank code implies nothing and is not
+an error, since a column populated for most rows and blank for a few is ordinary. A code
+that is present but missing from `names` fails the release, because keying an area with
+no name would publish an unlabelled area.
+
+The same entries drive `asserted_relations/2`, so each implied area also gets an edge to
+the row's own area. That composes with `relations/1` rather than replacing it: a provider
+that rebuilds measured relations from geometry can assert membership the geometry cannot
+express, and both land in one release.
 
 It may also return `{:ok, [%GeoGenius.Provider.Area{}, ...]}`, which is what a source
 that denormalises a hierarchy into every row needs: a city row that also carries its

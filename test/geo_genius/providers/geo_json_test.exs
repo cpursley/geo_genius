@@ -2,6 +2,7 @@ defmodule GeoGenius.Providers.GeoJSONTest do
   use ExUnit.Case, async: true
 
   alias GeoGenius.Manifest
+  alias GeoGenius.Provider.Area
   alias GeoGenius.Provider.Area.Code
   alias GeoGenius.Provider.Area.Name
   alias GeoGenius.Providers.GeoJSON
@@ -75,8 +76,28 @@ defmodule GeoGenius.Providers.GeoJSONTest do
     assert "code_property" in GeoJSON.required_options()
   end
 
-  test "area_types comes from the manifest, not from the provider" do
-    assert GeoJSON.area_types() == []
+  test "validate_options accepts implied_areas entries naming code_property" do
+    options = %{
+      "implied_areas" => [
+        %{"area_type" => "cluster", "code_property" => "CLUSTER", "names" => %{"1" => "One"}}
+      ]
+    }
+
+    assert GeoJSON.validate_options(options) == :ok
+  end
+
+  # The option vocabulary is this provider's own, so an entry written for the
+  # other generic provider is rejected here rather than accepted and failed on
+  # every row.
+  test "validate_options rejects an implied_areas entry naming code_column instead" do
+    options = %{"implied_areas" => [%{"area_type" => "cluster", "code_column" => "CLUSTER"}]}
+
+    assert {:error, reason} = GeoJSON.validate_options(options)
+    assert reason =~ ~s("code_property")
+  end
+
+  test "validate_options accepts options that declare no implied areas" do
+    assert GeoJSON.validate_options(%{"code_property" => "id"}) == :ok
   end
 
   test "artifacts returns every artifact across the manifest's sources" do
@@ -417,5 +438,115 @@ defmodule GeoGenius.Providers.GeoJSONTest do
 
   test "asks for relations to be rebuilt" do
     assert GeoJSON.relations(manifest()) == :rebuild
+  end
+
+  describe "normalize/2 with implied_areas" do
+    test "returns the row's area followed by its implied areas" do
+      manifest = manifest_with_implied_areas()
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "1"},
+        geom: nil
+      }
+
+      assert {:ok, [own, implied]} = GeoJSON.normalize(manifest, row)
+      assert own.area_type_key == "place"
+      assert own.code == "X"
+      assert implied.area_type_key == "cluster"
+      assert implied.code == "1"
+    end
+
+    test "returns a bare area when the manifest implies nothing" do
+      manifest = manifest_without_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "X", "name" => "Ex"}, geom: nil}
+
+      assert {:ok, %Area{}} = GeoJSON.normalize(manifest, row)
+    end
+
+    test "skips the whole row when the row's own code is blank" do
+      manifest = manifest_with_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "", "CLUSTER" => "1"}, geom: nil}
+
+      assert :skip = GeoJSON.normalize(manifest, row)
+    end
+
+    test "errors on a malformed implied_areas option even when the row's own code is blank" do
+      manifest =
+        manifest(%{
+          "area_type" => "place",
+          "code_property" => "code",
+          "name_property" => "name",
+          "implied_areas" => [
+            %{"area_type" => "cluster", "code_property" => "CLUSTER", "relation" => "near"}
+          ]
+        })
+
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "", "CLUSTER" => "1"}, geom: nil}
+
+      assert {:error, reason} = GeoJSON.normalize(manifest, row)
+      assert reason =~ "relation must be one of"
+    end
+
+    test "surfaces an unnamed implied code as an error" do
+      manifest = manifest_with_implied_areas()
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "7"},
+        geom: nil
+      }
+
+      assert {:error, reason} = GeoJSON.normalize(manifest, row)
+      assert reason =~ "names"
+    end
+  end
+
+  describe "asserted_relations/2" do
+    test "asserts an edge from each implied area to the row's area" do
+      manifest = manifest_with_implied_areas()
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "1"},
+        geom: nil
+      }
+
+      assert [{"demo:cluster:1", "demo:place:X", "contains"}] =
+               GeoJSON.asserted_relations(manifest, row)
+    end
+
+    test "asserts nothing when the manifest implies nothing" do
+      manifest = manifest_without_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "X", "name" => "Ex"}, geom: nil}
+
+      assert [] == GeoJSON.asserted_relations(manifest, row)
+    end
+
+    test "asserts nothing when the row's own code is blank" do
+      manifest = manifest_with_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "", "CLUSTER" => "1"}, geom: nil}
+
+      assert [] == GeoJSON.asserted_relations(manifest, row)
+    end
+  end
+
+  defp manifest_with_implied_areas do
+    manifest(%{
+      "area_type" => "place",
+      "code_property" => "code",
+      "name_property" => "name",
+      "implied_areas" => [
+        %{
+          "area_type" => "cluster",
+          "code_property" => "CLUSTER",
+          "names" => %{"1" => "First"}
+        }
+      ]
+    })
+  end
+
+  defp manifest_without_implied_areas do
+    manifest(%{"area_type" => "place", "code_property" => "code", "name_property" => "name"})
   end
 end

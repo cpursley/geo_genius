@@ -495,6 +495,253 @@ defmodule GeoGenius.ManifestTest do
     assert reason == "license must not be blank"
   end
 
+  # A provider that exports `validate_options/1` is handed the manifest's whole
+  # options map at load, after the required keys are known to be present. That
+  # is what turns an option only the provider understands -- `implied_areas`,
+  # whose entries name their code key in the provider's own vocabulary -- into
+  # an error naming the field before a release row exists, rather than a
+  # per-row failure partway through normalizing an artifact already downloaded
+  # and staged. The demo fixture's provider is "geojson", so the entries below
+  # are read under that vocabulary.
+  describe "provider option validation at load" do
+    test "accepts a well-formed implied_areas entry" do
+      map =
+        with_implied_areas([
+          %{
+            "area_type" => "cluster",
+            "code_property" => "CLUSTER",
+            "names" => %{"1" => "Cluster One"}
+          }
+        ])
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert [%{"area_type" => "cluster"}] = manifest.options["implied_areas"]
+    end
+
+    test "rejects an implied_areas that is not a list" do
+      map = with_implied_areas(%{"area_type" => "cluster"})
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "implied_areas must be a list"
+    end
+
+    test "rejects an implied_areas entry that is not an object" do
+      map = with_implied_areas(["cluster"])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "implied_areas entry must be an object"
+    end
+
+    test "rejects an implied_areas entry that names no area_type" do
+      map = with_implied_areas([%{"code_property" => "CLUSTER"}])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ ~s(implied_areas entry requires "area_type")
+    end
+
+    test "rejects an implied_areas entry whose area_type is blank" do
+      map = with_implied_areas([%{"area_type" => "", "code_property" => "CLUSTER"}])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ ~s(implied_areas entry requires "area_type")
+    end
+
+    test "rejects an unknown implied_areas relation" do
+      map =
+        with_implied_areas([
+          %{"area_type" => "cluster", "code_property" => "CLUSTER", "relation" => "near"}
+        ])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "implied_areas relation must be one of"
+      assert reason =~ "near"
+    end
+
+    test "rejects an implied_areas names map that is not an object" do
+      map =
+        with_implied_areas([
+          %{"area_type" => "cluster", "code_property" => "CLUSTER", "names" => ["Cluster One"]}
+        ])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "implied_areas names must be an object"
+    end
+
+    test "rejects an implied_areas names entry whose value is not a string" do
+      map =
+        with_implied_areas([
+          %{"area_type" => "cluster", "code_property" => "CLUSTER", "names" => %{"1" => 42}}
+        ])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "implied_areas names entry"
+      assert reason =~ "string key and a string value"
+    end
+
+    # The code key an entry names is the calling provider's own, so the same
+    # document is valid under one provider and invalid under another. Without
+    # this, a manifest could name `code_column` under a GeoJSON provider and
+    # load cleanly, then fail on every row -- which is the failure this whole
+    # gate exists to move forward.
+    test "rejects an implied_areas entry naming the CSV vocabulary under a GeoJSON provider" do
+      map = with_implied_areas([%{"area_type" => "cluster", "code_column" => "CLUSTER"}])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ ~s(implied_areas entry requires "code_property")
+    end
+
+    test "accepts under a CSV provider the entry a GeoJSON provider rejects" do
+      map =
+        valid_map()
+        |> Map.put("provider", "csv")
+        |> put_source_provider("csv")
+        |> put_option("code_column", "territory_id")
+        |> put_option("implied_areas", [
+          %{
+            "area_type" => "cluster",
+            "code_column" => "CLUSTER",
+            "names" => %{"1" => "Cluster One"}
+          }
+        ])
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert manifest.provider == "csv"
+    end
+
+    # `validate_options/1` is optional. A provider that does not export it
+    # contributes no checks, rather than every manifest naming it failing to
+    # load.
+    test "accepts a manifest whose provider exports no validate_options/1" do
+      map =
+        valid_map()
+        |> Map.put("provider", "satisfied_provider")
+        |> put_source_provider("satisfied_provider")
+        |> put_option("implied_areas", "not even a list")
+
+      Application.put_env(:geo_genius, :providers, %{
+        "satisfied_provider" => GeoGenius.ManifestTest.SatisfiedSchemaProvider
+      })
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert manifest.provider == "satisfied_provider"
+    end
+
+    # The required-key check runs first, so a manifest that is missing a
+    # required key and also carries a malformed option reports the missing key.
+    # Reporting the option instead would send an operator to fix the entry that
+    # is not the reason the manifest cannot be used.
+    test "reports a missing required key before a malformed option" do
+      map =
+        valid_map()
+        |> Map.delete("options")
+        |> Map.put("options", %{"implied_areas" => "not even a list"})
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "missing required key"
+    end
+  end
+
+  # A release composed of sources in different formats names a provider per
+  # source. The release's own `provider` is the default rather than the only
+  # answer, so a single-provider manifest -- every manifest written before this
+  # existed -- keeps loading unchanged.
+  describe "per-source providers" do
+    test "a source that names no provider inherits the manifest's" do
+      map = update_in(valid_map(), ["sources", Access.at(0)], &Map.delete(&1, "provider"))
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert [%{provider: "geojson"}] = manifest.sources
+    end
+
+    # `simplemaps` rather than `csv`: option validation soon covers every
+    # provider a manifest names, and the demo fixture's options carry
+    # `code_property` but not `code_column`.
+    test "a source's own provider overrides the manifest's" do
+      map = put_source_provider(valid_map(), "simplemaps")
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert manifest.provider == "geojson"
+      assert [%{provider: "simplemaps"}] = manifest.sources
+    end
+
+    test "rejects a source naming a provider that does not resolve" do
+      map = put_source_provider(valid_map(), "no_such_provider")
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "no_such_provider"
+    end
+
+    test "rejects a source whose provider is not a string" do
+      map = put_source_provider(valid_map(), 7)
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "provider must be a string"
+    end
+
+    # The resolved default is written back, so a document that omitted the key
+    # round-trips to one that names it and the catalog row registration writes
+    # never carries a null provider.
+    test "to_map writes the resolved provider for a source that omitted it" do
+      map = update_in(valid_map(), ["sources", Access.at(0)], &Map.delete(&1, "provider"))
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert [%{"provider" => "geojson"}] = Manifest.to_map(manifest)["sources"]
+      assert {:ok, ^manifest} = Manifest.from_map(Manifest.to_map(manifest))
+    end
+
+    # Two providers stage this release, so the options map must satisfy both.
+    # Validating only the release's own would let a manifest load that the
+    # source provider cannot stage a single row of.
+    test "requires the option keys a source's provider needs" do
+      map =
+        valid_map()
+        |> Map.put("provider", "simplemaps")
+        |> put_source_provider("csv")
+        |> put_option("area_type", "territory")
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "code_column"
+      assert reason =~ "GeoGenius.Providers.CSV"
+    end
+
+    test "runs a source provider's validate_options/1" do
+      map =
+        valid_map()
+        |> Map.put("provider", "simplemaps")
+        |> put_source_provider("geojson")
+        |> put_option("implied_areas", [%{"area_type" => "cluster", "code_column" => "C"}])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ ~s(implied_areas entry requires "code_property")
+    end
+
+    test "accepts options that satisfy both the release and source providers" do
+      map =
+        valid_map()
+        |> Map.put("provider", "simplemaps")
+        |> put_source_provider("geojson")
+        |> put_option("implied_areas", [
+          %{"area_type" => "cluster", "code_property" => "C", "names" => %{"1" => "One"}}
+        ])
+
+      assert {:ok, manifest} = Manifest.from_map(map)
+      assert manifest.provider == "simplemaps"
+      assert [%{provider: "geojson"}] = manifest.sources
+    end
+  end
+
+  defp put_source_provider(map, provider) do
+    update_in(map, ["sources", Access.at(0)], &Map.put(&1, "provider", provider))
+  end
+
+  defp put_option(map, key, value) do
+    update_in(map, ["options"], &Map.put(&1, key, value))
+  end
+
+  defp with_implied_areas(entries) do
+    put_option(valid_map(), "implied_areas", entries)
+  end
+
   defp put_in_artifact(map, key, value) do
     update_in(map, ["sources", Access.at(0), "artifacts", Access.at(0)], fn artifact ->
       Map.put(artifact, key, value)

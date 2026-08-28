@@ -15,6 +15,7 @@ defmodule GeoGenius.PipelineTest do
   alias GeoGenius.Pipeline.State
   alias GeoGenius.Provider.Area
   alias GeoGenius.Provider.Area.Name
+  alias GeoGenius.Published
   alias GeoGenius.RecordingRepo
   alias GeoGenius.Registration
   alias GeoGenius.Staging
@@ -24,6 +25,12 @@ defmodule GeoGenius.PipelineTest do
 
   @artifact Path.expand("../support/artifacts/territories.geojson", __DIR__)
   @url "https://example.test/territories.geojson"
+  @csv_url "https://example.test/places.csv"
+
+  # One row per format, both naming code "A" under area type "place", so the
+  # two sources converge on `demo:place:A`. Only the GeoJSON source carries a
+  # geometry, so the converged area's boundary can only have come from it.
+  @two_format_csv "code,name\nA,Alpha\n"
 
   # The four statements a national import can spend minutes inside, each
   # identified by a fragment of the SQL the catalog issues for it.
@@ -33,6 +40,20 @@ defmodule GeoGenius.PipelineTest do
     "analyze_release",
     "verify_release"
   ]
+
+  # `Relate.relate/1` asks a provider only these two questions, so these carry
+  # only them: they exist to differ in `relations/1` and nothing else.
+  defmodule RebuildingProvider do
+    @moduledoc false
+    def relations(_manifest), do: :rebuild
+    def asserted_relations(_manifest, _row), do: []
+  end
+
+  defmodule QuietProvider do
+    @moduledoc false
+    def relations(_manifest), do: :none
+    def asserted_relations(_manifest, _row), do: []
+  end
 
   defmodule ConvertingCommand do
     @moduledoc false
@@ -55,8 +76,6 @@ defmodule GeoGenius.PipelineTest do
     @moduledoc false
     @behaviour GeoGenius.Provider
 
-    @impl true
-    def area_types, do: [%{key: "city", rank: 30}, %{key: "state", rank: 10}]
     @impl true
     def required_options, do: []
     @impl true
@@ -688,12 +707,42 @@ defmodule GeoGenius.PipelineTest do
     end
   end
 
+  describe "relations across a release's providers" do
+    # `relations/1` is a release-level question and a release now has several
+    # providers to ask. These override only `providers`, leaving
+    # `artifact_providers` as the fixture built it, so the assertion isolates
+    # the union in `rebuild?/1` from the per-row dispatch beside it.
+    test "rebuilds when any provider asks, not only when every one does" do
+      state = relation_fixture()
+
+      assert {:ok, %{metrics: metrics}} =
+               Relate.relate(%{state | providers: [QuietProvider, RebuildingProvider]})
+
+      assert Map.has_key?(metrics, "relations")
+    end
+
+    # A release whose providers all decline measures nothing. Rebuilding
+    # anyway would spend the most expensive statement in the pipeline on a
+    # release with no geometry to measure.
+    test "does not rebuild when no provider asks" do
+      state = relation_fixture()
+
+      assert {:ok, %{metrics: metrics}} =
+               Relate.relate(%{state | providers: [QuietProvider, QuietProvider]})
+
+      refute Map.has_key?(metrics, "relations")
+    end
+  end
+
   describe "asserted relations" do
     test "asserted edges are written and counted, and compose with a rebuild" do
       # AssertingProvider returns :rebuild from relations/1 AND one edge per
       # row, so this pins that the two paths compose rather than one
       # replacing the other.
-      state = import_fixture(AssertingProvider, [%{"child" => "LA", "parent" => "CA"}])
+      state =
+        import_fixture(AssertingProvider, [%{key: "city", rank: 30}, %{key: "state", rank: 10}], [
+          %{"child" => "LA", "parent" => "CA"}
+        ])
 
       assert {:ok, %{metrics: metrics}} = Relate.relate(state)
       assert metrics["asserted_relations"] == 1
@@ -708,7 +757,8 @@ defmodule GeoGenius.PipelineTest do
       # assertions, but `relation_count` (a row count in `geo_genius.relation`)
       # stays at 1, since `put_relation` upserts and the edge converges.
       rows = [%{"child" => "LA", "parent" => "CA"}, %{"child" => "LA", "parent" => "CA"}]
-      state = import_fixture(AssertingProvider, rows)
+      area_types = [%{key: "city", rank: 30}, %{key: "state", rank: 10}]
+      state = import_fixture(AssertingProvider, area_types, rows)
 
       assert {:ok, %{metrics: metrics}} = Relate.relate(state)
       assert metrics["asserted_relations"] == 2
@@ -726,6 +776,165 @@ defmodule GeoGenius.PipelineTest do
       assert run.error["exception"] == "GeoGenius.CatalogError"
       assert run.error["reason"] =~ "put_relation"
       assert run.error["reason"] =~ "no rows"
+    end
+  end
+
+  describe "a release whose provider implies parent areas" do
+    test "stages the implied areas and their edges alongside the rows' own areas",
+         fixtures do
+      # Two rows in the same cluster, so convergence on `area_key` is
+      # exercised: the cluster must exist once, not twice.
+      rows = [
+        %{"code" => "A", "name" => "Alpha", "CLUSTER" => "1"},
+        %{"code" => "B", "name" => "Beta", "CLUSTER" => "1"}
+      ]
+
+      release_id = import_rows_with_implied_areas(fixtures, rows)
+      assert release_id != nil
+
+      areas = release_area_keys(release_id)
+      assert length(areas) == 3
+      assert "auth:place:A" in areas
+      assert "auth:place:B" in areas
+      assert Enum.count(areas, &(&1 == "auth:cluster:1")) == 1
+
+      relations = published_relations(release_id)
+      assert {"auth:cluster:1", "auth:place:A", "contains"} in relations
+      assert {"auth:cluster:1", "auth:place:B", "contains"} in relations
+    end
+
+    test "a row with a blank implied code still stages its own area", fixtures do
+      rows = [
+        %{"code" => "A", "name" => "Alpha", "CLUSTER" => "1"},
+        %{"code" => "B", "name" => "Beta", "CLUSTER" => ""}
+      ]
+
+      release_id = import_rows_with_implied_areas(fixtures, rows)
+
+      areas = release_area_keys(release_id)
+      assert length(areas) == 3
+      assert "auth:place:B" in areas
+      assert "auth:cluster:1" in areas
+
+      # The blank cluster column implies nothing, so the row's own area stands
+      # alone: no edge names it as a child.
+      relations = published_relations(release_id)
+      assert relations == [{"auth:cluster:1", "auth:place:A", "contains"}]
+      refute Enum.any?(relations, fn {_parent, child, _relation} -> child == "auth:place:B" end)
+    end
+
+    test "an implied code the names map does not cover fails the release before anything relates",
+         fixtures do
+      # Normalizing runs before relating and the pipeline halts on the first
+      # phase that errors, so a row the provider cannot normalize must never
+      # reach `Relate.relate/1`. Nothing else pins that ordering.
+      #
+      # The failure is data-dependent by construction: the manifest is well
+      # formed and names cluster "1", while the row carries "2". A malformed
+      # option cannot pin this ordering any more -- `validate_options/1`
+      # rejects one at load, which the case below covers.
+      body = implied_areas_document([%{"code" => "A", "name" => "Alpha", "CLUSTER" => "2"}])
+      opts = Keyword.put(fixtures.opts, :bodies, %{@url => body})
+
+      {_manifest, release_id, run_id} =
+        prepare_manifest(fixtures, implied_areas_manifest(fixtures, body))
+
+      assert {:error, %ImportRun{} = run} = Pipeline.execute(fixtures.context, run_id, opts)
+
+      assert run.status == "failed"
+      assert run.error["phase"] == "normalizing"
+      assert run.error["reason"] =~ "implied_areas"
+      assert run.error["reason"] =~ "no entry in names"
+      assert run.error["reason"] =~ ~s("2")
+
+      assert published_relations(release_id) == []
+    end
+
+    test "a malformed implied_areas option is rejected at load, before a run exists", fixtures do
+      # The companion to the case above. Here the manifest itself is wrong, so
+      # it never becomes a release at all: nothing is downloaded, nothing is
+      # staged, and there is no run whose failure a caller has to interpret.
+      body = implied_areas_document([%{"code" => "A", "name" => "Alpha", "CLUSTER" => "1"}])
+
+      map =
+        fixtures
+        |> implied_areas_manifest(body)
+        |> update_in(["options", "implied_areas", Access.at(0)], &Map.put(&1, "relation", "near"))
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "implied_areas"
+      assert reason =~ "relation"
+      assert reason =~ "near"
+    end
+  end
+
+  describe "a release whose sources name different providers" do
+    test "stages each source through its own provider and converges the areas",
+         fixtures do
+      # The point of a per-source provider. A single-provider release cannot
+      # express this at all: one parser would be handed both files, and the
+      # delimited one would fail as GeoJSON or the GeoJSON one as delimited.
+      geojson_body = two_format_geojson()
+
+      opts =
+        Keyword.put(fixtures.opts, :bodies, %{
+          @url => geojson_body,
+          @csv_url => @two_format_csv
+        })
+
+      {_manifest, release_id, run_id} =
+        prepare_manifest(fixtures, two_format_manifest(geojson_body))
+
+      assert {:ok, %ImportRun{status: "completed"} = run} =
+               Pipeline.execute(fixtures.context, run_id, opts)
+
+      assert release_area_keys(release_id) == ["demo:place:A"]
+
+      # Both sources described the same area and it exists once. The boundary
+      # can only have come from the GeoJSON source, so counting it proves the
+      # tabular source did not overwrite what the spatial one contributed.
+      assert run.stage_metrics["area_count"] == 1
+      assert run.stage_metrics["boundary_count"] == 1
+    end
+
+    test "a source naming an unregistered provider fails at manifest load", fixtures do
+      geojson_body = two_format_geojson()
+
+      map =
+        fixtures
+        |> then(fn _ -> two_format_manifest(geojson_body) end)
+        |> put_in(["sources", Access.at(0), "provider"], "no_such_provider")
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ "no_such_provider"
+    end
+  end
+
+  describe "a release that both rebuilds and asserts relations" do
+    test "keeps measured containment below and asserted membership above", fixtures do
+      # The outer polygon contains the inner one, and both carry the same
+      # cluster code: `relations/1` measures the containment from geometry
+      # while `implied_areas` asserts the membership from the column.
+      release_id = import_nested_rows_with_implied_cluster(fixtures)
+
+      relations = published_relations(release_id)
+
+      assert {"demo:outer:OUTER", "demo:inner:INNER", "contains"} in relations
+      assert {"demo:cluster:1", "demo:outer:OUTER", "contains"} in relations
+      assert {"demo:cluster:1", "demo:inner:INNER", "contains"} in relations
+    end
+
+    test "the asserted edges do not overwrite the measured one", fixtures do
+      # `Catalog.put_relation_many/3` upserts on `(parent_area_id,
+      # child_area_id)` and nulls the three measurement columns when an
+      # asserted edge lands on a measured pair, with no warning. The two sets
+      # here are disjoint, so the measurement must survive intact.
+      release_id = import_nested_rows_with_implied_cluster(fixtures)
+
+      measured = measured_relation(release_id, "demo:outer:OUTER", "demo:inner:INNER")
+
+      refute is_nil(measured.intersection_area_m2)
+      refute is_nil(measured.parent_coverage)
     end
   end
 
@@ -941,13 +1150,19 @@ defmodule GeoGenius.PipelineTest do
     end
   end
 
-  # Registers a collection carrying `provider`'s own area types under the
-  # fixed `demo_auth` authority, stages `payloads` as rows, and normalizes
-  # them so every area a relate-phase test needs already exists in the
-  # release. Returns the `%State{}` a test drives directly against
-  # `GeoGenius.Pipeline.Relate.relate/1` -- no manifest is built, since
-  # `relate/1` only reads `state.manifest` through the provider it is handed.
-  defp import_fixture(provider, payloads) do
+  # Registers a collection carrying `area_types` under the fixed `demo_auth`
+  # authority, stages `payloads` as rows, and normalizes them so every area a
+  # relate-phase test needs already exists in the release. Returns the
+  # `%State{}` a test drives directly against `GeoGenius.Pipeline.Relate.relate/1`
+  # -- no manifest is built, since `relate/1` only reads `state.manifest`
+  # through the provider it is handed.
+  defp relation_fixture do
+    import_fixture(AssertingProvider, [%{key: "city", rank: 30}, %{key: "state", rank: 10}], [
+      %{"child" => "LA", "parent" => "CA"}
+    ])
+  end
+
+  defp import_fixture(provider, area_types, payloads) do
     context = Context.new(repo: TestRepo, prefix: "geo_genius")
     collection = "assert_fixture_#{System.unique_integer([:positive])}"
 
@@ -956,7 +1171,7 @@ defmodule GeoGenius.PipelineTest do
     Catalog.upsert_collection(context, %{key: collection, name: collection})
     Catalog.upsert_authority(context, collection, %{key: "demo_auth", name: "Demo Authority"})
 
-    Enum.each(provider.area_types(), &Catalog.upsert_area_type(context, collection, &1))
+    Enum.each(area_types, &Catalog.upsert_area_type(context, collection, &1))
 
     release_id =
       Catalog.open_release(context, collection, %{
@@ -987,7 +1202,8 @@ defmodule GeoGenius.PipelineTest do
       batch_size: 500,
       timeout: 30_000,
       manifest: nil,
-      provider: provider
+      providers: [provider],
+      artifact_providers: %{"fixture" => provider}
     }
 
     assert {:ok, state} = Normalize.normalize(state)
@@ -1260,20 +1476,197 @@ defmodule GeoGenius.PipelineTest do
     on_exit(fn -> :telemetry.detach("geo-genius-pipeline-test") end)
   end
 
-  defp release_area_keys(release_id) do
-    %Postgrex.Result{rows: rows} =
-      TestRepo.query!(
-        """
-        SELECT area.area_key
-          FROM geo_genius.release_area
-          JOIN geo_genius.area ON area.id = release_area.area_id
-         WHERE release_area.release_id = $1
-         ORDER BY area.area_key
-        """,
-        [Ecto.UUID.dump!(release_id)]
-      )
+  # Runs a whole GeoJSON release whose features each carry a cluster code
+  # beside their own, under a manifest declaring the `cluster` type and the
+  # `implied_areas` entry that reads it. Returns the release id the completed
+  # import wrote into.
+  defp import_rows_with_implied_areas(fixtures, rows) do
+    body = implied_areas_document(rows)
+    opts = Keyword.put(fixtures.opts, :bodies, %{@url => body})
 
-    List.flatten(rows)
+    {_manifest, release_id, run_id} =
+      prepare_manifest(fixtures, implied_areas_manifest(fixtures, body))
+
+    assert {:ok, %ImportRun{status: "completed"}} =
+             Pipeline.execute(fixtures.context, run_id, opts)
+
+    release_id
+  end
+
+  # Each row becomes one boundary-free feature: an implied area carries no
+  # geometry either way, so geometry would only obscure what the release proves.
+  defp two_format_geojson do
+    Jason.encode!(%{
+      "type" => "FeatureCollection",
+      "features" => [
+        %{
+          "type" => "Feature",
+          "properties" => %{"code" => "A", "name" => "Alpha"},
+          "geometry" => %{
+            "type" => "Polygon",
+            "coordinates" => [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]
+          }
+        }
+      ]
+    })
+  end
+
+  # `options` must satisfy both providers at once: the CSV provider requires
+  # `code_column` and the GeoJSON provider `code_property`, and manifest
+  # validation now checks every provider a release names.
+  defp two_format_manifest(geojson_body) do
+    %{
+      "collection" => "demo",
+      "collection_name" => "Demo Two Formats",
+      "release" => "two_format",
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "source_date" => "2026-01-15",
+      "authorities" => [%{"key" => "demo", "name" => "Demo Operations"}],
+      "area_types" => [%{"key" => "place", "rank" => 100}],
+      "sources" => [
+        two_format_source("demo:tabular", "csv", "places.csv", "csv", @csv_url, @two_format_csv),
+        two_format_source(
+          "demo:spatial",
+          "geojson",
+          "places.geojson",
+          "geojson",
+          @url,
+          geojson_body
+        )
+      ],
+      "options" => %{
+        "area_type" => "place",
+        "code_column" => "code",
+        "name_column" => "name",
+        "code_property" => "code",
+        "name_property" => "name"
+      }
+    }
+  end
+
+  defp two_format_source(source_key, provider, logical_name, format, url, body) do
+    %{
+      "source_key" => source_key,
+      "provider" => provider,
+      "license" => "CC0-1.0",
+      "release_key" => "2026-01",
+      "source_date" => "2026-01-15",
+      "artifacts" => [
+        %{
+          "logical_name" => logical_name,
+          "url" => url,
+          "operator_supplied" => false,
+          "format" => format,
+          "required" => true,
+          "sha256" => sha256(body),
+          "bytes" => byte_size(body)
+        }
+      ]
+    }
+  end
+
+  defp implied_areas_document(rows) do
+    Jason.encode!(%{
+      "type" => "FeatureCollection",
+      "features" => Enum.map(rows, &%{"type" => "Feature", "properties" => &1, "geometry" => nil})
+    })
+  end
+
+  defp implied_areas_manifest(fixtures, body) do
+    fixtures
+    |> geojson_manifest([])
+    |> Map.put("authorities", [%{"key" => "auth", "name" => "Demo Operations"}])
+    |> Map.put("area_types", [
+      %{"key" => "place", "rank" => 100},
+      %{"key" => "cluster", "rank" => 50}
+    ])
+    |> Map.put("options", %{
+      "area_type" => "place",
+      "code_property" => "code",
+      "name_property" => "name",
+      "implied_areas" => [
+        %{
+          "area_type" => "cluster",
+          "code_property" => "CLUSTER",
+          "names" => %{"1" => "Cluster One"}
+        }
+      ]
+    })
+    |> update_in(["sources", Access.at(0), "artifacts", Access.at(0)], fn artifact ->
+      Map.merge(artifact, %{"sha256" => sha256(body), "bytes" => byte_size(body)})
+    end)
+  end
+
+  # Runs a whole stub release whose two rows nest spatially and share one
+  # cluster code, so the rebuild and the assertion both write into it. The
+  # rebuild pairs areas by type rank, so the nesting needs two types.
+  defp import_nested_rows_with_implied_cluster(fixtures) do
+    map =
+      fixtures
+      |> stub_manifest(rows: clustered_nested_rows())
+      |> Map.put("area_types", [
+        %{"key" => "cluster", "rank" => 100},
+        %{"key" => "outer", "rank" => 200},
+        %{"key" => "inner", "rank" => 300}
+      ])
+      |> update_in(["options"], &Map.put(&1, "implied_areas", implied_cluster_entries()))
+
+    {_manifest, release_id, run_id} = prepare_manifest(fixtures, map)
+
+    assert {:ok, %ImportRun{status: "completed"}} =
+             Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+
+    release_id
+  end
+
+  defp implied_cluster_entries do
+    [%{"area_type" => "cluster", "code_field" => "CLUSTER", "names" => %{"1" => "Cluster One"}}]
+  end
+
+  defp clustered_nested_rows do
+    [
+      %{
+        "code" => "OUTER",
+        "name" => "Outer",
+        "area_type" => "outer",
+        "CLUSTER" => "1",
+        "geometry" => square(0, 4)
+      },
+      %{
+        "code" => "INNER",
+        "name" => "Inner",
+        "area_type" => "inner",
+        "CLUSTER" => "1",
+        "geometry" => square(1, 2)
+      }
+    ]
+  end
+
+  defp measured_relation(release_id, parent_key, child_key) do
+    [release_id: release_id, parent_area_keys: [parent_key], child_area_keys: [child_key]]
+    |> Published.relations()
+    |> TestRepo.one()
+  end
+
+  defp published_relations(release_id) do
+    [release_id: release_id]
+    |> Published.relations()
+    |> TestRepo.all()
+    |> Enum.map(&{&1.parent_area_key, &1.child_area_key, &1.relation_type})
+  end
+
+  # Every area key in a release, sorted. `:release_id` swaps `Published` onto the
+  # release-scoped base rather than the published views, so this reads a release
+  # that was never published -- a failed import included. Sorted explicitly: an
+  # assertion comparing whole lists must not depend on the order Postgres happens
+  # to return.
+  defp release_area_keys(release_id) do
+    [release_id: release_id]
+    |> Published.areas()
+    |> TestRepo.all()
+    |> Enum.map(& &1.area_key)
+    |> Enum.sort()
   end
 
   defp drop_staging!(run_id) do

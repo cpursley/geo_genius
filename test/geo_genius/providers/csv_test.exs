@@ -81,8 +81,28 @@ defmodule GeoGenius.Providers.CSVTest do
     assert "code_column" in CSV.required_options()
   end
 
-  test "area_types comes from the manifest, not from the provider" do
-    assert CSV.area_types() == []
+  test "validate_options accepts implied_areas entries naming code_column" do
+    options = %{
+      "implied_areas" => [
+        %{"area_type" => "cluster", "code_column" => "CLUSTER", "names" => %{"1" => "One"}}
+      ]
+    }
+
+    assert CSV.validate_options(options) == :ok
+  end
+
+  # The option vocabulary is this provider's own, so an entry written for the
+  # other generic provider is rejected here rather than accepted and failed on
+  # every row.
+  test "validate_options rejects an implied_areas entry naming code_property instead" do
+    options = %{"implied_areas" => [%{"area_type" => "cluster", "code_property" => "CLUSTER"}]}
+
+    assert {:error, reason} = CSV.validate_options(options)
+    assert reason =~ ~s("code_column")
+  end
+
+  test "validate_options accepts options that declare no implied areas" do
+    assert CSV.validate_options(%{"code_column" => "id"}) == :ok
   end
 
   test "artifacts returns every artifact across the manifest's sources" do
@@ -429,5 +449,149 @@ defmodule GeoGenius.Providers.CSVTest do
 
   test "asks for relations to be rebuilt" do
     assert CSV.relations(manifest()) == :rebuild
+  end
+
+  describe "normalize/2 with implied_areas" do
+    test "returns the row's area followed by its implied areas" do
+      manifest = manifest_with_implied_areas()
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "1"},
+        geom: nil
+      }
+
+      assert {:ok, [own, implied]} = CSV.normalize(manifest, row)
+      assert own.code == "X"
+      assert implied.area_type_key == "cluster"
+      assert implied.code == "1"
+    end
+
+    test "implies areas with no geometry from a row with no geometry" do
+      manifest = manifest_with_implied_areas()
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "1"},
+        geom: nil
+      }
+
+      assert {:ok, [own, implied]} = CSV.normalize(manifest, row)
+      assert own.centroid == nil
+      assert implied.centroid == nil
+      assert implied.geometry == nil
+    end
+
+    test "reads the code column, not the code property" do
+      manifest = %Manifest{
+        collection: "demo",
+        release: "r1",
+        provider: "csv",
+        authorities: [%{key: "auth", name: "Auth"}],
+        sources: [],
+        options: %{
+          "area_type" => "place",
+          "code_column" => "code",
+          "name_column" => "name",
+          "implied_areas" => [
+            %{"area_type" => "cluster", "code_property" => "CLUSTER", "names" => %{"1" => "F"}}
+          ]
+        }
+      }
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "1"},
+        geom: nil
+      }
+
+      assert {:error, reason} = CSV.normalize(manifest, row)
+      assert reason =~ "code_column"
+    end
+
+    test "skips the whole row when the row's own code is blank" do
+      manifest = manifest_with_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "", "CLUSTER" => "1"}, geom: nil}
+
+      assert :skip = CSV.normalize(manifest, row)
+    end
+
+    test "errors on a malformed implied_areas option even when the row's own code is blank" do
+      manifest =
+        manifest(%{
+          "code_column" => "code",
+          "name_column" => "name",
+          "implied_areas" => [
+            %{"area_type" => "cluster", "code_column" => "CLUSTER", "relation" => "near"}
+          ]
+        })
+
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "", "CLUSTER" => "1"}, geom: nil}
+
+      assert {:error, reason} = CSV.normalize(manifest, row)
+      assert reason =~ "relation must be one of"
+    end
+  end
+
+  describe "asserted_relations/2" do
+    test "asserts an edge from each implied area to the row's area" do
+      manifest = manifest_with_implied_areas()
+
+      row = %Staging.Row{
+        artifact: "a",
+        payload: %{"code" => "X", "name" => "Ex", "CLUSTER" => "1"},
+        geom: nil
+      }
+
+      assert [{"auth:cluster:1", "auth:place:X", "contains"}] =
+               CSV.asserted_relations(manifest, row)
+    end
+
+    test "asserts nothing when the manifest implies nothing" do
+      manifest = manifest_without_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "X", "name" => "Ex"}, geom: nil}
+
+      assert [] == CSV.asserted_relations(manifest, row)
+    end
+
+    test "asserts nothing when the row's own code is blank" do
+      manifest = manifest_with_implied_areas()
+      row = %Staging.Row{artifact: "a", payload: %{"code" => "", "CLUSTER" => "1"}, geom: nil}
+
+      assert [] == CSV.asserted_relations(manifest, row)
+    end
+  end
+
+  defp manifest_without_implied_areas do
+    %Manifest{
+      collection: "demo",
+      release: "r1",
+      provider: "csv",
+      authorities: [%{key: "auth", name: "Auth"}],
+      sources: [],
+      options: %{
+        "area_type" => "place",
+        "code_column" => "code",
+        "name_column" => "name"
+      }
+    }
+  end
+
+  defp manifest_with_implied_areas do
+    %Manifest{
+      collection: "demo",
+      release: "r1",
+      provider: "csv",
+      authorities: [%{key: "auth", name: "Auth"}],
+      sources: [],
+      options: %{
+        "area_type" => "place",
+        "code_column" => "code",
+        "name_column" => "name",
+        "implied_areas" => [
+          %{"area_type" => "cluster", "code_column" => "CLUSTER", "names" => %{"1" => "First"}}
+        ]
+      }
+    }
   end
 end

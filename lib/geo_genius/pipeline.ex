@@ -447,17 +447,39 @@ defmodule GeoGenius.Pipeline do
 
   defp build_manifest(state, document) do
     case Manifest.from_map(document) do
-      {:ok, manifest} -> resolve_provider(state, manifest)
+      {:ok, manifest} -> resolve_providers(state, manifest)
       {:error, error} -> {:error, Exception.message(error)}
     end
   end
 
-  defp resolve_provider(state, manifest) do
-    provider = Config.provider!(manifest.provider)
-    artifacts = Map.new(provider.artifacts(manifest), &{&1.logical_name, &1})
-    {:ok, %{state | manifest: manifest, provider: provider, manifest_artifacts: artifacts}}
+  # Each source names the provider that stages it, so a release composed of
+  # sources in different formats resolves to several. `artifacts/1` is asked
+  # per source with the manifest narrowed to that source, so a provider
+  # delegating to `Provider.all_artifacts/1` -- which every shipped provider
+  # does -- answers with its own source's artifacts rather than with every
+  # source's, and each logical name maps to the provider that will parse it.
+  defp resolve_providers(state, manifest) do
+    pairs = Enum.map(manifest.sources, &{&1, Config.provider!(&1.provider)})
+    declared = Enum.flat_map(pairs, &source_artifacts(manifest, &1))
+
+    {:ok,
+     %{
+       state
+       | manifest: manifest,
+         providers: pairs |> Enum.map(&elem(&1, 1)) |> Enum.uniq(),
+         manifest_artifacts:
+           Map.new(declared, fn {artifact, _} -> {artifact.logical_name, artifact} end),
+         artifact_providers:
+           Map.new(declared, fn {artifact, provider} -> {artifact.logical_name, provider} end)
+     }}
   rescue
     error in ArgumentError -> {:error, Exception.message(error)}
+  end
+
+  defp source_artifacts(manifest, {source, provider}) do
+    %{manifest | sources: [source]}
+    |> provider.artifacts()
+    |> Enum.map(&{&1, provider})
   end
 
   defp stage(%State{} = state) do
@@ -481,15 +503,15 @@ defmodule GeoGenius.Pipeline do
 
   defp stage_one(state, artifact, path, counter) do
     emit = fn rows -> emit_rows(state, counter, rows) end
+    provider = Map.fetch!(state.artifact_providers, artifact.logical_name)
 
-    case state.provider.stage(state.manifest, artifact, path, emit, stage_opts(state)) do
+    case provider.stage(state.manifest, artifact, path, emit, stage_opts(state)) do
       :ok ->
         {:cont, :ok}
 
       {:error, reason} ->
         {:halt,
-         {:error,
-          "#{inspect(state.provider)} could not stage #{artifact.logical_name}: #{reason}"}}
+         {:error, "#{inspect(provider)} could not stage #{artifact.logical_name}: #{reason}"}}
     end
   end
 

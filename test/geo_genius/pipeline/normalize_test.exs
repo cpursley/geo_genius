@@ -12,12 +12,17 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
 
+  @two_level_area_types [%{key: "city", rank: 30}, %{key: "state", rank: 10}]
+  @three_level_area_types [
+    %{key: "city", rank: 30},
+    %{key: "state", rank: 10},
+    %{key: "zip", rank: 40}
+  ]
+
   defmodule MultiAreaProvider do
     @moduledoc false
     @behaviour GeoGenius.Provider
 
-    @impl true
-    def area_types, do: [%{key: "city", rank: 30}, %{key: "state", rank: 10}]
     @impl true
     def required_options, do: []
     @impl true
@@ -64,8 +69,6 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     @moduledoc false
     @behaviour GeoGenius.Provider
 
-    @impl true
-    def area_types, do: [%{key: "city", rank: 30}, %{key: "state", rank: 10}]
     @impl true
     def required_options, do: []
     @impl true
@@ -114,10 +117,6 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   defmodule MiddleAreaBadKindProvider do
     @moduledoc false
     @behaviour GeoGenius.Provider
-
-    @impl true
-    def area_types,
-      do: [%{key: "city", rank: 30}, %{key: "state", rank: 10}, %{key: "zip", rank: 40}]
 
     @impl true
     def required_options, do: []
@@ -175,7 +174,10 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   end
 
   test "a row returning two areas writes both and counts both" do
-    state = normalize_fixture(MultiAreaProvider, [%{"city" => "LA", "state" => "CA"}])
+    state =
+      normalize_fixture(MultiAreaProvider, @two_level_area_types, [
+        %{"city" => "LA", "state" => "CA"}
+      ])
 
     assert {:ok, %State{metrics: metrics}} = Normalize.normalize(state)
     assert metrics["areas"] == 2
@@ -188,7 +190,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
 
   test "two rows implying the same state converge on one area" do
     rows = [%{"city" => "LA", "state" => "CA"}, %{"city" => "SF", "state" => "CA"}]
-    state = normalize_fixture(MultiAreaProvider, rows)
+    state = normalize_fixture(MultiAreaProvider, @two_level_area_types, rows)
 
     assert {:ok, %State{metrics: metrics}} = Normalize.normalize(state)
     assert metrics["areas"] == 4
@@ -198,7 +200,10 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   end
 
   test "a bad name kind on the second area fails the batch outright" do
-    state = normalize_fixture(SecondAreaBadKindProvider, [%{"city" => "LA", "state" => "CA"}])
+    state =
+      normalize_fixture(SecondAreaBadKindProvider, @two_level_area_types, [
+        %{"city" => "LA", "state" => "CA"}
+      ])
 
     assert {:error, reason} = Normalize.normalize(state)
     assert reason =~ "demo_auth:state:CA"
@@ -212,7 +217,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
 
   test "a bad name kind leaves no area of the batch written, before it or after" do
     payloads = [%{"city" => "LA", "state" => "CA", "zip" => "90001"}]
-    state = normalize_fixture(MiddleAreaBadKindProvider, payloads)
+    state = normalize_fixture(MiddleAreaBadKindProvider, @three_level_area_types, payloads)
 
     assert {:error, reason} = Normalize.normalize(state)
     assert reason =~ "demo_auth:state:CA"
@@ -225,7 +230,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
 
   test "a batch costs one statement per kind of write, not one per area" do
     rows = Enum.map(1..40, &%{"city" => "city-#{&1}", "state" => "CA"})
-    state = normalize_fixture(MultiAreaProvider, rows)
+    state = normalize_fixture(MultiAreaProvider, @two_level_area_types, rows)
     recording = %{state | context: %{state.context | repo: RecordingRepo}}
 
     assert {:ok, %State{metrics: metrics}} = Normalize.normalize(recording)
@@ -251,12 +256,12 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     refute Map.has_key?(written, "put_area_code_many")
   end
 
-  # Registers a collection carrying `provider`'s own area types under a
-  # fixed authority key, opens a release, stages `payloads` as rows, and
-  # returns the `%State{}` a normalize test drives directly against
+  # Registers a collection carrying `area_types` under a fixed authority key,
+  # opens a release, stages `payloads` as rows, and returns the `%State{}` a
+  # normalize test drives directly against
   # `GeoGenius.Pipeline.Normalize.normalize/1` -- the manifest a real run
   # would carry is never built, since nothing on this path reads it.
-  defp normalize_fixture(provider, payloads) do
+  defp normalize_fixture(provider, area_types, payloads) do
     context = Context.new(repo: TestRepo, prefix: "geo_genius")
     collection = "normalize_fixture_#{System.unique_integer([:positive])}"
 
@@ -267,7 +272,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     Catalog.upsert_collection(context, %{key: collection, name: collection})
     Catalog.upsert_authority(context, collection, %{key: "demo_auth", name: "Demo Authority"})
 
-    Enum.each(provider.area_types(), fn area_type ->
+    Enum.each(area_types, fn area_type ->
       Catalog.upsert_area_type(context, collection, area_type)
     end)
 
@@ -300,7 +305,8 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
       batch_size: 500,
       timeout: 30_000,
       manifest: nil,
-      provider: provider
+      providers: [provider],
+      artifact_providers: %{"fixture" => provider}
     }
   end
 

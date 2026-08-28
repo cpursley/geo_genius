@@ -140,15 +140,13 @@ defmodule GeoGenius.Provider do
   `normalize/2` takes no such list: it is pure, so a caller derives an area
   from a staged row with no environment and no adapter to substitute.
 
-  `area_types/0`, `artifacts/1`, `relations/1`, and `asserted_relations/2`
-  have one body most providers share, so those bodies live here as
-  `no_area_types/0`, `all_artifacts/1`, `always_rebuild/1`, and
-  `no_asserted_relations/2`; a provider implements the callback with a
-  one-line `defdelegate`, keeping its own `@impl` and `@doc`. A provider
-  whose collections declare a fixed hierarchy, whose relations need none
-  rebuilt, or whose rows carry a hierarchy in their columns implements the
-  callback directly instead of delegating -- `GeoGenius.Providers.SimpleMaps`
-  does all three.
+  `artifacts/1`, `relations/1`, and `asserted_relations/2` have one body
+  most providers share, so those bodies live here as `all_artifacts/1`,
+  `always_rebuild/1`, and `no_asserted_relations/2`; a provider implements
+  the callback with a one-line `defdelegate`, keeping its own `@impl` and
+  `@doc`. A provider whose relations need none rebuilt, or whose rows carry
+  a hierarchy in their columns, implements the callback directly instead of
+  delegating -- `GeoGenius.Providers.SimpleMaps` does both.
 
   ## Option vocabulary across providers
 
@@ -168,6 +166,24 @@ defmodule GeoGenius.Provider do
   | external codes               | `"code_properties"`           | `"code_columns"`           | `[]`                    |
   | authority                    | `"authority"` (shared key)     | `"authority"` (shared key)  | the manifest's own single authority |
   | delimiter                    | n/a                            | `"delimiter"`               | `","` (CSV only)        |
+  | parent areas the row implies | `"implied_areas"` (shared key) | `"implied_areas"` (shared key) | `[]`                  |
+
+  `"implied_areas"` is a list of entries, and each entry names its own code
+  key in the calling provider's suffix: `"code_property"` under
+  `GeoGenius.Providers.GeoJSON`, `"code_column"` under
+  `GeoGenius.Providers.CSV`. An entry also names an `"area_type"`, a `"names"`
+  map from code to display name, an optional `"authority"`, and an optional
+  `"relation"` defaulting to `"contains"`. A row whose code column carries
+  `"1"` under
+
+      %{"area_type" => "cluster", "code_property" => "CLUSTER",
+        "names" => %{"1" => "Outer Cluster", "2" => "Inner Cluster"}}
+
+  implies the area `cluster:1` and asserts `contains` from it to the row's own
+  area. Both generic providers validate these entries at manifest load through
+  `c:validate_options/1`, so an entry written in the other's vocabulary is
+  rejected before anything is downloaded. See
+  `GeoGenius.Providers.ImpliedAreas`.
 
   `GeoGenius.Providers.Shapefile` reads the GeoJSON vocabulary, since it
   converts its archive before parsing it. `GeoGenius.Providers.SimpleMaps` is
@@ -196,15 +212,6 @@ defmodule GeoGenius.Provider do
   @type reason :: String.t()
 
   @doc """
-  The area types this provider's collections use when a manifest does not
-  declare its own.
-
-  A manifest's own `area_types` always wins; this exists for a provider whose
-  collections share one fixed hierarchy across every release.
-  """
-  @callback area_types() :: [Manifest.area_type()]
-
-  @doc """
   The manifest `options` keys this provider requires.
 
   Manifest validation checks that every key named here is present in a
@@ -212,7 +219,41 @@ defmodule GeoGenius.Provider do
   """
   @callback required_options() :: [String.t()]
 
-  @doc "The artifacts, across a manifest's sources, this provider will stage."
+  @doc """
+  Validates the manifest `options` map as a whole, beyond the presence of the
+  keys `required_options/0` names.
+
+  Optional. A provider that exports it is called at manifest load, once every
+  required key is known to be present, and an error it returns becomes a
+  `GeoGenius.ManifestError` naming the field. That is what makes a malformed
+  option fail before a release row exists, rather than partway through
+  normalizing an artifact already downloaded and staged.
+
+  This is where a provider checks the options only it understands. The option
+  vocabulary is per-provider, so the same document can be valid under one
+  provider and invalid under another: `GeoGenius.Providers.GeoJSON` reads an
+  `implied_areas` entry's code key as `"code_property"` and
+  `GeoGenius.Providers.CSV` reads it as `"code_column"`, and neither accepts
+  the other's.
+
+  A provider still validates what it reads at the point it reads it. A
+  `%GeoGenius.Manifest{}` built in Elixir never passes through
+  `GeoGenius.Manifest.from_map/2`, so this is a gate on loaded documents, not a
+  guarantee `normalize/2` may rely on.
+  """
+  @callback validate_options(options :: map()) :: :ok | {:error, reason()}
+
+  @optional_callbacks validate_options: 1
+
+  @doc """
+  The artifacts, across a manifest's sources, this provider will stage.
+
+  The pipeline asks this once per source, with the manifest narrowed to that
+  one source, so a provider delegating to `all_artifacts/1` answers with its
+  own source's artifacts. A release may name a different provider per source,
+  and each logical name is staged by the provider of the source that declared
+  it.
+  """
   @callback artifacts(manifest :: Manifest.t()) :: [Artifact.t()]
 
   @doc """
@@ -292,10 +333,6 @@ defmodule GeoGenius.Provider do
                 {parent_area_key :: String.t(), child_area_key :: String.t(),
                  relation_type :: String.t()}
               ]
-
-  @doc "No area types of its own; every manifest supplies its own `area_types`."
-  @spec no_area_types() :: [Manifest.area_type()]
-  def no_area_types, do: []
 
   @doc "Every artifact declared across a manifest's sources."
   @spec all_artifacts(Manifest.t()) :: [Artifact.t()]

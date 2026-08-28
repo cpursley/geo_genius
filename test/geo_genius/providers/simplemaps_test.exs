@@ -9,13 +9,23 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   @cities Path.expand("../../support/fixtures/simplemaps/uscities_sample.csv", __DIR__)
   @zips Path.expand("../../support/fixtures/simplemaps/uszips_sample.csv", __DIR__)
 
+  # The hierarchy the shipped manifest declares. SimpleMaps
+  # supplies no hierarchy of its own, so a test manifest declares it directly,
+  # the same as every other provider's fixtures.
+  @fixed_hierarchy [
+    %{key: "state", rank: 10},
+    %{key: "county", rank: 20},
+    %{key: "city", rank: 30},
+    %{key: "zip", rank: 40}
+  ]
+
   defp manifest_fixture do
     %Manifest{
       collection: "simplemaps",
       release: "r1",
       provider: "simplemaps",
       authorities: [%{key: "simplemaps", name: "SimpleMaps"}],
-      area_types: SimpleMaps.area_types(),
+      area_types: @fixed_hierarchy,
       sources: [],
       options: %{}
     }
@@ -35,15 +45,6 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     emit = fn rows -> Agent.update(agent, &(&1 ++ rows)) end
     result = fun.(emit)
     {result, Agent.get(agent, & &1)}
-  end
-
-  test "declares the four area types in rank order" do
-    assert SimpleMaps.area_types() == [
-             %{key: "state", rank: 10},
-             %{key: "county", rank: 20},
-             %{key: "city", rank: 30},
-             %{key: "zip", rank: 40}
-           ]
   end
 
   test "requires no manifest options" do
@@ -729,7 +730,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   # assertion vacuously instead of failing it.
   defp rank_of(area_key) do
     [_authority, area_type, _code] = String.split(area_key, ":", parts: 3)
-    %{rank: rank} = Enum.find(SimpleMaps.area_types(), &(&1.key == area_type))
+    %{rank: rank} = Enum.find(@fixed_hierarchy, &(&1.key == area_type))
     rank
   end
 

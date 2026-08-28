@@ -6,19 +6,27 @@ defmodule GeoGenius.StubProvider do
   alias GeoGenius.Manifest
   alias GeoGenius.Provider
   alias GeoGenius.Provider.Area
+  alias GeoGenius.Providers.ImpliedAreas
   alias GeoGenius.Staging
 
   # A provider whose whole behaviour is driven by the manifest's `options`,
   # so one module covers every shape the pipeline has to survive:
   #
-  #   "mode"      -- "default", "raise", "exit", "bad_kind", "bad_code_type",
-  #                  "stage_error", "command_probe", or "bad_relation"
-  #   "rows"      -- the row specs `stage/5` emits, each with "code", "name",
-  #                  "area_type", and an optional GeoJSON "geometry"
-  #   "relations" -- "rebuild" (default) or "none"
+  #   "mode"           -- "default", "raise", "exit", "bad_kind",
+  #                       "bad_code_type", "stage_error", "command_probe",
+  #                       or "bad_relation"
+  #   "rows"           -- the row specs `stage/5` emits, each with "code",
+  #                       "name", "area_type", and an optional GeoJSON
+  #                       "geometry"
+  #   "relations"      -- "rebuild" (default) or "none"
+  #   "implied_areas"  -- read through `GeoGenius.Providers.ImpliedAreas`,
+  #                       under this provider's own code option key
 
-  @impl Provider
-  def area_types, do: []
+  # The option key each `implied_areas` entry names its code field under. A
+  # third value beside GeoJSON's "code_property" and CSV's "code_column",
+  # so the contract tests exercise the key as a parameter rather than as a
+  # constant either shipped provider happens to share.
+  @code_option_key "code_field"
 
   @impl Provider
   def required_options, do: ["mode"]
@@ -44,7 +52,7 @@ defmodule GeoGenius.StubProvider do
       "exit" -> exit({:stub_provider_left, row.payload["code"]})
       "bad_kind" -> {:ok, area(row, names: [%Area.Name{name: "Bad", kind: :offical}])}
       "bad_code_type" -> {:ok, area(row, codes: [%Area.Code{code_type: 12, code_value: "x"}])}
-      _other -> {:ok, area(row, [])}
+      _other -> normalize_with_implied(manifest, row)
     end
   end
 
@@ -64,7 +72,34 @@ defmodule GeoGenius.StubProvider do
   def asserted_relations(%Manifest{} = manifest, row) do
     case mode(manifest) do
       "bad_relation" -> [{"demo:region:north", "demo:region:ghost", "contains"}]
-      _other -> Provider.no_asserted_relations(manifest, row)
+      _other -> implied_edges(manifest, row)
+    end
+  end
+
+  defp normalize_with_implied(%Manifest{options: options}, row) do
+    area = area(row, [])
+
+    case ImpliedAreas.parse(options, @code_option_key) do
+      {:ok, entries} -> ImpliedAreas.with_implied(area, row.payload, entries, area.authority_key)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # A manifest that implies nothing asserts nothing, which is what
+  # `GeoGenius.Provider.no_asserted_relations/2` returns for it anyway. A
+  # malformed option has already failed `normalize/2`, which runs first, so it
+  # yields no edges here rather than a second copy of the same error.
+  defp implied_edges(%Manifest{options: options} = manifest, row) do
+    case ImpliedAreas.parse(options, @code_option_key) do
+      {:ok, []} ->
+        Provider.no_asserted_relations(manifest, row)
+
+      {:ok, entries} ->
+        area = area(row, [])
+        ImpliedAreas.edges(row.payload, entries, area.authority_key, Area.key(area))
+
+      {:error, _reason} ->
+        []
     end
   end
 

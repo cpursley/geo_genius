@@ -101,7 +101,7 @@ defmodule GeoGenius.Manifest do
     :options
   ]
 
-  @typedoc "One entry of a manifest's `area_types` list, or a provider's own default hierarchy."
+  @typedoc "One entry of a manifest's `area_types` list."
   @type area_type :: %{key: String.t(), rank: pos_integer()}
 
   @typedoc """
@@ -113,9 +113,10 @@ defmodule GeoGenius.Manifest do
   all three -- so this is a list rather than a single value.
 
   `authorities` is required and must name at least one, unlike `area_types`,
-  which a provider can supply from `area_types/0` when the manifest declares
-  none. No callback supplies authorities, so an empty list is a manifest that
-  can register no area at all: `upsert_area` resolves an authority with
+  which a manifest may declare as an empty list: a manifest declaring no area
+  types registers none, and a release that normalizes an area whose type it
+  never declared fails. An empty `authorities` list is a manifest that can
+  register no area at all: `upsert_area` resolves an authority with
   `SELECT ... INTO STRICT` and raises `:no_data_found` deep in normalization.
   Rejecting it here is what turns that into an error naming the field, at load.
 
@@ -287,12 +288,12 @@ defmodule GeoGenius.Manifest do
          {:ok, provider_name} <- require_string(map, "provider"),
          {:ok, provider} <- resolve_provider(provider_name),
          {:ok, source_maps} <- require_nonempty_list(map, "sources"),
-         {:ok, sources} <- build_all(source_maps, &build_source/1),
+         {:ok, sources} <- build_all(source_maps, &build_source(&1, provider_name)),
          {:ok, source_date} <- parse_date(Map.get(map, "source_date"), "source_date"),
          {:ok, authority_maps} <- require_nonempty_list(map, "authorities"),
          {:ok, authorities} <- build_all(authority_maps, &validate_authority/1),
          {:ok, area_types} <- validate_area_types(Map.get(map, "area_types", [])),
-         :ok <- validate_options(provider, Map.get(map, "options", %{})) do
+         :ok <- validate_options(provider, sources, Map.get(map, "options", %{})) do
       fields = %{
         collection: collection,
         release: release,
@@ -323,9 +324,9 @@ defmodule GeoGenius.Manifest do
     }
   end
 
-  defp build_source(map) do
+  defp build_source(map, default_provider) do
     with {:ok, source_key} <- require_string(map, "source_key"),
-         {:ok, provider} <- require_string(map, "provider"),
+         {:ok, provider} <- source_provider(map, default_provider),
          {:ok, license} <- require_string(map, "license"),
          {:ok, release_key} <- require_string(map, "release_key"),
          {:ok, artifact_maps} <- require_nonempty_list(map, "artifacts"),
@@ -341,6 +342,30 @@ defmodule GeoGenius.Manifest do
          source_date: source_date,
          artifacts: artifacts
        }}
+    end
+  end
+
+  # A source that names no provider is staged by the release's own, which is
+  # what keeps a single-provider manifest -- one source, or several in the same
+  # format -- exactly as it was. The default is resolved here rather than left
+  # for the pipeline, so `%Source{}` carries a concrete name everywhere
+  # downstream: the catalog row `register_source/4` writes, and the document
+  # `to_map/1` produces. The name is resolved as well as type-checked, because
+  # a source naming a module that does not exist would otherwise fail at
+  # staging, several phases into a run.
+  defp source_provider(map, default_provider) do
+    with {:ok, name} <- source_provider_name(map, default_provider),
+         {:ok, _module} <- resolve_provider(name) do
+      {:ok, name}
+    end
+  end
+
+  defp source_provider_name(map, default_provider) do
+    case Map.get(map, "provider") do
+      nil -> {:ok, default_provider}
+      "" -> {:error, "provider must not be blank"}
+      value when is_binary(value) -> {:ok, value}
+      other -> {:error, "provider must be a string, got: #{inspect(other)}"}
     end
   end
 
@@ -497,18 +522,47 @@ defmodule GeoGenius.Manifest do
   defp metadata_for(nil), do: %{}
   defp metadata_for(cache_key), do: %{"cache_key" => cache_key}
 
-  defp validate_options(provider, options) when is_map(options) do
-    check_all(required_option_keys(provider), &missing_option_key(&1, options))
+  # Every provider a release names validates the options, not only the
+  # release's own: a release staged by several providers has several sets of
+  # required keys and several option vocabularies, and a manifest that
+  # satisfies one but not another cannot be staged. Within each provider the
+  # required-key check runs first, so an operator sent to fix an option is
+  # never sent to fix the entry that is not the reason the manifest cannot be
+  # used.
+  defp validate_options(provider, sources, options) when is_map(options) do
+    check_all(provider_modules(provider, sources), &provider_option_error(&1, options))
   end
 
-  defp validate_options(_provider, other),
+  defp validate_options(_provider, _sources, other),
     do: {:error, "options must be a map, got: #{inspect(other)}"}
 
-  defp missing_option_key(key, options) do
+  # The release's provider first, then each source's in declaration order.
+  # `build_source/2` has already resolved every source's name, so
+  # `Config.provider!/1` here cannot raise.
+  defp provider_modules(provider, sources) do
+    Enum.uniq([provider | Enum.map(sources, &Config.provider!(&1.provider))])
+  end
+
+  defp provider_option_error(module, options) do
+    case validate_provider(module, options) do
+      :ok -> nil
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_provider(module, options) do
+    with :ok <- check_all(required_option_keys(module), &missing_option_key(&1, module, options)) do
+      validate_provider_options(module, options)
+    end
+  end
+
+  # The message names the provider, because with several staging one release
+  # "for provider" alone leaves an operator guessing which one wanted the key.
+  defp missing_option_key(key, module, options) do
     if Map.has_key?(options, key) do
       nil
     else
-      {:error, "options is missing required key #{inspect(key)} for provider"}
+      {:error, "options is missing required key #{inspect(key)} for provider #{inspect(module)}"}
     end
   end
 
@@ -530,6 +584,19 @@ defmodule GeoGenius.Manifest do
 
       true ->
         []
+    end
+  end
+
+  # `validate_options/1` is optional: a provider that exports none contributes
+  # no checks beyond the required keys, rather than every manifest naming it
+  # failing to load. `required_option_keys/1` has already established that the
+  # module loads, so `function_exported?/3` here answers whether the callback
+  # is implemented rather than whether the module is available.
+  defp validate_provider_options(provider, options) do
+    if function_exported?(provider, :validate_options, 1) do
+      provider.validate_options(options)
+    else
+      :ok
     end
   end
 

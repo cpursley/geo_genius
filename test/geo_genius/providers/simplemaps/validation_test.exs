@@ -17,6 +17,15 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   @cities Path.expand("../../../support/fixtures/simplemaps/uscities_sample.csv", __DIR__)
   @zips Path.expand("../../../support/fixtures/simplemaps/uszips_sample.csv", __DIR__)
 
+  # The hierarchy the shipped manifest declares. SimpleMaps
+  # supplies no hierarchy of its own, so a test manifest declares it directly.
+  @fixed_hierarchy [
+    %{key: "state", rank: 10},
+    %{key: "county", rank: 20},
+    %{key: "city", rank: 30},
+    %{key: "zip", rank: 40}
+  ]
+
   test "a primary county_fips missing from county_fips_all fails" do
     payload = %{city_payload() | "county_fips" => "50101", "county_fips_all" => "50199"}
 
@@ -284,7 +293,7 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
       release: "r1",
       provider: "simplemaps",
       authorities: [%{key: "simplemaps", name: "SimpleMaps"}],
-      area_types: SimpleMaps.area_types(),
+      area_types: @fixed_hierarchy,
       sources: [],
       options: %{}
     }

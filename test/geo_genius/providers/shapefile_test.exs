@@ -95,9 +95,15 @@ defmodule GeoGenius.Providers.ShapefileTest do
     assert Shapefile.required_options() == GeoJSON.required_options()
   end
 
-  test "area_types delegates to the GeoJSON provider" do
-    assert Shapefile.area_types() == GeoJSON.area_types()
-    assert Shapefile.area_types() == []
+  # A shapefile is converted before it is parsed, so its options are written in
+  # the converted document's vocabulary and validated by the same code that
+  # reads them.
+  test "validates manifest options through the GeoJSON provider" do
+    options = %{"implied_areas" => [%{"area_type" => "cluster", "code_column" => "CLUSTER"}]}
+
+    assert {:error, reason} = Shapefile.validate_options(options)
+    assert reason =~ ~s("code_property")
+    assert Shapefile.validate_options(options) == GeoJSON.validate_options(options)
   end
 
   test "artifacts returns every artifact declared across the manifest's sources" do

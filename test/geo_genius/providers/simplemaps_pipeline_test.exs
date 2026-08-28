@@ -53,6 +53,15 @@ defmodule GeoGenius.Providers.SimpleMapsPipelineTest do
   # and the six non-ANSI state codes under the USPS.
   @authority_keys ["census", "simplemaps", "usps"]
 
+  # The ranked hierarchy the shipped manifest declares. SimpleMaps supplies
+  # no hierarchy of its own; the manifest is the only source.
+  @shipped_hierarchy [
+    %{key: "state", rank: 10},
+    %{key: "county", rank: 20},
+    %{key: "city", rank: 30},
+    %{key: "zip", rank: 40}
+  ]
+
   defmodule FixtureDownloader do
     @moduledoc """
     Serves the repository's own SimpleMaps samples over a URL.
@@ -172,10 +181,10 @@ defmodule GeoGenius.Providers.SimpleMapsPipelineTest do
       assert Enum.all?(manifest.authorities, &(&1.name not in [nil, ""]))
     end
 
-    test "declares the provider's own ranked hierarchy" do
+    test "declares the ranked hierarchy the manifest names" do
       manifest = Manifest.load!(@shipped_collection, @shipped_release)
 
-      assert manifest.area_types == SimpleMaps.area_types()
+      assert manifest.area_types == @shipped_hierarchy
     end
 
     test "names both artifacts the provider parses, as operator-supplied files" do

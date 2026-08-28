@@ -3,10 +3,17 @@ defmodule GeoGenius.Pipeline.State do
   One run's working set, threaded through every phase.
 
   Everything durable about a run lives in PostgreSQL; this carries only what
-  one phase hands the next: the rebuilt manifest and the provider it resolves
+  one phase hands the next: the rebuilt manifest and the providers it resolves
   to, the local path and attributed source release of each artifact the
   download phase obtained, and the metrics the last phase measured, which the
   next phase boundary writes onto the run.
+
+  A release names a provider per source, so there is no single provider for a
+  run. `artifact_providers` maps a logical name to the module that stages it,
+  which is how staging dispatches on an artifact and how normalizing and
+  relating dispatch on `row.artifact`. `providers` is the same set without the
+  keys, in declaration order, for the release-level question `relations/1`
+  asks.
   """
 
   alias GeoGenius.Context
@@ -23,7 +30,8 @@ defmodule GeoGenius.Pipeline.State do
     :batch_size,
     :timeout,
     :manifest,
-    :provider,
+    providers: [],
+    artifact_providers: %{},
     manifest_artifacts: %{},
     resolved: %{},
     sources: %{},
@@ -45,7 +53,8 @@ defmodule GeoGenius.Pipeline.State do
           batch_size: pos_integer(),
           timeout: timeout(),
           manifest: Manifest.t() | nil,
-          provider: module() | nil,
+          providers: [module()],
+          artifact_providers: %{optional(String.t()) => module()},
           manifest_artifacts: %{optional(String.t()) => Manifest.Artifact.t()},
           resolved: %{optional(String.t()) => Path.t()},
           sources: %{optional(String.t()) => Ecto.UUID.t()},

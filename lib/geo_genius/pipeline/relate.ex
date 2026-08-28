@@ -45,11 +45,12 @@ defmodule GeoGenius.Pipeline.Relate do
   alias GeoGenius.Staging
 
   @doc """
-  Rebuilds measured relations, writes every edge the provider asserts, and
-  merges both into one metrics map.
+  Rebuilds measured relations, writes every edge the release's providers
+  assert, and merges both into one metrics map.
 
-  Measures `"relations"` (present only when `relations/1` returns
-  `:rebuild`) and `"asserted_relations"`, which counts edges asserted rather
+  Measures `"relations"` (present only when at least one provider's
+  `relations/1` returns `:rebuild`) and `"asserted_relations"`, which counts
+  edges asserted rather
   than distinct edges written: two rows asserting the same edge each add
   one, even though `put_relation_many/3` deduplicates and the edge itself
   converges to a single row.
@@ -57,13 +58,23 @@ defmodule GeoGenius.Pipeline.Relate do
   @spec relate(State.t()) :: State.result()
   def relate(%State{} = state) do
     measured =
-      case state.provider.relations(state.manifest) do
-        :rebuild -> %{"relations" => rebuild_relations(state)}
-        :none -> %{}
+      if rebuild?(state) do
+        %{"relations" => rebuild_relations(state)}
+      else
+        %{}
       end
 
     count = write_asserted_relations(state)
     {:ok, %{state | metrics: Map.put(measured, "asserted_relations", count)}}
+  end
+
+  # A release with several providers gets one answer, and it is the union: a
+  # source whose areas nest spatially needs its containment measured whether or
+  # not another source in the same release carries geometry at all. Requiring
+  # every provider to agree would silently drop the measurement the moment a
+  # release gained a source with no boundaries.
+  defp rebuild?(%State{} = state) do
+    Enum.any?(state.providers, &(&1.relations(state.manifest) == :rebuild))
   end
 
   defp rebuild_relations(state) do
@@ -94,9 +105,21 @@ defmodule GeoGenius.Pipeline.Relate do
     Catalog.heartbeat_import(state.context, state.run.run_id, %{"asserted_relations" => count})
   end
 
+  # A row's edges come from the provider that staged it, the same dispatch
+  # normalizing uses. A row naming an artifact no provider in this run stages
+  # asserts nothing rather than raising: `GeoGenius.Pipeline.Normalize` runs
+  # first and fails the release on exactly that row, so this is unreachable in
+  # a run that got here.
   defp asserted_edges(row, state) do
+    case Map.fetch(state.artifact_providers, row.artifact) do
+      {:ok, provider} -> mapped_edges(provider, row, state)
+      :error -> []
+    end
+  end
+
+  defp mapped_edges(provider, row, state) do
     state.manifest
-    |> state.provider.asserted_relations(row)
+    |> provider.asserted_relations(row)
     |> Enum.map(fn {parent_key, child_key, relation_type} ->
       %{
         parent_area_key: parent_key,

@@ -31,6 +31,7 @@ defmodule GeoGenius.Providers.GeoJSON do
   alias GeoGenius.Provider.Area
   alias GeoGenius.Providers.Batch
   alias GeoGenius.Providers.Fields
+  alias GeoGenius.Providers.ImpliedAreas
   alias GeoGenius.Providers.ManifestOptions
   alias GeoGenius.Staging
 
@@ -43,14 +44,14 @@ defmodule GeoGenius.Providers.GeoJSON do
   @chunk_size 1_000
 
   @impl Provider
-  @doc "GeoJSON carries no fixed hierarchy of its own; every manifest supplies its own area_types."
-  @spec area_types() :: [Manifest.area_type()]
-  defdelegate area_types(), to: Provider, as: :no_area_types
-
-  @impl Provider
   @doc "Requires `area_type` and `code_property` in the manifest's options."
   @spec required_options() :: [String.t()]
   def required_options, do: ["area_type", "code_property"]
+
+  @impl Provider
+  @doc "Validates the manifest's `implied_areas` entries, whose code key is `code_property`."
+  @spec validate_options(map()) :: :ok | {:error, String.t()}
+  def validate_options(options), do: ImpliedAreas.validate(options, "code_property")
 
   @impl Provider
   @doc "Every artifact declared across the manifest's sources; a GeoJSON collection's artifacts are all GeoJSON."
@@ -80,10 +81,13 @@ defmodule GeoGenius.Providers.GeoJSON do
 
   @impl Provider
   @doc "Reads the code and name out of the staged row's payload, using the manifest's options."
-  @spec normalize(Manifest.t(), Staging.Row.t()) :: {:ok, Area.t()} | :skip | {:error, String.t()}
+  @spec normalize(Manifest.t(), Staging.Row.t()) ::
+          {:ok, Area.t()} | {:ok, [Area.t()]} | :skip | {:error, String.t()}
   def normalize(%Manifest{options: options} = manifest, %Staging.Row{} = row) do
-    with {:ok, keys} <- ManifestOptions.area_keys(manifest, options, "code_property") do
-      build_area(row, keys, options)
+    with {:ok, keys} <- ManifestOptions.area_keys(manifest, options, "code_property"),
+         {:ok, entries} <- ImpliedAreas.parse(options, "code_property"),
+         {:ok, area} <- build_area(row, keys, options) do
+      ImpliedAreas.with_implied(area, row.payload, entries, keys.authority_key)
     end
   end
 
@@ -93,9 +97,25 @@ defmodule GeoGenius.Providers.GeoJSON do
   defdelegate relations(manifest), to: Provider, as: :always_rebuild
 
   @impl Provider
-  @doc "Asserts no relations; this format carries no hierarchy in its columns."
-  @spec asserted_relations(Manifest.t(), Staging.Row.t()) :: []
-  defdelegate asserted_relations(manifest, row), to: Provider, as: :no_asserted_relations
+  @doc "Asserts an edge from each area the row implies to the row's own area."
+  @spec asserted_relations(Manifest.t(), Staging.Row.t()) ::
+          [{String.t(), String.t(), String.t()}]
+  def asserted_relations(%Manifest{options: options} = manifest, %Staging.Row{} = row) do
+    with {:ok, keys} <- ManifestOptions.area_keys(manifest, options, "code_property"),
+         {:ok, entries} <- ImpliedAreas.parse(options, "code_property"),
+         code when is_binary(code) <- Fields.presence(Map.get(row.payload, keys.code_field)) do
+      child =
+        Area.key(%Area{
+          authority_key: keys.authority_key,
+          area_type_key: keys.area_type_key,
+          code: code
+        })
+
+      ImpliedAreas.edges(row.payload, entries, keys.authority_key, child)
+    else
+      _ -> []
+    end
+  end
 
   defp read_document(path) do
     case Files.read(path) do
