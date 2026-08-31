@@ -66,10 +66,11 @@ defmodule GeoGenius.Catalog do
   @doc "Creates or updates an area type within a collection, returning its id."
   @spec upsert_area_type(Context.t(), String.t(), map()) :: Ecto.UUID.t()
   def upsert_area_type(%Context{} = context, collection_key, attrs) do
-    scalar(context, "upsert_area_type", "$1, $2, $3", [
+    scalar(context, "upsert_area_type", "$1, $2, $3, $4", [
       collection_key,
       Map.fetch!(attrs, :key),
-      Map.fetch!(attrs, :rank)
+      Map.fetch!(attrs, :rank),
+      Map.get(attrs, :requires_geometry, false)
     ])
   end
 
@@ -223,16 +224,60 @@ defmodule GeoGenius.Catalog do
   @doc """
   Attaches a boundary geometry to an area within a release, attributed to the
   source release it came from.
+
+  A zero or omitted `:simplify_tolerance` uses the set-based boundary path.
+  A nonzero tolerance retains the singular SQL path so existing callers keep
+  its display-geometry simplification behavior.
   """
   @spec put_boundary(Context.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
   def put_boundary(%Context{} = context, release_id, area_key, attrs) do
-    void(context, "put_boundary", "$1, $2, $3, $4, $5", [
-      dump_uuid(release_id),
-      area_key,
-      dump_uuid(Map.fetch!(attrs, :source_release_id)),
-      Map.fetch!(attrs, :geometry),
-      Map.get(attrs, :simplify_tolerance, 0.0)
-    ])
+    case Map.get(attrs, :simplify_tolerance, 0.0) do
+      tolerance when tolerance in [0, 0.0] ->
+        put_boundaries(context, release_id, [Map.put(attrs, :area_key, area_key)])
+
+      tolerance ->
+        void(context, "put_boundary", "$1, $2, $3, $4, $5", [
+          dump_uuid(release_id),
+          area_key,
+          dump_uuid(Map.fetch!(attrs, :source_release_id)),
+          Map.fetch!(attrs, :geometry),
+          tolerance
+        ])
+    end
+  end
+
+  @doc """
+  Attaches every boundary in `boundaries` within one release, in one round trip.
+
+  Each map carries `:area_key`, `:source_release_id`, and `:geometry`, with
+  optional `:display_tier` and `:source_properties`. A repeated area key keeps
+  its last boundary, matching the state left by scalar writes in caller order.
+
+  Returns `:ok` without touching the database for an empty list, having
+  validated `release_id` first.
+  """
+  @spec put_boundaries(Context.t(), Ecto.UUID.t(), [map()]) :: :ok
+  def put_boundaries(context, release_id, boundaries)
+
+  def put_boundaries(%Context{}, release_id, []) do
+    dump_uuid(release_id)
+    :ok
+  end
+
+  def put_boundaries(%Context{} = context, release_id, boundaries) do
+    void(
+      context,
+      "put_boundaries",
+      "$1::uuid, $2::text[], $3::uuid[], $4::geometry[], $5::integer[], $6::jsonb[]",
+      [
+        dump_uuid(release_id),
+        Enum.map(boundaries, &Map.fetch!(&1, :area_key)),
+        Enum.map(boundaries, &(&1 |> Map.fetch!(:source_release_id) |> dump_uuid())),
+        Enum.map(boundaries, &Map.fetch!(&1, :geometry)),
+        Enum.map(boundaries, &Map.get(&1, :display_tier, 0)),
+        Enum.map(boundaries, &Map.get(&1, :source_properties, %{}))
+      ]
+    )
   end
 
   @doc "Asserts a relation between two areas within a release."

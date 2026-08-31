@@ -63,11 +63,11 @@ defmodule GeoGenius.PipelineTest do
     def available?(_executable, _opts), do: true
 
     # Stands in for ogr2ogr: reports what it was asked to run and writes the
-    # GeoJSON document a real conversion would have produced.
+    # GeoJSON Sequence a real conversion would have produced.
     @impl GeoGenius.Command
     def run(executable, args, opts) do
       send(Keyword.fetch!(opts, :test_pid), {:ran, executable, args})
-      File.cp!(Keyword.fetch!(opts, :fixture), Enum.at(args, -2))
+      File.write!(Enum.at(args, -2), Keyword.fetch!(opts, :fixture))
       {:ok, ""}
     end
   end
@@ -665,7 +665,7 @@ defmodule GeoGenius.PipelineTest do
       seed_key!(fixtures, "demo/demo:territories/2026-01/shapes.zip", zip)
 
       context = %{fixtures.context | command: ConvertingCommand}
-      opts = Keyword.put(fixtures.opts, :fixture, @artifact)
+      opts = Keyword.put(fixtures.opts, :fixture, shapefile_sequence())
 
       assert {:ok, run} = Pipeline.execute(context, run_id, opts)
       assert run.status == "completed"
@@ -1355,6 +1355,14 @@ defmodule GeoGenius.PipelineTest do
     entries = Enum.map(members, &{String.to_charlist(&1), "stand-in for #{&1}"})
     {:ok, {_name, bytes}} = :zip.create(~c"shapes.zip", entries, [:memory])
     bytes
+  end
+
+  defp shapefile_sequence do
+    @artifact
+    |> File.read!()
+    |> Jason.decode!()
+    |> Map.fetch!("features")
+    |> Enum.map_join("\n", &Jason.encode!/1)
   end
 
   defp shapefile_manifest(zip) do

@@ -65,14 +65,27 @@ defmodule GeoGenius.MigrationTest do
     |> String.to_integer()
   end
 
+  test "the pre-release package has one consolidated schema version" do
+    assert GeoGenius.Migration.current_version() == 1
+
+    assert "lib/geo_genius/migrations/v*.ex"
+           |> Path.wildcard()
+           |> Enum.map(&Path.basename/1) == ["v01.ex"]
+  end
+
   test "installs at the default prefix and records the version" do
     :ok = migrate("geo_genius")
-    assert GeoGenius.Migration.installed_version(TestRepo, "geo_genius") == 1
+
+    assert GeoGenius.Migration.installed_version(TestRepo, "geo_genius") ==
+             GeoGenius.Migration.current_version()
   end
 
   test "installs at a non-default prefix" do
     :ok = migrate("custom_geo")
-    assert GeoGenius.Migration.installed_version(TestRepo, "custom_geo") == 1
+
+    assert GeoGenius.Migration.installed_version(TestRepo, "custom_geo") ==
+             GeoGenius.Migration.current_version()
+
     assert GeoGenius.Migration.installed_version(TestRepo, "geo_genius") == 0
   end
 

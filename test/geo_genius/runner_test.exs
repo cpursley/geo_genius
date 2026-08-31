@@ -1,11 +1,9 @@
 defmodule GeoGenius.RunnerTest do
   # `Runners.PgFlow` is our own module and always compiles -- its top-level
-  # `defmodule` has no dependency on `:pgflow` being present, only its
-  # nested `Job` submodule does. `:pgflow` itself is not a dependency of
-  # this library at all (see `GeoGenius.Runners.PgFlow`'s moduledoc for why),
-  # so `Runners.PgFlow.available?/0` is genuinely false here -- the actual
-  # experience of every host of this library, not a simulation -- and the
-  # availability chain falls through to `Runners.Task` or `Runners.Inline`.
+  # `defmodule` has no dependency on optional `:pgflow` being present; only
+  # its nested `Job` submodule does. The ordinary development graph includes
+  # PgFlow and the Job, but no PgFlow supervisor is running, so availability
+  # still falls through to `Runners.Task` or `Runners.Inline`.
   use ExUnit.Case, async: false
 
   alias GeoGenius.AppEnv
@@ -78,7 +76,7 @@ defmodule GeoGenius.RunnerTest do
     assert Runner.configured([]) == Runners.Task
   end
 
-  test "Runners.PgFlow loads but is unavailable with :pgflow not installed" do
+  test "Runners.PgFlow loads but is unavailable without a running PgFlow supervisor" do
     # `configured/1`'s chain guards every backend with `Code.ensure_loaded?/1`
     # before calling `available?/0` on it -- true for `Runners.PgFlow` on
     # this build (it is our own module, unconditionally compiled), so the

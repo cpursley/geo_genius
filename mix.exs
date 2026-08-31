@@ -35,14 +35,18 @@ defmodule GeoGenius.MixProject do
     [
       {:ecto, "~> 3.13"},
       {:ecto_sql, "~> 3.13"},
-      {:postgrex, "~> 0.22"},
+      {:postgrex, ">= 0.20.0 and < 0.23.0"},
       {:geo_postgis, "~> 3.7"},
       {:ecto_evolver, "~> 0.1.0"},
       {:telemetry, "~> 1.3"},
       {:jason, "~> 1.4"},
       {:nimble_csv, "~> 1.2"},
       {:req, "~> 0.7", optional: true},
-      {:plug, "~> 1.0", only: [:dev, :test]},
+      {:pgflow, ">= 0.3.4 and < 0.4.0", optional: true},
+      {:phoenix, "~> 1.7", optional: true},
+      {:phoenix_live_view, "~> 1.0", optional: true},
+      {:livefilter, "~> 0.2.0", optional: true},
+      {:plug, "~> 1.0", optional: true},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false},
@@ -98,6 +102,7 @@ defmodule GeoGenius.MixProject do
         "guides/ingestion.md",
         "guides/projections.md",
         "guides/sql_api.md",
+        "docs/design/geo-genius-design.md",
         "CHANGELOG.md"
       ],
       groups_for_modules: groups_for_modules()
@@ -153,6 +158,7 @@ defmodule GeoGenius.MixProject do
         GeoGenius.Notifiers.Noop,
         GeoGenius.Providers.CSV,
         GeoGenius.Providers.GeoJSON,
+        GeoGenius.Providers.GeoJSONSequence,
         GeoGenius.Providers.Shapefile,
         GeoGenius.Runners.Inline,
         GeoGenius.Runners.PgFlow,
@@ -195,7 +201,8 @@ defmodule GeoGenius.MixProject do
 
   defp package do
     [
-      files: ~w(lib priv guides test/pgtap test/pgtap_support docker-compose.yml database
+      files:
+        ~w(lib priv guides docs/design test/pgtap test/pgtap_support docker-compose.yml database
            .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}

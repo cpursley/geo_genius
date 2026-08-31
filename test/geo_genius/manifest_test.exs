@@ -440,17 +440,52 @@ defmodule GeoGenius.ManifestTest do
   end
 
   test "rejects an area_types entry that names no rank, naming the field" do
-    map = Map.put(valid_map(), "area_types", [%{"key" => "state"}])
+    map = Map.put(valid_map(), "area_types", [%{"key" => "bounded_zone"}])
 
     assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
     assert reason == "area_types entry rank is required"
   end
 
   test "rejects an area_types entry whose rank is not a positive integer, naming the field" do
-    map = Map.put(valid_map(), "area_types", [%{"key" => "state", "rank" => "10"}])
+    map = Map.put(valid_map(), "area_types", [%{"key" => "bounded_zone", "rank" => "10"}])
 
     assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
     assert reason == "area_types entry rank must be a positive integer, got: \"10\""
+  end
+
+  test "area_types accept optional requires_geometry booleans and preserve explicit values" do
+    area_types = [
+      %{"key" => "bounded_zone", "rank" => 10, "requires_geometry" => true},
+      %{"key" => "parent_record", "rank" => 20},
+      %{"key" => "metadata_record", "rank" => 30, "requires_geometry" => false}
+    ]
+
+    map = Map.put(valid_map(), "area_types", area_types)
+
+    assert {:ok, manifest} = Manifest.from_map(map)
+
+    assert manifest.area_types == [
+             %{key: "bounded_zone", rank: 10, requires_geometry: true},
+             %{key: "parent_record", rank: 20},
+             %{key: "metadata_record", rank: 30, requires_geometry: false}
+           ]
+
+    assert Manifest.to_map(manifest)["area_types"] == area_types
+  end
+
+  test "area_types reject non-boolean requires_geometry values" do
+    for value <- ["true", 1, nil, %{}, []] do
+      map =
+        Map.put(valid_map(), "area_types", [
+          %{"key" => "bounded_zone", "rank" => 10, "requires_geometry" => value}
+        ])
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map),
+             "requires_geometry accepted #{inspect(value)}"
+
+      assert reason ==
+               "area_types entry requires_geometry must be a boolean, got: #{inspect(value)}"
+    end
   end
 
   # The first failing entry is the one reported: a later well-formed entry

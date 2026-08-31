@@ -6,6 +6,22 @@ CREATE OR REPLACE VIEW $SCHEMA$.geo_genius_version AS SELECT 1 AS installed;
 
 --SPLIT--
 
+CREATE OR REPLACE VIEW $SCHEMA$.geo_genius_contract AS
+SELECT
+  1::integer AS schema_version,
+  'sha256:0bb7f017525771075a7cb4dfed5568d1b14edb261e8fadbb82d14acbfba53fb1'::text
+    AS contract_revision,
+  ARRAY[
+    'boundary_batches',
+    'boundary_canonical_repair_once',
+    'boundary_collection_provenance',
+    'boundary_publication_serialization',
+    'reversible_legacy_v01_reconciliation',
+    'type_scoped_geometry_requirements'
+  ]::text[] AS capabilities;
+
+--SPLIT--
+
 CREATE FUNCTION $SCHEMA$.assert_extensions(required text[])
 RETURNS void
 LANGUAGE plpgsql
@@ -97,6 +113,7 @@ CREATE TABLE $SCHEMA$.area_type (
   collection_id uuid NOT NULL REFERENCES $SCHEMA$.collection(id) ON DELETE CASCADE,
   key text NOT NULL,
   rank integer NOT NULL,
+  requires_geometry boolean NOT NULL DEFAULT false,
   CONSTRAINT area_type_collection_key_uq UNIQUE (collection_id, key),
   CONSTRAINT area_type_collection_rank_uq UNIQUE (collection_id, rank),
   CONSTRAINT area_type_key_format_chk CHECK (key ~ '^[a-z_][a-z0-9_]*$'),
@@ -1016,7 +1033,8 @@ $fn$;
 CREATE FUNCTION $SCHEMA$.upsert_area_type(
   collection_key text,
   key text,
-  rank integer
+  rank integer,
+  requires_geometry boolean
 )
 RETURNS uuid
 LANGUAGE plpgsql
@@ -1028,8 +1046,8 @@ DECLARE
   target_collection_id uuid;
   result_id uuid;
 BEGIN
-  IF collection_key IS NULL OR key IS NULL OR rank IS NULL THEN
-    RAISE EXCEPTION 'collection, key, and rank are required'
+  IF collection_key IS NULL OR key IS NULL OR rank IS NULL OR requires_geometry IS NULL THEN
+    RAISE EXCEPTION 'collection, key, rank, and requires_geometry are required'
       USING ERRCODE = '22004';
   END IF;
 
@@ -1054,13 +1072,38 @@ BEGIN
     ('x' || substr(md5('$SCHEMA$.area_type:' || target_collection_id::text || ':' || key), 1, 16))::bit(64)::bigint
   );
 
-  INSERT INTO $SCHEMA$.area_type (collection_id, key, rank)
-  VALUES (target_collection_id, key, rank)
+  INSERT INTO $SCHEMA$.area_type (collection_id, key, rank, requires_geometry)
+  VALUES (target_collection_id, key, rank, requires_geometry)
   ON CONFLICT ON CONSTRAINT area_type_collection_key_uq
-  DO UPDATE SET rank = EXCLUDED.rank
+  DO UPDATE SET
+    rank = EXCLUDED.rank,
+    requires_geometry = EXCLUDED.requires_geometry
   RETURNING id INTO result_id;
 
   RETURN result_id;
+END;
+$fn$;
+
+--SPLIT--
+
+CREATE FUNCTION $SCHEMA$.upsert_area_type(
+  collection_key text,
+  key text,
+  rank integer
+)
+RETURNS uuid
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+BEGIN
+  IF collection_key IS NULL OR key IS NULL OR rank IS NULL THEN
+    RAISE EXCEPTION 'collection, key, and rank are required'
+      USING ERRCODE = '22004';
+  END IF;
+
+  RETURN $SCHEMA$.upsert_area_type(collection_key, key, rank, false);
 END;
 $fn$;
 
@@ -1942,7 +1985,9 @@ SECURITY INVOKER
 SET search_path = pg_catalog, public, $SCHEMA$
 AS $fn$
 DECLARE
+  target_collection_id uuid;
   target_area_id uuid;
+  source_collection_id uuid;
   canonical geometry;
   was_repaired boolean := false;
   display geometry;
@@ -1979,6 +2024,10 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
+  SELECT collection_id INTO STRICT target_collection_id
+    FROM $SCHEMA$.release WHERE id = target_release_id;
+
+  PERFORM pg_advisory_xact_lock($SCHEMA$.publication_lock_key(target_collection_id));
   PERFORM $SCHEMA$.assert_release_mutable(target_release_id);
 
   SELECT id INTO STRICT target_area_id
@@ -1996,6 +2045,18 @@ BEGIN
   ) THEN
     RAISE EXCEPTION
       'source release % is not declared by release %',
+      target_source_release_id, target_release_id
+      USING ERRCODE = '23503';
+  END IF;
+
+  SELECT source.collection_id INTO source_collection_id
+    FROM $SCHEMA$.source_release
+    JOIN $SCHEMA$.source ON source.id = source_release.source_id
+   WHERE source_release.id = target_source_release_id;
+
+  IF source_collection_id IS DISTINCT FROM target_collection_id THEN
+    RAISE EXCEPTION
+      'source release % belongs to another collection than release %',
       target_source_release_id, target_release_id
       USING ERRCODE = '23503';
   END IF;
@@ -2049,6 +2110,286 @@ BEGIN
     target_area_id,
     ST_Multi(part)
   FROM ST_Subdivide(canonical, 256) AS part;
+END;
+$fn$;
+
+--SPLIT--
+
+-- Attaches one accepted boundary per area key. Parallel arrays preserve the
+-- source row's alignment and ordinality makes a repeated area last-write-wins.
+CREATE FUNCTION $SCHEMA$.put_boundaries(
+  target_release_id uuid,
+  target_area_keys text[],
+  target_source_release_ids uuid[],
+  input_geometries geometry[],
+  display_tiers integer[],
+  source_properties_values jsonb[]
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = pg_catalog, public, $SCHEMA$
+AS $fn$
+DECLARE
+  batch_size integer;
+  target_collection_id uuid;
+  foreign_area_id uuid;
+  undeclared_source_release_id uuid;
+  foreign_source_release_id uuid;
+  invalid_geometry geometry;
+  invalid_display_tier integer;
+  invalid_source_properties jsonb;
+  accepted_area_ids uuid[];
+  accepted_source_release_ids uuid[];
+  accepted_geometries geometry[];
+  accepted_display_tiers integer[];
+  accepted_source_properties jsonb[];
+  accepted_repaired boolean[];
+BEGIN
+  IF target_release_id IS NULL THEN
+    RAISE EXCEPTION 'release id is required' USING ERRCODE = '22004';
+  END IF;
+
+  batch_size := $SCHEMA$.assert_write_arrays(
+    ARRAY[cardinality(target_area_keys), cardinality(target_source_release_ids),
+          cardinality(input_geometries), cardinality(display_tiers),
+          cardinality(source_properties_values)],
+    ARRAY[array_position(target_area_keys, NULL),
+          array_position(target_source_release_ids, NULL),
+          array_position(input_geometries, NULL),
+          array_position(display_tiers, NULL),
+          array_position(source_properties_values, NULL)],
+    ARRAY['area keys', 'source release ids', 'geometries', 'display tiers',
+          'source properties']);
+
+  IF batch_size = 0 THEN
+    RETURN;
+  END IF;
+
+  -- Publication, rollback, retirement, and this write all serialize on the
+  -- collection's existing lifecycle key. The mutability check is deliberately
+  -- after the lock: a writer that waited for publication must see the release
+  -- as completed and fail rather than committing after it became published.
+  SELECT collection_id INTO STRICT target_collection_id
+    FROM $SCHEMA$.release WHERE id = target_release_id;
+
+  PERFORM pg_advisory_xact_lock(
+    $SCHEMA$.publication_lock_key(target_collection_id));
+
+  PERFORM $SCHEMA$.assert_release_mutable(target_release_id);
+
+  PERFORM $SCHEMA$.assert_resolved(
+    (SELECT min(requested.area_key)
+       FROM unnest(target_area_keys) AS requested(area_key)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM $SCHEMA$.area WHERE area.area_key = requested.area_key)),
+    'area key');
+
+  SELECT area.id INTO foreign_area_id
+    FROM $SCHEMA$.area
+   WHERE area.area_key = ANY(target_area_keys)
+     AND area.collection_id <> target_collection_id
+   ORDER BY area.area_key
+   LIMIT 1;
+
+  IF foreign_area_id IS NOT NULL THEN
+    PERFORM $SCHEMA$.assert_area_in_collection(target_release_id, foreign_area_id);
+  END IF;
+
+  -- Resolve and deduplicate once. Every later array is ordered by area id, so
+  -- parallel positions stay aligned and the first row write acquires shared
+  -- release_area locks in one deterministic order.
+  WITH requested AS (
+    SELECT DISTINCT ON (t.area_key)
+           area.id AS area_id, t.source_release_id, t.input_geom,
+           t.display_tier, t.source_properties
+      FROM unnest(target_area_keys, target_source_release_ids, input_geometries,
+                  display_tiers, source_properties_values) WITH ORDINALITY
+             AS t(area_key, source_release_id, input_geom, display_tier,
+                  source_properties, ord)
+      JOIN $SCHEMA$.area ON area.area_key = t.area_key
+     ORDER BY t.area_key, t.ord DESC
+  )
+  SELECT array_agg(area_id ORDER BY area_id),
+         array_agg(source_release_id ORDER BY area_id),
+         array_agg(input_geom ORDER BY area_id),
+         array_agg(display_tier ORDER BY area_id),
+         array_agg(source_properties ORDER BY area_id)
+    INTO accepted_area_ids, accepted_source_release_ids, accepted_geometries,
+         accepted_display_tiers, accepted_source_properties
+    FROM requested;
+
+  SELECT requested.source_release_id INTO undeclared_source_release_id
+    FROM unnest(accepted_source_release_ids) AS requested(source_release_id)
+   WHERE NOT EXISTS (
+     SELECT 1 FROM $SCHEMA$.release_source
+      WHERE release_source.release_id = target_release_id
+        AND release_source.source_release_id = requested.source_release_id)
+   ORDER BY requested.source_release_id
+   LIMIT 1;
+
+  IF undeclared_source_release_id IS NOT NULL THEN
+    RAISE EXCEPTION
+      'source release % is not declared by release %',
+      undeclared_source_release_id, target_release_id
+      USING ERRCODE = '23503';
+  END IF;
+
+  -- release_source is directly writable, so membership alone cannot prove
+  -- provenance belongs to the release's collection. Recheck the source chain
+  -- independently before accepting geometry attributed to it.
+  SELECT source_release.id INTO foreign_source_release_id
+    FROM unnest(accepted_source_release_ids) AS requested(source_release_id)
+    JOIN $SCHEMA$.source_release ON source_release.id = requested.source_release_id
+    JOIN $SCHEMA$.source ON source.id = source_release.source_id
+   WHERE source.collection_id <> target_collection_id
+   ORDER BY source_release.id
+   LIMIT 1;
+
+  IF foreign_source_release_id IS NOT NULL THEN
+    RAISE EXCEPTION
+      'source release % belongs to another collection than release %',
+      foreign_source_release_id, target_release_id
+      USING ERRCODE = '23503';
+  END IF;
+
+  SELECT display_tier INTO invalid_display_tier
+    FROM unnest(accepted_display_tiers) AS requested(display_tier)
+   WHERE display_tier NOT BETWEEN 0 AND 20
+   LIMIT 1;
+
+  IF invalid_display_tier IS NOT NULL THEN
+    RAISE EXCEPTION 'display tier % must be between 0 and 20', invalid_display_tier
+      USING ERRCODE = '22023';
+  END IF;
+
+  SELECT source_properties INTO invalid_source_properties
+    FROM unnest(accepted_source_properties) AS requested(source_properties)
+   WHERE jsonb_typeof(source_properties) <> 'object'
+   LIMIT 1;
+
+  IF invalid_source_properties IS NOT NULL THEN
+    RAISE EXCEPTION 'source properties must be a JSON object' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT input_geom INTO invalid_geometry
+    FROM unnest(accepted_geometries) AS requested(input_geom)
+   WHERE ST_SRID(input_geom) <> 4326
+      OR GeometryType(input_geom) NOT IN ('POLYGON', 'MULTIPOLYGON')
+      OR ST_IsEmpty(input_geom)
+      OR ST_XMin(input_geom) < -180 OR ST_XMax(input_geom) > 180
+      OR ST_YMin(input_geom) < -90 OR ST_YMax(input_geom) > 90
+   LIMIT 1;
+
+  IF invalid_geometry IS NOT NULL THEN
+    IF ST_SRID(invalid_geometry) <> 4326 THEN
+      RAISE EXCEPTION 'geometry must use SRID 4326' USING ERRCODE = '22023';
+    ELSIF GeometryType(invalid_geometry) NOT IN ('POLYGON', 'MULTIPOLYGON') THEN
+      RAISE EXCEPTION 'geometry must be POLYGON or MULTIPOLYGON, got %',
+        GeometryType(invalid_geometry) USING ERRCODE = '22023';
+    ELSIF ST_IsEmpty(invalid_geometry) THEN
+      RAISE EXCEPTION 'geometry must not be empty' USING ERRCODE = '22023';
+    ELSE
+      RAISE EXCEPTION
+        'geometry coordinates are out of range for SRID 4326 (x %..%, y %..%)',
+        ST_XMin(invalid_geometry), ST_XMax(invalid_geometry),
+        ST_YMin(invalid_geometry), ST_YMax(invalid_geometry)
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  -- Materialize validity and repair once. ST_MakeValid is the expensive part
+  -- for national polygons; every subsequent write unnests the accepted
+  -- canonical array instead of recomputing it for membership, boundary, and
+  -- subdivision independently.
+  WITH requested AS MATERIALIZED (
+    SELECT t.ord, t.input_geom, ST_IsValid(t.input_geom) AS valid
+      FROM unnest(accepted_geometries) WITH ORDINALITY AS t(input_geom, ord)
+  ),
+  made AS MATERIALIZED (
+    SELECT ord, NOT valid AS repaired,
+           CASE WHEN valid THEN input_geom ELSE ST_MakeValid(input_geom) END AS geom
+      FROM requested
+  ),
+  canonical AS (
+    SELECT ord, repaired,
+           CASE
+             WHEN GeometryType(geom) IN ('POLYGON', 'MULTIPOLYGON') THEN geom
+             ELSE ST_CollectionExtract(geom, 3)
+           END AS geom
+      FROM made
+  )
+  SELECT array_agg(geom ORDER BY ord), array_agg(repaired ORDER BY ord)
+    INTO accepted_geometries, accepted_repaired
+    FROM canonical;
+
+  SELECT geom INTO invalid_geometry
+    FROM unnest(accepted_geometries) AS requested(geom)
+   WHERE GeometryType(geom) NOT IN ('POLYGON', 'MULTIPOLYGON')
+      OR ST_IsEmpty(geom)
+      OR NOT ST_IsValid(geom)
+   LIMIT 1;
+
+  IF invalid_geometry IS NOT NULL THEN
+    RAISE EXCEPTION 'geometry could not be repaired into a valid nonempty polygon'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- This is the first row write. The singular SQL path also begins with the
+  -- membership upsert, so plural/plural and plural/singular overlap queue on
+  -- release_area before either path can lock boundary or boundary_part. The
+  -- area-id order prevents two plural batches from walking shared rows in
+  -- opposite directions.
+  INSERT INTO $SCHEMA$.release_area (release_id, area_id, centroid)
+  SELECT target_release_id, requested.area_id,
+         ST_PointOnSurface(requested.geom)::geography
+    FROM unnest(accepted_area_ids, accepted_geometries)
+           AS requested(area_id, geom)
+   ORDER BY requested.area_id
+  ON CONFLICT (release_id, area_id)
+  DO UPDATE SET centroid = EXCLUDED.centroid;
+
+  -- Match the singular write's relation order after membership: boundary
+  -- first, subdivision parts second.
+  DELETE FROM $SCHEMA$.boundary target
+   USING unnest(accepted_area_ids, accepted_display_tiers)
+           AS requested(area_id, display_tier)
+   WHERE target.release_id = target_release_id
+     AND target.area_id = requested.area_id
+     AND target.display_tier <> requested.display_tier;
+
+  DELETE FROM $SCHEMA$.boundary_part target
+   USING unnest(accepted_area_ids) AS requested(area_id)
+   WHERE target.release_id = target_release_id
+     AND target.area_id = requested.area_id;
+
+  INSERT INTO $SCHEMA$.boundary AS target
+    (release_id, area_id, source_release_id, geom, display_geom,
+     display_tier, repaired, source_properties)
+  SELECT target_release_id, requested.area_id, requested.source_release_id,
+         requested.geom, ST_QuantizeCoordinates(requested.geom, 6),
+         requested.display_tier, requested.repaired, requested.source_properties
+    FROM unnest(accepted_area_ids, accepted_source_release_ids,
+                accepted_geometries, accepted_display_tiers,
+                accepted_repaired, accepted_source_properties)
+           AS requested(area_id, source_release_id, geom, display_tier,
+                        repaired, source_properties)
+   ORDER BY requested.area_id
+  ON CONFLICT (release_id, area_id, display_tier)
+  DO UPDATE SET
+    source_release_id = EXCLUDED.source_release_id,
+    geom = EXCLUDED.geom,
+    display_geom = EXCLUDED.display_geom,
+    repaired = EXCLUDED.repaired,
+    source_properties = EXCLUDED.source_properties;
+
+  INSERT INTO $SCHEMA$.boundary_part (release_id, area_id, geom)
+  SELECT target_release_id, requested.area_id, ST_Multi(part)
+    FROM unnest(accepted_area_ids, accepted_geometries)
+           AS requested(area_id, geom)
+    CROSS JOIN LATERAL ST_Subdivide(requested.geom, 256) AS part
+   ORDER BY requested.area_id;
 END;
 $fn$;
 
@@ -2494,20 +2835,21 @@ BEGIN
     JOIN $SCHEMA$.collection ON collection.id = release.collection_id
    WHERE release.id = target_release_id;
 
-  IF collection_requires_geometry THEN
-    SELECT count(*) INTO ungeometried_count
-      FROM $SCHEMA$.release_area ra
-     WHERE ra.release_id = target_release_id
-       AND NOT EXISTS (
-         SELECT 1 FROM $SCHEMA$.boundary b
-          WHERE b.release_id = ra.release_id
-            AND b.area_id = ra.area_id
-            AND b.display_tier = 0
-       );
+  SELECT count(*) INTO ungeometried_count
+    FROM $SCHEMA$.release_area ra
+    JOIN $SCHEMA$.area ON area.id = ra.area_id
+    JOIN $SCHEMA$.area_type ON area_type.id = area.area_type_id
+   WHERE ra.release_id = target_release_id
+     AND (collection_requires_geometry OR area_type.requires_geometry)
+     AND NOT EXISTS (
+       SELECT 1 FROM $SCHEMA$.boundary b
+        WHERE b.release_id = ra.release_id
+          AND b.area_id = ra.area_id
+          AND b.display_tier = 0
+     );
 
-    IF ungeometried_count > 0 THEN
-      failures := failures || format('%s areas lack a boundary', ungeometried_count);
-    END IF;
+  IF ungeometried_count > 0 THEN
+    failures := failures || format('%s areas lack a boundary', ungeometried_count);
   END IF;
 
   SELECT count(*) INTO invalid_count
@@ -2587,6 +2929,19 @@ DECLARE
   target_collection_id uuid;
   previous uuid;
 BEGIN
+  IF target_release_id IS NULL THEN
+    RAISE EXCEPTION 'release id is required' USING ERRCODE = '22004';
+  END IF;
+
+  SELECT collection_id INTO target_collection_id
+    FROM $SCHEMA$.release WHERE id = target_release_id;
+
+  IF target_collection_id IS NULL THEN
+    RAISE EXCEPTION 'release % does not exist', target_release_id USING ERRCODE = '23503';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock($SCHEMA$.publication_lock_key(target_collection_id));
+
   verification := $SCHEMA$.verify_release(target_release_id);
 
   IF NOT (verification ->> 'ok')::boolean THEN
@@ -2594,11 +2949,6 @@ BEGIN
       target_release_id, verification ->> 'failures'
       USING ERRCODE = '23514';
   END IF;
-
-  SELECT collection_id INTO STRICT target_collection_id
-    FROM $SCHEMA$.release WHERE id = target_release_id;
-
-  PERFORM pg_advisory_xact_lock($SCHEMA$.publication_lock_key(target_collection_id));
 
   UPDATE $SCHEMA$.release
      SET status = 'completed', completed_at = coalesce(completed_at, now())

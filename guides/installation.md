@@ -4,6 +4,9 @@ GeoGenius requires Ecto, Ecto SQL, Postgrex, and an already available PostgreSQL
 PostGIS and `pg_trgm`. It does not provision or start a database, and it does not decide
 where its own schema lives — that is a host decision, made once, at install time.
 
+The supported Postgrex window is `>= 0.20.0 and < 0.23.0`. GeoGenius does not require a
+host already locked to Postgrex 0.20 or 0.21 to override its dependency graph.
+
 ## Prefixes are host-selected
 
 Every GeoGenius object — tables, views, functions, the `area_match` composite type — installs
@@ -224,10 +227,93 @@ mix ecto.migrate
 mix geo_genius.check_schema --repo MyApp.Repo --prefix geo_genius
 ```
 
-`mix geo_genius.check_schema` is read-only. It starts the selected Repo, compares the installed
-schema version (read from a tracking view's comment) against the version the loaded package
-code expects, and exits non-zero on a mismatch — usable as a CI or deploy gate. It never
-creates, repairs, or migrates anything.
+`mix geo_genius.check_schema` is read-only. It starts the selected Repo, compares both the
+installed schema version and the content-addressed schema contract against the loaded package,
+and exits non-zero on a mismatch — usable as a CI or deploy gate. `GeoGenius.Preflight` performs
+the same contract check at startup. Neither surface creates, repairs, or migrates anything.
+
+## Reconciling an historical pre-release v1 install
+
+GeoGenius remains at public schema version 1, but a database installed from an earlier
+pre-release v1 contract may not have the reviewed batch-boundary, publication-locking, or
+type-scoped geometry contract. Version alone cannot distinguish that database from a fresh
+revised v1 install. `geo_genius_contract` therefore records a SHA-256 identity derived from
+the canonical list of required SQL signatures and capabilities. Inspect it without changing
+the database:
+
+```elixir
+GeoGenius.Migration.contract_status(MyApp.Repo, "geo_genius")
+```
+
+An historical install reports `:legacy_unmarked`; the reviewed pre-type-scoped v1 contract
+reports `:reviewed_v01`; an unknown partial modification reports `:drifted`; a fresh or
+reconciled install reports `:compatible`. For each supported frozen shape, the comparison
+includes the affected functions' exact arguments and return, body, language, volatility,
+security mode, strictness, parallel/leakproof flags, and pinned settings such as
+`search_path`; an extra same-name overload is drift too. Render a literal, transactional SQL
+edge for a SQL-first host:
+
+```console
+mix geo_genius.reconciliation_sql \
+  --prefix geo_genius \
+  --from legacy_v01_aebc28a \
+  --to sha256:0bb7f017525771075a7cb4dfed5568d1b14edb261e8fadbb82d14acbfba53fb1 \
+  > priv/repo/reconciliation/geo_genius_v1.sql
+```
+
+An Ecto host pins the same literal identities in its own reversible migration:
+
+```elixir
+defmodule MyApp.Repo.Migrations.ReconcileGeoGeniusV1 do
+  use Ecto.Migration
+
+  @legacy :legacy_v01_aebc28a
+  @target "sha256:0bb7f017525771075a7cb4dfed5568d1b14edb261e8fadbb82d14acbfba53fb1"
+
+  def up do
+    GeoGenius.Migration.reconcile(prefix: "geo_genius", from: @legacy, to: @target)
+  end
+
+  def down do
+    GeoGenius.Migration.reconcile(prefix: "geo_genius", from: @target, to: @legacy)
+  end
+end
+```
+
+Do not call `current_contract_revision/0` from a durable migration: pinning the literal target
+prevents a later package update from changing what that committed migration means. Reconciliation
+takes a prefix-scoped transaction lock, accepts only supported pinned edges among
+`legacy_v01_aebc28a`, the reviewed pre-type-scoped v1 revision
+`sha256:8c5adea2c1fab08fdbc67137ff99ea0864c69a3dff5a3952dd9d6e62d971ab25`, and the current
+revision, preserves catalog rows, verifies the result, and stamps the marker last. Reverse edges
+drop only the metadata introduced after the requested target contract; area and release rows
+remain. Unknown drift is rejected before writes and requires inspection; GeoGenius never
+reconciles automatically at boot or from ordinary catalog operations. The Ecto API also refuses
+calls outside an active Ecto migration transaction: leave Ecto's default DDL transaction enabled
+and do not set
+`@disable_ddl_transaction true`, or the advisory lock could not cover the complete operation.
+
+## Hosts that keep migrations as SQL
+
+A host that uses Hasura, Flyway, or another SQL-first migration system can render the exact
+GeoGenius transition it intends to apply without starting a Repo or issuing any database query:
+
+```console
+mix geo_genius.migration_sql --prefix geo_genius --from 0 --to 1 > priv/hasura/migrations/20260831_install_geo_genius/up.sql
+```
+
+`--prefix`, `--from`, and `--to` are all required. The task writes only SQL to standard output,
+so redirect it into the migration file that the host's own migration tool will apply. This
+pre-release package renders the consolidated v1 install (`0` to `1`) and uninstall (`1` to `0`).
+The renderer validates that both versions are in the package's supported range, preserves the
+shipped version-file order, substitutes the escaped PostgreSQL identifier for `$SCHEMA$`, removes
+the internal statement separators, and emits the same version-view comment that the Ecto
+migration path records. It neither starts a Repo nor executes the rendered SQL.
+
+Commit the rendered SQL file with the host migration. Treat it as immutable deployment input:
+a later GeoGenius package upgrade can add newer version files, but it must not rewrite what a
+previously committed host migration installs or rolls back. Review the generated diff before
+commit, particularly when using a prefix that PostgreSQL needs to quote.
 
 ## Testing with `Ecto.Adapters.SQL.Sandbox`
 
@@ -360,17 +446,10 @@ the test ends.
 
 ## Upgrades
 
-When a later GeoGenius release ships an adjacent schema version, generate and review its own
-pinned wrapper the same way, then migrate normally:
-
-```console
-mix geo_genius.gen.migration --repo MyApp.Repo --prefix geo_genius --from 1 --to 2
-mix ecto.migrate
-```
-
-Only one adjacent transition (`to = from + 1`) is accepted per invocation; there is no
-multi-version jump. Back up the database before running an upgrade migration, the same as
-before any other schema change.
+When a later GeoGenius release ships an adjacent schema version, follow that release's migration
+notes to generate and review its own pinned wrapper, then migrate normally. Only one adjacent
+transition (`to = from + 1`) is accepted per invocation; there is no multi-version jump. Back up
+the database before running an upgrade migration, the same as before any other schema change.
 
 ## The down migration drops the schema, and that is deliberate
 

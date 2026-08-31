@@ -13,19 +13,20 @@ defmodule GeoGenius.Providers.Shapefile do
        more than one is an error naming both, because picking one silently
        would publish half a dataset.
     3. Converts it with the configured `GeoGenius.Command` adapter:
-       `ogr2ogr -f GeoJSON -t_srs EPSG:4326 <out.json> <in.shp>`. The
+       `ogr2ogr -f GeoJSONSeq -t_srs EPSG:4326 -lco RS=NO <out.geojsonl>
+       <in.shp>`. The
        `-t_srs` flag is not optional: a shapefile in a projected coordinate
        system would otherwise stage coordinates in metres that PostGIS
        accepts as degrees -- geometry that is silently, plausibly wrong
        rather than obviously broken.
-    4. Delegates the parse of the converted document to
-       `GeoGenius.Providers.GeoJSON.stage/5`.
+    4. Delegates the parse of the converted sequence to
+       `GeoGenius.Providers.GeoJSONSequence.stage/5`.
 
   `normalize/2`, `required_options/0`, `artifacts/1`,
   `relations/1`, and `asserted_relations/2` all delegate to
-  `GeoGenius.Providers.GeoJSON` unchanged: a converted shapefile is a GeoJSON
-  `FeatureCollection` by the time anything downstream of `ogr2ogr` sees it,
-  so the manifest options a release names are the same ones
+  `GeoGenius.Providers.GeoJSON` unchanged: a converted shapefile is a sequence
+  of GeoJSON `Feature` records by the time anything downstream of `ogr2ogr`
+  sees it, so the manifest options a release names are the same ones
   `GeoGenius.Providers.GeoJSON` reads.
 
   This is the only shipped provider that needs GDAL installed -- a host
@@ -64,13 +65,10 @@ defmodule GeoGenius.Providers.Shapefile do
   fail loudly with a named error rather than silently choosing wrong, so
   this is a limit to know about, not a defect to route around silently.
 
-  **Known limit.** `-f GeoJSON` produces one document that
-  `GeoGenius.Providers.GeoJSON.stage/5` reads whole, so peak memory during a
-  shapefile release scales with the size of the converted dataset. The
-  streaming alternative is `ogr2ogr -f GeoJSONSeq`, which emits one feature
-  per line, paired with a line-oriented reader instead of
-  `GeoGenius.Providers.GeoJSON.stage/5`. That reader is not built here
-  because no shipped manifest needs it yet.
+  **Streaming conversion.** `-f GeoJSONSeq -lco RS=NO` writes one Feature per
+  newline. `GeoGenius.Providers.GeoJSONSequence.stage/5` reads and emits the
+  resulting sequence in bounded batches, so this provider never retains the
+  converted dataset as a whole document.
   """
 
   @behaviour GeoGenius.Provider
@@ -79,9 +77,10 @@ defmodule GeoGenius.Providers.Shapefile do
   alias GeoGenius.Provider
   alias GeoGenius.Provider.Area
   alias GeoGenius.Providers.GeoJSON
+  alias GeoGenius.Providers.GeoJSONSequence
   alias GeoGenius.Staging
 
-  @converted_filename "converted.json"
+  @converted_filename "converted.geojsonl"
 
   @impl Provider
   @doc "Delegates to `GeoGenius.Providers.GeoJSON.required_options/0`: the manifest options a shapefile release names are read from the converted GeoJSON document."
@@ -101,8 +100,8 @@ defmodule GeoGenius.Providers.Shapefile do
   @impl Provider
   @doc """
   Unzips `path` into a private subdirectory of `opts[:work_dir]`, converts
-  its single `.shp` member to GeoJSON with `ogr2ogr`, and delegates the
-  parse to `GeoGenius.Providers.GeoJSON.stage/5`.
+  its single `.shp` member to GeoJSON Sequence with `ogr2ogr`, and delegates
+  the parse to `GeoGenius.Providers.GeoJSONSequence.stage/5`.
 
   The subdirectory this call creates is removed once the call returns,
   whether it succeeds or fails; `opts[:work_dir]` itself, and anything else
@@ -155,7 +154,7 @@ defmodule GeoGenius.Providers.Shapefile do
          {:ok, members} <- unzip(path, extract_dir),
          {:ok, shp_path} <- find_shp_member(members, path),
          {:ok, converted_path} <- convert(command, extract_dir, shp_path, opts) do
-      GeoJSON.stage(manifest, artifact, converted_path, emit, opts)
+      GeoJSONSequence.stage(manifest, artifact, converted_path, emit, opts)
     end
   end
 
@@ -205,7 +204,7 @@ defmodule GeoGenius.Providers.Shapefile do
 
   defp convert(command, extract_dir, shp_path, opts) do
     out_path = Path.join(extract_dir, @converted_filename)
-    args = ["-f", "GeoJSON", "-t_srs", "EPSG:4326", out_path, shp_path]
+    args = ["-f", "GeoJSONSeq", "-t_srs", "EPSG:4326", "-lco", "RS=NO", out_path, shp_path]
 
     case command.run("ogr2ogr", args, opts) do
       {:ok, _output} ->

@@ -7,7 +7,7 @@ BEGIN;
 -- search_areas, children_of, ancestors_of, verify_release, and
 -- publish_release, plus the two new write functions this task adds.
 
-SELECT plan(20);
+SELECT plan(22);
 
 SELECT geo_genius.upsert_collection('directory', 'Directory', NULL, false);
 SELECT geo_genius.upsert_authority('directory', 'dir_auth', 'Directory Authority');
@@ -266,6 +266,72 @@ SELECT throws_ok(
   '23514',
   NULL,
   'publishing an ungeometried release in a requires_geometry collection is refused'
+);
+
+-- 11. a metadata collection can require geometry only for selected area
+-- types. The metadata record stays ungeometried while verification fails for
+-- the required bounded zone only, then passes after its boundary is present.
+SELECT geo_genius.upsert_collection('typed_catalog', 'Typed Catalog', NULL, false);
+SELECT geo_genius.upsert_authority('typed_catalog', 'typed_auth', 'Typed Authority');
+SELECT geo_genius.upsert_area_type('typed_catalog', 'bounded_zone', 10, true);
+SELECT geo_genius.upsert_area_type('typed_catalog', 'metadata_record', 20, false);
+SELECT geo_genius.upsert_area('typed_catalog', 'typed_auth', 'bounded_zone', 'BZ1');
+SELECT geo_genius.upsert_area('typed_catalog', 'typed_auth', 'metadata_record', 'R1');
+
+INSERT INTO geo_genius.release (collection_id, release_key, manifest)
+SELECT id, 'typed1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'typed_catalog';
+SELECT geo_genius.create_release_partitions(
+  (SELECT id FROM geo_genius.release WHERE release_key = 'typed1'));
+
+SELECT geo_genius.put_area_in_release(
+  (SELECT id FROM geo_genius.release WHERE release_key = 'typed1'),
+  'typed_auth:bounded_zone:BZ1',
+  NULL,
+  '{}'::jsonb
+);
+SELECT geo_genius.put_area_in_release(
+  (SELECT id FROM geo_genius.release WHERE release_key = 'typed1'),
+  'typed_auth:metadata_record:R1',
+  NULL,
+  '{}'::jsonb
+);
+
+INSERT INTO geo_genius.source (collection_id, source_key, provider, license)
+SELECT id, 'typed_catalog:src', 'fixture', 'test'
+  FROM geo_genius.collection WHERE key = 'typed_catalog';
+INSERT INTO geo_genius.source_release (source_id, release_key)
+SELECT id, 'v1' FROM geo_genius.source WHERE source_key = 'typed_catalog:src';
+INSERT INTO geo_genius.release_source (release_id, source_release_id)
+SELECT r.id, sr.id
+  FROM geo_genius.release r
+  JOIN geo_genius.source_release sr ON sr.release_key = 'v1'
+  JOIN geo_genius.source s ON s.id = sr.source_id
+ WHERE r.release_key = 'typed1'
+   AND s.source_key = 'typed_catalog:src';
+
+SELECT is(
+  (geo_genius.verify_release(
+    (SELECT id FROM geo_genius.release WHERE release_key = 'typed1')
+  ) -> 'failures'),
+  '["1 areas lack a boundary"]'::jsonb,
+  'verify_release fails only the ungeometried required type'
+);
+
+SELECT geo_genius.put_boundary(
+  (SELECT id FROM geo_genius.release WHERE release_key = 'typed1'),
+  'typed_auth:bounded_zone:BZ1',
+  (SELECT source_release_id
+     FROM geo_genius.release_source
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'typed1')),
+  ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326),
+  0.0
+);
+
+SELECT ok(
+  ((geo_genius.verify_release(
+    (SELECT id FROM geo_genius.release WHERE release_key = 'typed1')
+  )) ->> 'ok')::boolean,
+  'verify_release ignores ungeometried non-required types'
 );
 
 SELECT finish();

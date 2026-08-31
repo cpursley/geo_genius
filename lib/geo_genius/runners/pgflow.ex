@@ -2,40 +2,21 @@ defmodule GeoGenius.Runners.PgFlow do
   @moduledoc """
   Runs an import as a durable PgFlow background job.
 
-  Built against `pgflow` 0.3.1's documented job API -- `use PgFlow.Job`,
-  `@job`, `perform`, and `PgFlow.enqueue/2` -- verified against the
-  installed package, not guessed at. That job definition lives in
-  `GeoGenius.Runners.PgFlow.Job`, a second module in this same file, defined
-  only when `PgFlow.Job` is loaded: a single-step job (`@job queue:
-  :geo_genius_import`) whose `perform :execute` block calls
-  `GeoGenius.Pipeline.execute/3` through `run/1`, `job_context/1`,
-  `job_input_opts/1`, and `job_outcome/2` below.
+  `pgflow` `>= 0.3.4 and < 0.4.0` is an optional dependency. It establishes
+  compile order when a host opts into PgFlow, so `PgFlow.Job` is available
+  before this file conditionally defines `GeoGenius.Runners.PgFlow.Job`.
+  Hosts that do not install PgFlow do not receive it or compile the job.
 
-  **`:pgflow` is not a dependency of this library.** `mix.exs` does not
-  declare it, in either the `optional: true` or the ordinary form: as of
-  0.3.1, `pgflow` does not compile at all unless `phoenix` and
-  `phoenix_live_view` are also present, because ten files under its own
-  `lib/pgflow_dashboard/components/` call `use Phoenix.Component` with no
-  `Code.ensure_loaded?/1` guard, despite `phoenix` and `phoenix_live_view`
-  being declared `optional: true` in `pgflow`'s own `mix.exs`. A host that
-  adds `{:pgflow, "~> 0.3"}` to their own `mix.exs` will hit that exact
-  compile failure themselves unless they also add Phoenix and Phoenix
-  LiveView -- this module does not, and cannot, change that; it is a
-  property of the `pgflow` package a host chooses to install.
+  PgFlow 0.3's dashboard code also compiles against its optional Phoenix,
+  Phoenix LiveView, and LiveFilter packages when those packages are present.
+  GeoGenius declares matching optional edges so its own integration build can
+  exercise the real job module. A host using a PgFlow release that compiles
+  those dashboard modules unconditionally must opt into those packages too;
+  they are not made mandatory by GeoGenius.
 
-  **This backend is therefore not exercised by this library's test suite.**
-  No test in this repository loads `pgflow`, starts a `PgFlow.Supervisor`,
-  or calls `GeoGenius.Runners.PgFlow.Job.run/1`. What the suite does verify
-  is the behaviour a host without `pgflow` actually experiences: `name/0`,
-  `available?/0` reporting `false`, `enqueue/3` returning `{:error, reason}`
-  naming the package rather than raising, and `GeoGenius.Runner.configured/1`
-  skipping past this backend to `Runners.Task` or `Runners.Inline` -- plus
-  `job_outcome/2`, `job_input_opts/1`, and `job_context/1` below, which
-  together cover everything `Job.run/1` does even though `Job.run/1` itself
-  cannot be. A host that installs
-  `pgflow` (and accepts the Phoenix requirement that comes with it) is
-  relying on the job-API contract described here and confirmed once against
-  the real package during development -- not on this repository's CI.
+  The job is a single-step definition (`@job queue: :geo_genius_import`)
+  whose `perform :execute` block calls `GeoGenius.Pipeline.execute/3` through
+  `run/1`, `job_context/1`, `job_input_opts/1`, and `job_outcome/2` below.
 
   `available?/0` reports whether this backend can actually accept work right
   now, and `enqueue/3` says so plainly rather than raising deep inside
@@ -44,15 +25,7 @@ defmodule GeoGenius.Runners.PgFlow do
 
     * `pgflow` itself is loaded;
     * `GeoGenius.Runners.PgFlow.Job` -- this project's own submodule, not
-      `pgflow`'s -- is loaded too. A host normally installs `geo_genius`
-      first and adds `pgflow` to `mix.exs` afterward, and adding a
-      dependency to a host's `mix.exs` does not invalidate `geo_genius`'s
-      already-compiled `_build` artifacts. Without this check,
-      `Code.ensure_loaded?(PgFlow)` could answer `true` (the package is
-      fetched and compiled) while this project's own `Job` submodule --
-      compiled back when `PgFlow.Job` did not yet exist in the build --
-      stays stale and uncompiled, and `enqueue/3` would hand
-      `PgFlow.enqueue/2` a module that is not there;
+      `pgflow`'s -- is loaded too;
     * `PgFlow.Supervisor` -- the process PgFlow's own supervision tree
       registers itself under once `{PgFlow, repo: ..., jobs: [...]}` has
       actually started -- is running.
@@ -76,16 +49,12 @@ defmodule GeoGenius.Runners.PgFlow do
 
   A host that installs `pgflow` wires this up once:
 
-    1. Add `{:pgflow, "~> 0.3"}`, `{:phoenix, "~> 1.7"}`, and
-       `{:phoenix_live_view, "~> 1.0"}` to `mix.exs`, then `mix deps.get`.
-    2. Run `mix deps.compile geo_genius --force` -- the stale-`Job`
-       hazard described above; skip this and `available?/0` may see an
-       uncompiled `Job` and correctly refuse to enqueue, or, on an older
-       build of this file without that check, silently enqueue a module
-       that does not exist.
-    3. Compile the job into the database with `mix pgflow.gen.job_migration
+    1. Add `{:pgflow, "~> 0.3.4"}` to `mix.exs`. For PgFlow releases whose
+       dashboard compiles unconditionally, also add `:phoenix`,
+       `:phoenix_live_view`, and `:livefilter` at PgFlow's supported versions.
+    2. Compile the job into the database with `mix pgflow.gen.job_migration
        GeoGenius.Runners.PgFlow.Job` followed by `mix ecto.migrate`.
-    4. Start `{PgFlow, repo: MyApp.Repo, jobs: [GeoGenius.Runners.PgFlow.Job]}`
+    3. Start `{PgFlow, repo: MyApp.Repo, jobs: [GeoGenius.Runners.PgFlow.Job]}`
        under its own supervision tree.
   """
 
@@ -117,10 +86,9 @@ defmodule GeoGenius.Runners.PgFlow do
   running `PgFlow.Supervisor` are all present right now.
 
   All three are checked live rather than assumed from configuration. A host
-  that installed `pgflow` but never force-recompiled `geo_genius` afterward
-  (`Code.ensure_loaded?(Job)`), or that added the dependency but never
-  started `{PgFlow, repo: ..., jobs: [...]}` (`Process.whereis/1`), gets the
-  same `false` a host that never touched `pgflow` at all gets -- the same
+  that added the dependency but never started
+  `{PgFlow, repo: ..., jobs: [...]}` (`Process.whereis/1`) gets the same
+  `false` a host that never touched `pgflow` at all gets -- the same
   distinction `GeoGenius.Runners.Task` draws between a configured `Task.Supervisor`
   name and one that is dead.
   """
@@ -157,9 +125,8 @@ defmodule GeoGenius.Runners.PgFlow do
   hands back to PgFlow.
 
   Lives here, on the module that always compiles, rather than inside `Job`
-  itself, specifically so it is covered by this repository's own test
-  suite: `Job` never compiles in this repository (`pgflow` is not
-  installed), so nothing here would otherwise notice if
+  itself, so the mapping remains covered even in a no-optional-dependencies
+  build. Otherwise nothing there would notice if
   `GeoGenius.Pipeline.execute/3` gained or renamed a return shape --
   `Job.run/1` would keep its stale clauses, and the first host running this
   backend under real `pgflow` would get a `CaseClauseError` inside a
@@ -239,13 +206,12 @@ defmodule GeoGenius.Runners.PgFlow do
   @doc false
   @spec unavailable_message() :: String.t()
   def unavailable_message do
-    ~s|GeoGenius cannot enqueue through PgFlow: :pgflow is not installed, not fully | <>
-      ~s|compiled for this project, or its supervisor is not running. Add | <>
-      ~s|{:pgflow, "~> 0.3"} to your deps -- along with {:phoenix, "~> 1.7"} and | <>
-      ~s|{:phoenix_live_view, "~> 1.0"}, both required for pgflow 0.3 to compile at | <>
-      ~s|all -- run `mix deps.get`, then `mix deps.compile geo_genius --force` (adding | <>
-      ~s|a dependency to your own mix.exs does not recompile geo_genius's already-built | <>
-      ~s|artifacts). Compile the job with `mix pgflow.gen.job_migration | <>
+    ~s|GeoGenius cannot enqueue through PgFlow: :pgflow or this integration is not | <>
+      ~s|compiled, or its supervisor is not running. Add {:pgflow, "~> 0.3.4"} to your | <>
+      ~s|deps. If that PgFlow release compiles its dashboard unconditionally, also add | <>
+      ~s|{:phoenix, "~> 1.7"}, {:phoenix_live_view, "~> 1.0"}, and | <>
+      ~s|{:livefilter, "~> 0.2"}, then run `mix deps.get`. Compile the job with | <>
+      ~s|`mix pgflow.gen.job_migration | <>
       ~s|GeoGenius.Runners.PgFlow.Job` and `mix ecto.migrate`, then start {PgFlow, repo: | <>
       ~s|MyApp.Repo, jobs: [GeoGenius.Runners.PgFlow.Job]} under your own supervision | <>
       ~s|tree, or configure a different GeoGenius.Runner.|
@@ -290,7 +256,7 @@ if Code.ensure_loaded?(PgFlow.Job) do
     the context it rebuilds all live on `GeoGenius.Runners.PgFlow` --
     `job_outcome/2`, `job_input_opts/1`, and `job_context/1` -- instead of
     here, because that module compiles (and is tested) in every build of
-    this library, while this one compiles in none of them.
+    this library, while this one exists only when the optional integration is present.
     """
 
     use PgFlow.Job
@@ -310,8 +276,7 @@ if Code.ensure_loaded?(PgFlow.Job) do
     Rebuilds the context and the `Pipeline.execute/3` opts through
     `GeoGenius.Runners.PgFlow.job_context/1` and `.job_input_opts/1`, then
     hands the result to `GeoGenius.Runners.PgFlow.job_outcome/2` -- all
-    three the only parts of this behaviour ever covered by a test, since
-    they live on the module that compiles unconditionally.
+    three to logic that remains covered in both integration and no-optional-dependencies builds.
     """
     @spec run(map()) :: %{String.t() => String.t()}
     def run(input) do

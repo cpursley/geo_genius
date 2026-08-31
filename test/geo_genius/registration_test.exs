@@ -41,6 +41,18 @@ defmodule GeoGenius.RegistrationTest do
       assert %{"members" => [], "required" => true} = artifact_metadata(collection)
     end
 
+    test "persists each area type's geometry requirement",
+         %{context: context, collection: collection} do
+      manifest = manifest!(collection)
+
+      Registration.register(context, manifest)
+
+      assert area_type_geometry_flags(collection) == [
+               {"bounded_zone", true},
+               {"metadata_record", false}
+             ]
+    end
+
     test "returns the id of the release it opened",
          %{context: context, collection: collection} do
       manifest = manifest!(collection)
@@ -78,7 +90,10 @@ defmodule GeoGenius.RegistrationTest do
           %{"key" => "census", "name" => "US Census Bureau"},
           %{"key" => "usps", "name" => "US Postal Service"}
         ],
-        "area_types" => [%{"key" => "territory", "rank" => 100}],
+        "area_types" => [
+          %{"key" => "bounded_zone", "rank" => 100, "requires_geometry" => true},
+          %{"key" => "metadata_record", "rank" => 200}
+        ],
         "sources" => [
           %{
             "source_key" => "#{collection}:territories",
@@ -102,7 +117,7 @@ defmodule GeoGenius.RegistrationTest do
         "options" => %{
           "code_property" => "territory_id",
           "name_property" => "territory_name",
-          "area_type" => "territory"
+          "area_type" => "metadata_record"
         }
       })
 
@@ -140,6 +155,22 @@ defmodule GeoGenius.RegistrationTest do
       )
 
     metadata
+  end
+
+  defp area_type_geometry_flags(collection) do
+    %{rows: rows} =
+      TestRepo.query!(
+        """
+        SELECT area_type.key, area_type.requires_geometry
+          FROM geo_genius.area_type
+          JOIN geo_genius.collection ON collection.id = area_type.collection_id
+         WHERE collection.key = $1
+         ORDER BY area_type.key
+        """,
+        [collection]
+      )
+
+    Enum.map(rows, fn [key, requires_geometry] -> {key, requires_geometry} end)
   end
 
   defp sole_release_id(collection) do

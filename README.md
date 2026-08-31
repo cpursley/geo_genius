@@ -91,7 +91,9 @@ prefers raw SQL can still call every function and view below through its own Rep
 
 - Elixir 1.17+
 - PostgreSQL with the `postgis` and `pg_trgm` extensions, and an Ecto Repo (Ecto SQL +
-  Postgrex)
+  Postgrex `>= 0.20.0 and < 0.23.0`)
+- GDAL's `ogr2ogr` binary when using the shapefile provider; GeoJSON and CSV ingestion do
+  not require it
 
 ## Installation
 
@@ -144,12 +146,14 @@ migration itself. Commit the wrapper so a later package upgrade cannot silently 
 already-deployed migration. Later upgrades use
 `mix geo_genius.gen.migration --from N --to N+1`. See
 [`guides/installation.md`](guides/installation.md) for prefixes, the pinned wrapper,
-upgrades, the destructive down migration, and uninstalling.
+SQL-first rendering, historical pre-release v1 reconciliation, the destructive down migration,
+and uninstalling. GeoGenius never installs or reconciles a host schema automatically.
 
 > **Startup verification.** Place `{GeoGenius.Preflight, repo: MyApp.Repo, prefix: "geo_genius"}`
 > in the supervision tree right after the Repo to fail host startup, with a clear message,
-> when the required extensions or the expected schema version are missing — rather than
-> deferring that failure to the first query that touches GeoGenius.
+> when the required extensions, schema version, or content-addressed schema contract do not
+> match — rather than deferring that failure to the first query that touches GeoGenius. Historical
+> pre-release v1 reconciliation is documented in [`guides/installation.md`](guides/installation.md#reconciling-an-historical-pre-release-v1-install).
 
 ## Usage
 
@@ -379,6 +383,9 @@ SELECT geo_genius.put_boundary(release_id, area_key, source_release_id, geom);
 -- is its plural form called with one-element arrays.
 SELECT geo_genius.upsert_area_many(collection_key, authority_keys, area_type_keys, codes);
 SELECT geo_genius.put_area_in_release_many(release_id, area_keys, centroids, data);
+SELECT geo_genius.put_boundaries(
+  release_id, area_keys, source_release_ids, geometries, display_tiers, source_properties
+);
 
 -- Lifecycle
 SELECT geo_genius.verify_release(release_id);
@@ -424,6 +431,8 @@ without polling.
 |----------------------------------|------------------------------------------------------------------------------|
 | `mix geo_genius.setup`           | Generate the initial pinned host migration                                   |
 | `mix geo_genius.gen.migration`   | Generate one adjacent version-upgrade wrapper                                |
+| `mix geo_genius.migration_sql`   | Render a pinned SQL transition for a host-owned migration                    |
+| `mix geo_genius.reconciliation_sql` | Render a pinned reversible v1 contract reconciliation                    |
 | `mix geo_genius.check_schema`    | Verify the installed schema version (CI/deploy gate)                         |
 | `mix geo_genius.uninstall`       | Print the `DROP SCHEMA` statement for a prefix; pass `--yes` to execute it   |
 | `mix geo_genius.import`          | Register a release from its manifest and enqueue its import                  |

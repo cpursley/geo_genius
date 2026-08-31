@@ -113,7 +113,8 @@ defmodule GeoGenius.OperationalTasksTest do
         )
       end)
 
-    assert GeoGenius.Migration.installed_version(TestRepo, @alt_prefix) == 1
+    assert GeoGenius.Migration.installed_version(TestRepo, @alt_prefix) ==
+             GeoGenius.Migration.current_version()
 
     on_exit(fn -> TestRepo.query!(~s(DROP SCHEMA IF EXISTS "#{@alt_prefix}" CASCADE)) end)
 

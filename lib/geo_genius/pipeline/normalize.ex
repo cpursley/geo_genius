@@ -27,10 +27,10 @@ defmodule GeoGenius.Pipeline.Normalize do
   `*_many` counterparts of the scalar catalog writes. A source that
   denormalises a hierarchy describes the same county in every city row of it,
   so a batch names far fewer distinct areas than it has rows, and one statement
-  per area would spend a round trip on every repeat. Boundaries stay one call per
-  boundary: `GeoGenius.Catalog.put_boundary/4` validates and repairs a
-  geometry, replaces the area's boundary and its subdivided parts, and
-  recomputes the centroid from what it stored.
+  per area would spend a round trip on every repeat. Boundaries use one plural
+  write for the page as well: `GeoGenius.Catalog.put_boundaries/3` validates
+  and repairs the geometries, replaces the areas' boundaries and subdivided
+  parts, and recomputes their centroids from what it stored.
 
   Collecting the whole page before writing any of it also means a provider's
   own errors -- an illegal name kind, an unstaged artifact -- are found before
@@ -190,7 +190,7 @@ defmodule GeoGenius.Pipeline.Normalize do
   defp count_area(counts, %Area{}), do: counts |> bump("areas") |> bump("boundaries")
 
   # The order the catalog needs: an area exists before its names, codes and
-  # membership name it, and `put_boundary/4` recomputes the centroid
+  # membership name it, and `put_boundaries/3` recomputes the centroid
   # `put_area_in_release_many/3` has just written, so boundaries come last.
   defp write_batch(collected, state) do
     Catalog.upsert_area_many(
@@ -208,7 +208,11 @@ defmodule GeoGenius.Pipeline.Normalize do
       Enum.map(collected, &membership_attrs/1)
     )
 
-    Enum.each(collected, &put_boundary(state, &1))
+    Catalog.put_boundaries(
+      state.context,
+      state.run.release_id,
+      Enum.flat_map(collected, &boundary_attrs/1)
+    )
   end
 
   defp area_attrs({_area_key, %Area{} = area, _source_release_id}) do
@@ -240,13 +244,16 @@ defmodule GeoGenius.Pipeline.Normalize do
     %{area_key: area_key, centroid: area.centroid, attributes: area.attributes}
   end
 
-  defp put_boundary(_state, {_area_key, %Area{geometry: nil}, _source_release_id}), do: :ok
+  defp boundary_attrs({_area_key, %Area{geometry: nil}, _source_release_id}), do: []
 
-  defp put_boundary(state, {area_key, %Area{} = area, source_release_id}) do
-    Catalog.put_boundary(state.context, state.run.release_id, area_key, %{
-      source_release_id: source_release_id,
-      geometry: area.geometry
-    })
+  defp boundary_attrs({area_key, %Area{} = area, source_release_id}) do
+    [
+      %{
+        area_key: area_key,
+        source_release_id: source_release_id,
+        geometry: area.geometry
+      }
+    ]
   end
 
   defp bump(counts, key), do: Map.update!(counts, key, &(&1 + 1))

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Installation
+
+- **Postgrex `>= 0.20.0 and < 0.23.0` is supported.** This includes hosts locked to
+  Postgrex 0.20 as well as the package's Postgrex 0.22 development baseline.
+- **`GeoGenius.Migration.render_sql/1` and `mix geo_genius.migration_sql` render a
+  deterministic schema transition without starting a Repo or executing SQL.** The task
+  requires `--prefix`, `--from`, and `--to`, writes only the rendered SQL to standard
+  output, substitutes the quoted host-selected schema, and renders the consolidated v1 install
+  or uninstall. GeoGenius still never migrates a host automatically; the host commits and applies
+  the rendered SQL or generated Ecto wrapper itself.
+- **Historical pre-release v1 installs have an explicit reconciliation path.**
+  `GeoGenius.Migration.contract_status/2` distinguishes the frozen `legacy_v01_aebc28a`
+  shape, the current content-addressed contract, and unknown drift;
+  `render_reconciliation_sql/1`, `reconcile/1`, and
+  `mix geo_genius.reconciliation_sql` produce or apply only a literal reversible edge.
+  Reconciliation is host-owned and transactional and never runs from Preflight, startup, or a
+  catalog call.
+- **PgFlow `>= 0.3.4 and < 0.4.0` is an optional integration dependency.** This establishes
+  dependency compile order whenever a host opts into PgFlow, so
+  `GeoGenius.Runners.PgFlow.Job` is compiled after `PgFlow.Job`; hosts without PgFlow still
+  compile without any optional dependencies.
+
 ### Reading
 
 - **`:limit` accepts `nil` to mean no cap** on `GeoGenius.areas_near/4`,
@@ -124,6 +146,11 @@
 
 ### Providers
 
+- **Shapefile staging now streams a GeoJSON Feature sequence in bounded batches.** The
+  provider runs GDAL's `ogr2ogr -f GeoJSONSeq -t_srs EPSG:4326 -lco RS=NO`, then decodes
+  one newline-delimited feature at a time instead of loading a converted FeatureCollection
+  into memory. Plain LF-delimited and RFC 8142 record-separator sequences are accepted;
+  the shapefile provider requires an installed `ogr2ogr` binary.
 - **`implied_areas`, a manifest option on both generic providers,** lets a source row
   describe parent areas it names only by code in other columns, and asserts an edge from
   each of them to the row's own area. A source that carries a grouping code on every
@@ -179,22 +206,23 @@
   on it registered no area types at all. **An out-of-tree provider should delete its
   `area_types/0` implementation**, whose `@impl` now warns that the behaviour specifies no
   such callback, and any manifest that leaned on the fallback must declare its
-  `area_types` itself. `GeoGenius.Provider.no_area_types/0`, the shared body the shipped
-  providers delegated to, is removed with it.
+  `area_types` itself. The shared `no_area_types/0` body the shipped providers delegated
+  to is removed with it.
 
 ### Ingestion
 
-- **Five set writes: `upsert_area_many`, `put_area_name_many`, `put_area_code_many`,
-  `put_area_in_release_many`, and `put_relation_many`,** each taking one array per column
+- **Six set writes: `upsert_area_many`, `put_area_name_many`, `put_area_code_many`,
+  `put_area_in_release_many`, `put_relation_many`, and `put_boundaries`,** each taking one array per column
   and pairing them by position, with `GeoGenius.Catalog` wrappers of the same names taking
-  a list of maps. Each scalar write is now that plural form called with one-element
-  arrays, so there is one implementation of what a write means. `put_boundary` has no
-  plural form: it validates and repairs a geometry, replaces the area's boundary and its
-  subdivided parts, and recomputes the centroid, and the dataset that motivated this work
-  carries no boundaries at all.
+  a list of maps. The consolidated schema v1 includes the plural boundary write: it validates
+  and repairs each geometry, replaces each area's boundary and subdivided parts, and recomputes
+  its centroid in one round trip per batch. `put_boundary` remains compatible; zero tolerance
+  uses the plural path with one element, while nonzero display simplification retains the
+  singular SQL implementation.
 - **The normalizing and relating phases write a page as a set.** Normalizing collects a
   page of staged rows, then issues one statement for its areas, one for its names, one for
-  its codes and one for its memberships; relating issues one for a page's asserted edges.
+  its codes, one for its memberships, and one for its boundaries; relating issues one for
+  a page's asserted edges.
   Measured on the US SimpleMaps import (150,622 staged rows, 153,917 areas, 466,262 area
   writes, 330,297 asserted edges), against the same data on the same machine:
 
@@ -248,8 +276,9 @@
   import measured at ~17 minutes (1015 seconds), so any caller awaiting one with no explicit
   `timeout` failed on the default alone. The set writes above have since brought that same
   import under two minutes, but the default stays where it is: a boundary-carrying
-  collection still writes one `put_boundary` per area, which is the shape the thirty
-  minutes are for. Resolution order is now the `timeout` argument, then
+  collection still spends significant time repairing, subdividing, and indexing geometry even
+  though boundaries are written once per batch, which is the shape the thirty minutes are for.
+  Resolution order is now the `timeout` argument, then
   `config :geo_genius, :await_timeout`, then the 1,800,000ms library default, via the new
   `await_timeout/1` resolver in the library's internal config module -- the same
   per-call-opts-then-app-env-then-default pattern `manifest_paths/1` and the adapter

@@ -68,9 +68,14 @@ what the collection row carries; leaving `collection_name` out names the collect
 its key.
 
 `provider` must resolve through the registry described under
-[Providers](#providers). `requires_geometry` is a promise about the collection, checked
-at publication time: with it set, `verify_release` refuses a release in which any area
-lacks a boundary. `authorities` names who is responsible for the identifiers; an
+[Providers](#providers). Collection-level `requires_geometry` is a promise about the
+whole collection, checked at publication time: with it set, `verify_release` refuses a
+release in which any area lacks a boundary. An `area_types` entry may also carry
+`"requires_geometry": true`; that leaves the collection usable for metadata-only types
+while requiring boundaries for areas of the marked type. Omitted area-type flags default
+to false, and an explicit false is preserved when the manifest is stored on the release
+row. A collection-level true still requires boundaries for every area, regardless of its
+type. `authorities` names who is responsible for the identifiers; an
 authority key is the first segment of every `area_key` keyed under it, so `demo` above
 yields `demo:territory:west`. It is a list because a collection may draw on more than
 one: a US release keyed partly by the Census, partly by the USPS, and partly by its own
@@ -83,8 +88,15 @@ the collection does not carry is refused.
 types registers none, and a release that normalizes an area whose type it never declared
 fails. Nothing else supplies either. A manifest with no authorities can therefore
 register no area at all, and rejecting it at load names the field rather than failing
-partway through normalization. `area_types` declares
-the ranked types this collection uses, low rank containing high.
+partway through normalization. `area_types` declares the ranked types this collection
+uses, low rank containing high:
+
+```json
+[
+  { "key": "bounded_zone", "rank": 10, "requires_geometry": true },
+  { "key": "metadata_record", "rank": 20 }
+]
+```
 
 `GeoGenius.Providers.GeoJSON` and `GeoGenius.Providers.CSV` key every area they emit
 under one authority, which they take from `options["authority"]` or, when that is
@@ -166,9 +178,15 @@ A provider adapts one source format. It is called for parsing and never for a wr
 every write the import makes is the pipeline's, through `GeoGenius.Catalog`. Four
 providers ship: `GeoGenius.Providers.GeoJSON` (`"geojson"`), `GeoGenius.Providers.CSV`
 (`"csv"`), `GeoGenius.Providers.Shapefile` (`"shapefile"`), which converts its archive
-with `ogr2ogr` before parsing the result as GeoJSON, and
+with `ogr2ogr -f GeoJSONSeq -t_srs EPSG:4326 -lco RS=NO` before streaming the resulting
+GeoJSON Feature sequence in bounded batches, and
 `GeoGenius.Providers.SimpleMaps` (`"simplemaps"`), which has a section of its own
 [below](#the-simplemaps-provider).
+
+Shapefile staging is the only shipped provider that requires GDAL's `ogr2ogr` binary.
+The conversion explicitly reprojects to EPSG:4326 and writes one Feature per line; the
+sequence reader decodes and emits each configured batch before reading further, so neither
+the converted artifact nor all of its staged rows are retained in memory.
 
 `GeoGenius.Provider` declares six callbacks every provider implements, and one optional
 seventh.
@@ -514,8 +532,9 @@ available one wins, in this order: `Runners.PgFlow`, then `Runners.Task`, then
 `Runners.Inline`.
 
 `GeoGenius.Runners.PgFlow` therefore takes precedence if you have installed `pgflow`
-yourself, which is worth knowing before you install it for something else. This library
-does not declare `pgflow`, so for every host that has not gone looking for it the first
+yourself, which is worth knowing before you install it for something else. GeoGenius declares
+`pgflow >= 0.3.4 and < 0.4.0` as an optional dependency: that establishes compile order when
+a host opts in, without installing PgFlow for hosts that do not. For those hosts the first
 available backend is `Runners.Task`.
 
 `GeoGenius.Runners.Task` is what a host gets with no configuration and no pgflow. It runs
@@ -555,12 +574,13 @@ where the resolution above ends up when neither other backend can accept work, w
 a national vintage means blocking the caller for hours.
 
 More on `GeoGenius.Runners.PgFlow`: it runs the import as a durable PgFlow job.
-**This library does not declare `pgflow`**, in either the ordinary or the optional form,
-because as of 0.3.1 it does not compile unless `phoenix` and `phoenix_live_view` are also
-present. If you add it, this backend reports itself available once `pgflow` is loaded,
-this library's own job submodule is compiled, and `PgFlow.Supervisor` is running; short of
-that it returns an error naming what is missing rather than raising deep inside
-`PgFlow.enqueue/2`, and the resolution falls through to `Runners.Task`.
+The optional dependency edge ensures this library's job submodule compiles after `PgFlow.Job`
+when the host adds PgFlow directly. PgFlow 0.3 releases may also compile dashboard modules
+against their optional `phoenix`, `phoenix_live_view`, and `livefilter` packages; a host using
+that dashboard opts into those dependencies too. This backend reports itself available once
+`pgflow` and the job submodule are loaded and `PgFlow.Supervisor` is running; short of that it
+returns an error naming what is missing rather than raising deep inside `PgFlow.enqueue/2`, and
+the resolution falls through to `Runners.Task`.
 
 Pin a backend for every import or for one call:
 
@@ -600,7 +620,7 @@ on each, and writes the areas, names, codes, membership, and boundaries through
 
 A batch is collected in full and then written as a set: one statement for its areas, one
 for its names, one for its codes, one for its memberships, through the
-[set writes](sql_api.md#set-writes). Boundaries are still one statement each. A source that
+[set writes](sql_api.md#set-writes), and one for all its boundaries. A source that
 denormalises a hierarchy names the same county in every city row of it, so a batch
 describes far fewer distinct areas than it has rows, and one statement per area spends a
 round trip on every repeat. Measured on the US SimpleMaps import -- 150,622 staged rows,
@@ -626,9 +646,9 @@ row.
 query against it.
 
 `verifying` runs `verify_release` and fails the run when the report is not `ok`. This is
-the gate: a release that has no areas, that lacks a boundary somewhere `requires_geometry`
-demands one, that carries a relation or a membership belonging to another collection, or
-that declares no source releases, does not become publishable.
+the gate: a release that has no areas, that lacks a boundary somewhere the collection or
+area type requires one, that carries a relation or a membership belonging to another
+collection, or that declares no source releases, does not become publishable.
 
 `verify_release` also reports boundaries with invalid geometry, though nothing an import
 does can produce one: `put_boundary` repairs its input with `ST_MakeValid` before storing
@@ -674,8 +694,8 @@ elapses, returning `{:ok, run}`, `{:error, run}` for a run that finished and fai
 `await/3`'s `timeout` resolves the explicit argument first, then
 `config :geo_genius, :await_timeout`, then a library default of 1,800,000ms (thirty
 minutes). A full US SimpleMaps import, which carries no boundaries, runs in well under two
-minutes; the thirty are sized for a boundary-carrying collection, which still writes one
-`put_boundary` per area. Pass
+minutes; the thirty are sized for a boundary-carrying collection, whose geometry repair,
+subdivision, and indexing can still dominate a national import even with set-based writes. Pass
 `:infinity` at either level for a caller willing to wait as long as it takes:
 
 ```elixir

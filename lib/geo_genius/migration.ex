@@ -11,6 +11,42 @@ defmodule GeoGenius.Migration do
     tracking_object: {:view, "geo_genius_version"},
     versions: [GeoGenius.Migrations.V01]
 
+  @doc "Renders a deterministic SQL transition for hosts that do not run Ecto migrations."
+  @spec render_sql(keyword()) :: String.t()
+  def render_sql(opts) do
+    GeoGenius.MigrationSQL.render!(
+      opts
+      |> Keyword.put_new(:to, current_version())
+    )
+  end
+
+  @doc "Returns the content-addressed identity of the schema contract shipped by this package."
+  @spec current_contract_revision() :: String.t()
+  def current_contract_revision, do: GeoGenius.SchemaContract.revision()
+
+  @doc "Returns the explicit capabilities required by the current schema contract."
+  @spec required_capabilities() :: [String.t()]
+  def required_capabilities, do: GeoGenius.SchemaContract.capabilities()
+
+  @doc "Inspects an installed schema's version, contract marker, signatures, and capabilities."
+  @spec contract_status(module(), String.t()) :: map()
+  def contract_status(repo, prefix), do: GeoGenius.SchemaContract.status(repo, prefix)
+
+  @doc "Renders one explicit, pinned v01 contract reconciliation edge as deterministic SQL."
+  @spec render_reconciliation_sql(keyword()) :: String.t()
+  def render_reconciliation_sql(opts), do: GeoGenius.ReconciliationSQL.render!(opts)
+
+  @doc """
+  Executes one explicit, pinned reconciliation edge inside a host-owned transactional Ecto
+  migration.
+
+  Reconciliation refuses calls outside an active Ecto migration transaction, including migrations
+  that set `@disable_ddl_transaction true`, because every verification, DDL statement, and the
+  prefix-scoped advisory transaction lock must share one database transaction.
+  """
+  @spec reconcile(keyword()) :: :ok
+  def reconcile(opts), do: GeoGenius.Reconciliation.run(opts)
+
   @doc """
   Returns the installed GeoGenius schema version for `prefix`, read directly
   through `repo`.

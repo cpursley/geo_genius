@@ -173,6 +173,58 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     end
   end
 
+  defmodule MixedGeometryProvider do
+    @moduledoc false
+    @behaviour GeoGenius.Provider
+
+    @impl true
+    def required_options, do: []
+    @impl true
+    defdelegate artifacts(manifest), to: GeoGenius.Provider, as: :all_artifacts
+    @impl true
+    def stage(_manifest, _artifact, _path, _emit, _opts), do: :ok
+    @impl true
+    defdelegate relations(manifest), to: GeoGenius.Provider, as: :always_rebuild
+
+    @impl true
+    defdelegate asserted_relations(manifest, row),
+      to: GeoGenius.Provider,
+      as: :no_asserted_relations
+
+    @impl true
+    def normalize(_manifest, %{payload: %{"code" => code, "geometry" => geometry?}}) do
+      geometry =
+        if geometry? do
+          offset = if code == "first", do: 0.0, else: 2.0
+
+          %Geo.Polygon{
+            coordinates: [
+              [
+                {offset, offset},
+                {offset + 1.0, offset},
+                {offset + 1.0, offset + 1.0},
+                {offset, offset + 1.0},
+                {offset, offset}
+              ]
+            ],
+            srid: 4326
+          }
+        end
+
+      {:ok,
+       %Area{
+         authority_key: "demo_auth",
+         area_type_key: "city",
+         code: code,
+         centroid: nil,
+         geometry: geometry,
+         names: [%Name{name: code, kind: :official}],
+         codes: [],
+         attributes: %{}
+       }}
+    end
+  end
+
   test "a row returning two areas writes both and counts both" do
     state =
       normalize_fixture(MultiAreaProvider, @two_level_area_types, [
@@ -256,6 +308,34 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
     refute Map.has_key?(written, "put_area_code_many")
   end
 
+  test "a page writes its geometries in one aligned boundary call" do
+    rows = [
+      %{"code" => "first", "geometry" => true},
+      %{"code" => "without", "geometry" => false},
+      %{"code" => "third", "geometry" => true}
+    ]
+
+    state = normalize_fixture(MixedGeometryProvider, [%{key: "city", rank: 30}], rows)
+    recording = %{state | context: %{state.context | repo: RecordingRepo}}
+
+    assert {:ok, %State{metrics: metrics}} = Normalize.normalize(recording)
+    assert metrics == %{"areas" => 3, "boundaries" => 2, "skipped" => 0}
+
+    boundary_queries =
+      recorded_queries()
+      |> Enum.filter(fn {sql, _params} -> sql =~ ~s|"geo_genius".put_boundaries(| end)
+
+    assert [{_sql, [_release_id, area_keys, source_ids, geometries, tiers, properties]}] =
+             boundary_queries
+
+    assert area_keys == ["demo_auth:city:first", "demo_auth:city:third"]
+    assert length(source_ids) == 2
+    assert length(geometries) == 2
+    assert Enum.map(geometries, &hd(hd(&1.coordinates))) == [{0.0, 0.0}, {2.0, 2.0}]
+    assert tiers == [0, 0]
+    assert properties == [%{}, %{}]
+  end
+
   # Registers a collection carrying `area_types` under a fixed authority key,
   # opens a release, stages `payloads` as rows, and returns the `%State{}` a
   # normalize test drives directly against
@@ -283,6 +363,22 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
         source_date: ~D[2026-01-15]
       })
 
+    Catalog.upsert_source(context, collection, %{
+      source_key: "fixture:source",
+      provider: "fixture",
+      license: "test"
+    })
+
+    source_release_id =
+      Catalog.upsert_source_release(context, collection, %{
+        source_key: "fixture:source",
+        release_key: "v1",
+        source_date: nil,
+        metadata: %{}
+      })
+
+    Catalog.attach_source_release(context, release_id, source_release_id)
+
     run_id =
       Catalog.begin_or_resume_import(context, release_id, %{
         owner: "normalize-fixture",
@@ -306,7 +402,8 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
       timeout: 30_000,
       manifest: nil,
       providers: [provider],
-      artifact_providers: %{"fixture" => provider}
+      artifact_providers: %{"fixture" => provider},
+      sources: %{"fixture" => source_release_id}
     }
   end
 
@@ -330,6 +427,14 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   defp recorded_statements do
     receive do
       {:query, sql, _params, _opts} -> [sql | recorded_statements()]
+    after
+      0 -> []
+    end
+  end
+
+  defp recorded_queries do
+    receive do
+      {:query, sql, params, _opts} -> [{sql, params} | recorded_queries()]
     after
       0 -> []
     end

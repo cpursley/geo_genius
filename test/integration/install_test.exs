@@ -3,8 +3,11 @@ defmodule GeoGenius.InstallIntegrationTest do
 
   @moduletag :integration
 
+  alias EctoEvolver.Adapters.Postgres
   alias GeoGenius.AppEnv
+  alias GeoGenius.Migration
   alias GeoGenius.TestRepo
+  alias GeoGenius.TestSimpleSQL
 
   # Every named function GeoGenius installs, grouped roughly by the layer it
   # serves. A complete install must expose all of them, not merely "some
@@ -14,7 +17,7 @@ defmodule GeoGenius.InstallIntegrationTest do
     drop_release_partitions partition_lock_key classify_relation relation_lock_key
     publication_lock_key
     upsert_collection upsert_authority upsert_area_type upsert_area put_area_name put_area_code
-    put_boundary put_area_in_release put_relation rebuild_relations verify_release
+    put_boundary put_boundaries put_area_in_release put_relation rebuild_relations verify_release
     publish_release rollback_publication retire_releases begin_or_resume_import
     heartbeat_import advance_import fail_import areas_for_point areas_for_geometry
     areas_near areas_by_code search_areas children_of ancestors_of related_areas
@@ -135,6 +138,21 @@ defmodule GeoGenius.InstallIntegrationTest do
     rows |> List.flatten() |> MapSet.new()
   end
 
+  defp function_definition(prefix, name) do
+    %{rows: [[definition]]} =
+      TestRepo.query!(
+        """
+        SELECT pg_get_functiondef(p.oid)
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = $1 AND p.proname = $2
+        """,
+        [prefix, name]
+      )
+
+    definition
+  end
+
   defp type_names(prefix) do
     %{rows: rows} =
       TestRepo.query!(
@@ -178,6 +196,63 @@ defmodule GeoGenius.InstallIntegrationTest do
   defp schema_exists?(prefix) do
     %{rows: rows} = TestRepo.query!("SELECT 1 FROM pg_namespace WHERE nspname = $1", [prefix])
     rows != []
+  end
+
+  # The container pgTAP runner executes this canonical file at the default
+  # prefix. Render its schema positions again here so the rendered-SQL proof
+  # exercises the same seventeen assertions at the unique quoted prefix.
+  defp assert_install_pgtap_contract!(prefix) do
+    tap_lines =
+      TestRepo.transaction(fn ->
+        prefix
+        |> rendered_install_contract()
+        |> contract_statements!()
+        |> Enum.flat_map(&tap_lines_for_statement/1)
+        |> Kernel.++(tap_lines_for_statement("SELECT finish()"))
+      end)
+
+    assert {:ok, lines} = tap_lines
+
+    failures = Enum.filter(lines, &String.starts_with?(&1, "not ok"))
+    assert failures == [], "pgTAP install contract failures:\n#{Enum.join(failures, "\n")}"
+    assert Enum.count(lines, &String.starts_with?(&1, "ok ")) == 21
+  end
+
+  defp rendered_install_contract(prefix) do
+    escaped_prefix = Postgres.escape_identifier(prefix)
+    prefix_literal = Postgres.escape_string(prefix)
+    escaped_prefix_literal = Postgres.escape_string(escaped_prefix)
+
+    Path.expand("../pgtap/schema/test_install.sql", __DIR__)
+    |> File.read!()
+    |> String.replace(
+      "geo_genius.geo_genius_contract",
+      "#{escaped_prefix}.geo_genius_contract"
+    )
+    |> String.replace(
+      "'geo_genius.published_areas'::regclass",
+      "#{Postgres.escape_string("#{escaped_prefix}.published_areas")}::regclass"
+    )
+    |> String.replace(
+      "'geo_genius.release_areas'::regclass",
+      "#{Postgres.escape_string("#{escaped_prefix}.release_areas")}::regclass"
+    )
+    |> String.replace("'geo_genius'::regnamespace", "#{escaped_prefix_literal}::regnamespace")
+    |> String.replace("'geo_genius'", prefix_literal)
+    |> String.replace_prefix("BEGIN;\n\n", "")
+    |> String.replace_suffix("ROLLBACK;\n", "")
+  end
+
+  defp contract_statements!(contract) do
+    case String.split(contract, "SELECT finish();", parts: 2) do
+      [statements, "\n\n"] -> String.split(statements, ~r/(?=^SELECT )/m, trim: true)
+      _ -> raise "unexpected pgTAP install-contract envelope"
+    end
+  end
+
+  defp tap_lines_for_statement(statement) do
+    %{rows: rows} = TestRepo.query!(statement, [], log: false)
+    Enum.map(rows, &List.first/1)
   end
 
   test "installs, reports its version, and uninstalls at the default prefix" do
@@ -294,6 +369,74 @@ defmodule GeoGenius.InstallIntegrationTest do
     for required <- @required_functions do
       assert required in names, "missing function #{required}"
     end
+  end
+
+  test "rendered SQL installs and uninstalls the contract at a quoted prefix" do
+    prefix = "gg-rendered-#{System.unique_integer([:positive])}"
+    escaped_prefix = Postgres.escape_identifier(prefix)
+
+    on_exit(fn ->
+      TestRepo.query!("DROP SCHEMA IF EXISTS #{escaped_prefix} CASCADE", [], log: false)
+    end)
+
+    TestSimpleSQL.query!(
+      TestRepo,
+      Migration.render_sql(prefix: prefix, from: 0, to: Migration.current_version())
+    )
+
+    assert Migration.installed_version(TestRepo, prefix) == Migration.current_version()
+    assert "area" in table_names(prefix)
+    assert "release" in table_names(prefix)
+    assert "publication" in table_names(prefix)
+    assert relkind(prefix, "boundary") == "p"
+    assert "published_areas" in view_names(prefix)
+    assert "geo_genius_contract" in view_names(prefix)
+    assert "area_match" in type_names(prefix)
+    assert "resolve" in function_names(prefix)
+    assert "put_boundaries" in function_names(prefix)
+    assert_install_pgtap_contract!(prefix)
+
+    TestSimpleSQL.query!(
+      TestRepo,
+      Migration.render_sql(prefix: prefix, from: Migration.current_version(), to: 0)
+    )
+
+    refute schema_exists?(prefix), "rendered rollback left the quoted-prefix schema behind"
+  end
+
+  test "rendered SQL installs and uninstalls the consolidated reviewed v01" do
+    prefix = "gg-v01-#{System.unique_integer([:positive])}"
+    escaped_prefix = Postgres.escape_identifier(prefix)
+
+    on_exit(fn ->
+      TestRepo.query!("DROP SCHEMA IF EXISTS #{escaped_prefix} CASCADE", [], log: false)
+    end)
+
+    TestSimpleSQL.query!(TestRepo, Migration.render_sql(prefix: prefix, from: 0, to: 1))
+
+    assert Migration.installed_version(TestRepo, prefix) == 1
+
+    assert %{status: :compatible, compatible?: true} =
+             Migration.contract_status(TestRepo, prefix)
+
+    assert "put_boundary" in function_names(prefix)
+    assert "put_boundaries" in function_names(prefix)
+    publish_definition = function_definition(prefix, "publish_release")
+    boundary_definition = function_definition(prefix, "put_boundary")
+    boundaries_definition = function_definition(prefix, "put_boundaries")
+
+    assert :binary.match(publish_definition, "publication_lock_key") <
+             :binary.match(publish_definition, "verify_release")
+
+    assert boundary_definition =~ "publication_lock_key"
+    assert boundary_definition =~ "source_collection_id"
+    assert boundaries_definition =~ "publication_lock_key"
+    assert boundaries_definition =~ "foreign_source_release_id"
+    assert boundaries_definition =~ "accepted_repaired"
+
+    TestSimpleSQL.query!(TestRepo, Migration.render_sql(prefix: prefix, from: 1, to: 0))
+
+    refute schema_exists?(prefix), "consolidated v01 rollback left its schema behind"
   end
 
   test "uninstall removes every relation, function, type, and the schema itself" do

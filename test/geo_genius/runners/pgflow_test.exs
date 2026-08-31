@@ -1,16 +1,7 @@
 defmodule GeoGenius.Runners.PgFlowTest do
-  # `:pgflow` is not a dependency of this library -- see
-  # `GeoGenius.Runners.PgFlow`'s moduledoc for why: as of 0.3.1, pgflow does
-  # not compile at all without Phoenix and Phoenix LiveView present. Nothing
-  # in this suite can load it, start a `PgFlow.Supervisor`, or exercise
-  # `GeoGenius.Runners.PgFlow.Job` -- that module is defined only when
-  # `PgFlow.Job` loads, and it never does in this repository. What this
-  # suite verifies is exactly what a host without pgflow experiences:
-  # `available?/0` is false, `enqueue/3` returns an error naming the
-  # package rather than raising, the availability chain lands on
-  # `Runners.Task` or `Runners.Inline` instead, and (in `job_outcome/2`,
-  # the one piece of `Job`'s logic that lives on this always-compiled
-  # module instead) every shape `GeoGenius.Pipeline.execute/3` can return.
+  # PgFlow is optional. The ordinary development graph includes it and
+  # compiles the real Job module; the separate no-optional-dependencies gate
+  # proves the always-compiled backend remains warning-free without it.
   use ExUnit.Case, async: false
 
   alias GeoGenius.AppEnv
@@ -46,42 +37,24 @@ defmodule GeoGenius.Runners.PgFlowTest do
     assert Runner.module_for_backend("pgflow") == {:ok, Runners.PgFlow}
   end
 
-  test "PgFlow.Job is not loaded, so GeoGenius.Runners.PgFlow.Job does not exist" do
-    # Pins the actual, current state of this repository: `:pgflow` is not
-    # declared, so neither `PgFlow.Job` nor the `defmodule
-    # GeoGenius.Runners.PgFlow.Job do ... end` guarded behind
-    # `Code.ensure_loaded?(PgFlow.Job)` ever compiles. An implementation
-    # that dropped the guard -- or guarded on the wrong module -- would
-    # either fail to compile this repository at all, or leave this
-    # assertion false.
-    refute Code.ensure_loaded?(PgFlow.Job)
-    refute Code.ensure_loaded?(Runners.PgFlow.Job)
+  test "the optional dependency compiles the GeoGenius PgFlow job after PgFlow.Job" do
+    assert Code.ensure_loaded?(PgFlow.Job)
+    assert Code.ensure_loaded?(Runners.PgFlow.Job)
   end
 
-  test "available?/0 is false with :pgflow not installed" do
-    # `Process.whereis(PgFlow.Supervisor)` returns `nil` regardless of
-    # whether the earlier `Code.ensure_loaded?(PgFlow)` and
-    # `Code.ensure_loaded?(Job)` checks ran at all, so this test cannot
-    # discriminate an implementation that skipped either of them from one
-    # that runs them correctly -- both still answer `false` here. What
-    # this test actually pins is an implementation that answered `true`
-    # unconditionally. The checks' short-circuit ordering and the
-    # supervisor-running branch are not exercised by any test in this
-    # repository, since nothing here can load `pgflow` or start one --
-    # that is the host-only surface this whole module documents.
-    refute Code.ensure_loaded?(PgFlow)
+  test "available?/0 is false until the optional engine's supervisor is running" do
+    assert Code.ensure_loaded?(PgFlow)
+    assert Code.ensure_loaded?(Runners.PgFlow.Job)
+    assert Process.whereis(PgFlow.Supervisor) == nil
     refute Runners.PgFlow.available?()
   end
 
   test "enqueue/3 returns an error naming pgflow rather than raising", %{context: context} do
     {_collection, _release_id, run_id} = ImportFixture.claim_run!(context)
 
-    # A backend that called straight into `PgFlow.enqueue/2` without
-    # checking `available?/0` first would raise `UndefinedFunctionError`
-    # here, since `PgFlow` does not exist anywhere in this build -- exactly
-    # the crash `enqueue/3`'s `if available?() do ... end` guard exists to
-    # turn into a plain, callable error instead. `assert {:error, _} = ...`
-    # only passes if the call returns rather than raising.
+    # A backend that called straight into `PgFlow.enqueue/2` without checking
+    # `available?/0` first would try to submit against an unstarted engine.
+    # The guard turns that into a plain, callable error.
     assert {:error, reason} = Runners.PgFlow.enqueue(context, run_id, %{publish: false})
     assert reason =~ "pgflow"
     assert reason =~ "PgFlow"
@@ -92,7 +65,7 @@ defmodule GeoGenius.Runners.PgFlowTest do
     assert Catalog.import_run(context, run_id).status == "pending"
   end
 
-  test "unavailable_message/0 carries the whole remedy, including the Phoenix requirement" do
+  test "unavailable_message/0 carries the whole optional integration remedy" do
     message = Runners.PgFlow.unavailable_message()
 
     # A host that follows only part of this message -- adds `:pgflow` but
@@ -103,7 +76,8 @@ defmodule GeoGenius.Runners.PgFlowTest do
     assert message =~ ":pgflow"
     assert message =~ ~s({:phoenix, "~> 1.7"})
     assert message =~ ~s({:phoenix_live_view, "~> 1.0"})
-    assert message =~ "mix deps.compile geo_genius --force"
+    assert message =~ ~s({:livefilter, "~> 0.2"})
+    refute message =~ "deps.compile geo_genius --force"
     assert message =~ "pgflow.gen.job_migration"
     assert message =~ "GeoGenius.Runners.PgFlow.Job"
     assert message =~ "GeoGenius.Runner"

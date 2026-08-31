@@ -190,7 +190,16 @@ defmodule GeoGenius.Preflight do
         ]
 
       ^expected ->
-        []
+        case GeoGenius.Migration.contract_status(repo, prefix) do
+          %{compatible?: true} ->
+            []
+
+          %{status: status, installed_revision: revision, remedy: remedy} ->
+            [
+              "GeoGenius schema contract mismatch in #{prefix}: status #{status}, " <>
+                "installed revision #{inspect(revision)}; #{remedy}"
+            ]
+        end
 
       installed ->
         [

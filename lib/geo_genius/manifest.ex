@@ -102,7 +102,11 @@ defmodule GeoGenius.Manifest do
   ]
 
   @typedoc "One entry of a manifest's `area_types` list."
-  @type area_type :: %{key: String.t(), rank: pos_integer()}
+  @type area_type :: %{
+          required(:key) => String.t(),
+          required(:rank) => pos_integer(),
+          optional(:requires_geometry) => boolean()
+        }
 
   @typedoc """
   One entry of a manifest's `authorities` list: who is responsible for the
@@ -232,7 +236,7 @@ defmodule GeoGenius.Manifest do
       "requires_geometry" => manifest.requires_geometry,
       "source_date" => date_to_iso8601(manifest.source_date),
       "authorities" => Enum.map(manifest.authorities, &keys_to_strings(&1, [:key, :name])),
-      "area_types" => Enum.map(manifest.area_types, &keys_to_strings(&1, [:key, :rank])),
+      "area_types" => Enum.map(manifest.area_types, &area_type_to_map/1),
       "sources" => Enum.map(manifest.sources, &source_to_map/1),
       "options" => manifest.options
     }
@@ -652,8 +656,17 @@ defmodule GeoGenius.Manifest do
   # failing a cast inside PL/pgSQL.
   defp validate_area_type(map) when is_map(map) do
     with {:ok, key} <- require_string(map, "key"),
-         {:ok, rank} <- require_positive_integer(map, "rank") do
-      {:ok, %{key: key, rank: rank}}
+         {:ok, rank} <- require_positive_integer(map, "rank"),
+         {:ok, requires_geometry} <- optional_boolean(map, "requires_geometry") do
+      area_type =
+        %{key: key, rank: rank}
+        |> maybe_put(
+          :requires_geometry,
+          requires_geometry,
+          Map.has_key?(map, "requires_geometry")
+        )
+
+      {:ok, area_type}
     else
       {:error, reason} -> {:error, "area_types entry #{reason}"}
     end
@@ -665,6 +678,30 @@ defmodule GeoGenius.Manifest do
   defp keys_to_strings(map, keys) when is_map(map) do
     Map.new(keys, fn key -> {Atom.to_string(key), Map.get(map, key)} end)
   end
+
+  defp area_type_to_map(map) when is_map(map) do
+    map
+    |> keys_to_strings([:key, :rank])
+    |> maybe_put(
+      "requires_geometry",
+      Map.get(map, :requires_geometry),
+      Map.has_key?(map, :requires_geometry)
+    )
+  end
+
+  defp optional_boolean(map, field) do
+    if Map.has_key?(map, field) do
+      case Map.get(map, field) do
+        value when is_boolean(value) -> {:ok, value}
+        other -> {:error, "#{field} must be a boolean, got: #{inspect(other)}"}
+      end
+    else
+      {:ok, false}
+    end
+  end
+
+  defp maybe_put(map, key, value, true), do: Map.put(map, key, value)
+  defp maybe_put(map, _key, _value, false), do: map
 
   defp source_to_map(%Source{} = source) do
     %{

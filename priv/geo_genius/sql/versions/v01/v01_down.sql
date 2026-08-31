@@ -218,6 +218,10 @@ DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release_many(uuid, text[], geograph
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.put_boundaries(uuid, text[], uuid[], geometry[], integer[], jsonb[]);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.put_boundary(uuid, text, uuid, geometry, double precision);
 
 --SPLIT--
@@ -283,6 +287,10 @@ DROP FUNCTION IF EXISTS $SCHEMA$.upsert_source_release(text, text, text, date, j
 --SPLIT--
 
 DROP FUNCTION IF EXISTS $SCHEMA$.upsert_source(text, text, text, text);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.upsert_area_type(text, text, integer, boolean);
 
 --SPLIT--
 
@@ -437,6 +445,10 @@ DROP TABLE IF EXISTS $SCHEMA$.collection;
 --SPLIT--
 
 DROP FUNCTION IF EXISTS $SCHEMA$.assert_extensions(text[]);
+
+--SPLIT--
+
+DROP VIEW IF EXISTS $SCHEMA$.geo_genius_contract;
 
 --SPLIT--
 

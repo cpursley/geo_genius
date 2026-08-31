@@ -22,23 +22,40 @@ defmodule Mix.Tasks.GeoGenius.CheckSchema do
     try do
       current = GeoGenius.Migration.current_version()
       installed = GeoGenius.Migration.installed_version(repo, prefix)
+      contract = GeoGenius.Migration.contract_status(repo, prefix)
 
       Mix.shell().info("""
       GeoGenius prefix #{prefix}
       installed version: #{installed}
       expected version: #{current}
+      contract status: #{contract.status}
+      installed contract: #{inspect(contract.installed_revision)}
+      expected contract: #{contract.expected_revision}
       """)
 
-      if installed == current do
+      if installed == current and contract.compatible? do
         :ok
       else
-        Mix.raise(
-          "GeoGenius schema mismatch for prefix #{prefix}: installed #{installed}, expected #{current}"
-        )
+        mismatch!(prefix, installed, current, contract)
       end
     after
       if started?, do: GenServer.stop(pid)
     end
+  end
+
+  defp mismatch!(prefix, installed, current, %{compatible?: false} = contract)
+       when installed == current do
+    Mix.raise(
+      "GeoGenius schema contract mismatch for prefix #{prefix}: status #{contract.status}, " <>
+        "installed revision #{inspect(contract.installed_revision)}, " <>
+        "expected #{contract.expected_revision}; #{contract.remedy}"
+    )
+  end
+
+  defp mismatch!(prefix, installed, current, _contract) do
+    Mix.raise(
+      "GeoGenius schema mismatch for prefix #{prefix}: installed #{installed}, expected #{current}"
+    )
   end
 
   defp parse_args(args) do

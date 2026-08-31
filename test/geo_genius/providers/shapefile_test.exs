@@ -6,9 +6,8 @@ defmodule GeoGenius.Providers.ShapefileTest do
   alias GeoGenius.Provider
   alias GeoGenius.Providers.GeoJSON
   alias GeoGenius.Providers.Shapefile
+  alias GeoGenius.RecordingCommand
   alias GeoGenius.Staging
-
-  @geojson Path.expand("../../support/artifacts/territories.geojson", __DIR__)
 
   defmodule StubCommand do
     @moduledoc false
@@ -25,7 +24,7 @@ defmodule GeoGenius.Providers.ShapefileTest do
     end
 
     defp output_path(args) do
-      # ogr2ogr -f GeoJSON -t_srs EPSG:4326 <out> <in>
+      # ogr2ogr -f GeoJSONSeq -t_srs EPSG:4326 -lco RS=NO <out> <in>
       Enum.at(args, -2)
     end
   end
@@ -86,9 +85,33 @@ defmodule GeoGenius.Providers.ShapefileTest do
     on_exit(fn -> File.rm_rf!(work_dir) end)
 
     Keyword.merge(
-      [command: StubCommand, work_dir: work_dir, test_pid: self(), fixture: @geojson],
+      [command: StubCommand, work_dir: work_dir, test_pid: self(), fixture: sequence_fixture()],
       extra
     )
+  end
+
+  defp sequence_fixture do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "gg_shp_sequence_#{System.unique_integer([:positive])}.geojsonl"
+      )
+
+    content =
+      Enum.map_join(["west", "central", "east"], "\n", fn territory_id ->
+        Jason.encode!(%{
+          "type" => "Feature",
+          "properties" => %{
+            "territory_id" => territory_id,
+            "territory_name" => String.capitalize(territory_id)
+          },
+          "geometry" => nil
+        })
+      end)
+
+    File.write!(path, content)
+    on_exit(fn -> File.rm_rf!(path) end)
+    path
   end
 
   test "declares the same manifest options the GeoJSON provider reads" do
@@ -128,7 +151,7 @@ defmodule GeoGenius.Providers.ShapefileTest do
     assert Shapefile.artifacts(manifest_with_source) == GeoJSON.artifacts(manifest_with_source)
   end
 
-  test "unzips, converts, and stages every feature" do
+  test "unzips, converts to GeoJSONSeq, and delegates every feature to the sequence reader" do
     {:ok, agent} = Agent.start_link(fn -> [] end)
     emit = fn rows -> Agent.update(agent, &(&1 ++ rows)) end
 
@@ -140,25 +163,35 @@ defmodule GeoGenius.Providers.ShapefileTest do
 
   test "invokes ogr2ogr with the SRS flag and value in the exact expected pairing" do
     zip = archive(["territories.shp", "territories.dbf"])
-    stage_opts = opts()
+    stage_opts = opts(command: RecordingCommand)
     work_dir = Keyword.fetch!(stage_opts, :work_dir)
 
-    assert :ok = Shapefile.stage(manifest(), artifact(), zip, fn _ -> :ok end, stage_opts)
+    assert {:error, _reason} =
+             Shapefile.stage(manifest(), artifact(), zip, fn _ -> :ok end, stage_opts)
 
-    assert_receive {:ran, "ogr2ogr", args}
+    assert_receive {:command_ran, "ogr2ogr", args, ^stage_opts}
 
     # A fixed-length destructure fails outright if an implementation slips
     # in an extra flag (an added "-s_srs EPSG:4326" declaring a projected
-    # source as lat/long, for instance) -- that mutation produces an 8-element
-    # list, not 6, and this match raises before the equality assertion below
+    # source as lat/long, for instance) -- that mutation produces a 10-element
+    # list, not 8, and this match raises before the equality assertion below
     # ever runs.
-    [_flag_f, _fmt, _flag_srs, _srs_value, out_path, shp_path] = args
+    [_flag_f, _fmt, _flag_srs, _srs_value, _flag_lco, _rs_value, out_path, shp_path] = args
 
-    assert args == ["-f", "GeoJSON", "-t_srs", "EPSG:4326", out_path, shp_path],
+    assert args == [
+             "-f",
+             "GeoJSONSeq",
+             "-t_srs",
+             "EPSG:4326",
+             "-lco",
+             "RS=NO",
+             out_path,
+             shp_path
+           ],
            "a transposed flag/value pair, or an extra CRS flag, would silently mislocate geometry"
 
     assert Path.basename(shp_path) == "territories.shp"
-    assert Path.basename(out_path) == "converted.json"
+    assert Path.basename(out_path) == "converted.geojsonl"
     assert Path.dirname(out_path) == Path.dirname(shp_path)
     assert String.starts_with?(shp_path, work_dir)
   end

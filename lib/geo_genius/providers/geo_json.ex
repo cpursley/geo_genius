@@ -31,6 +31,7 @@ defmodule GeoGenius.Providers.GeoJSON do
   alias GeoGenius.Provider.Area
   alias GeoGenius.Providers.Batch
   alias GeoGenius.Providers.Fields
+  alias GeoGenius.Providers.GeoJSONGeometry
   alias GeoGenius.Providers.ImpliedAreas
   alias GeoGenius.Providers.ManifestOptions
   alias GeoGenius.Staging
@@ -181,7 +182,7 @@ defmodule GeoGenius.Providers.GeoJSON do
   end
 
   defp row_for(artifact, feature) do
-    case decode_geometry(Map.get(feature, "geometry")) do
+    case GeoJSONGeometry.decode(Map.get(feature, "geometry")) do
       {:ok, geom} ->
         {:ok,
          %Staging.Row{
@@ -193,19 +194,6 @@ defmodule GeoGenius.Providers.GeoJSON do
       {:error, _reason} = error ->
         error
     end
-  end
-
-  defp decode_geometry(nil), do: {:ok, nil}
-
-  defp decode_geometry(geometry) when is_map(geometry) do
-    case Geo.JSON.decode(geometry) do
-      {:ok, geom} -> {:ok, geom}
-      {:error, error} -> {:error, "invalid geometry: #{Exception.message(error)}"}
-    end
-  end
-
-  defp decode_geometry(other) do
-    {:error, "expected \"geometry\" to be a JSON object or null, got: #{inspect(other)}"}
   end
 
   defp build_area(row, keys, options) do

@@ -178,13 +178,14 @@ Load catalog identity, then release membership and geometry.
 | `put_area_in_release(target_release_id, target_area_key, centroid, data)`                                    | Record release membership; geometry optional                                                       |
 | `put_area_in_release_many(target_release_id, target_area_keys, centroids, data)`                             | Record a batch of release memberships                                                              |
 | `put_boundary(target_release_id, target_area_key, target_source_release_id, input_geom, simplify_tolerance)` | Attach a polygon; also ensures release membership                                                  |
+| `put_boundaries(target_release_id, target_area_keys, target_source_release_ids, input_geometries, display_tiers, source_properties)` | Attach a batch of polygons; also ensures release membership                         |
 | `put_relation(target_release_id, parent_area_key, child_area_key, relation_type)`                            | Assert an unmeasured relation from source data                                                     |
 | `put_relation_many(target_release_id, parent_area_keys, child_area_keys, relation_types)`                    | Assert a batch of unmeasured relations                                                             |
 | `rebuild_relations(target_release_id)`                                                                       | Derive measured relations from boundary overlap                                                    |
 
 ### Set writes
 
-Five of the writes above come in a plural form taking one array per column, with element
+Six of the writes above come in a plural form taking one array per column, with element
 _n_ of every array describing row _n_. The scalar form is the plural form called with
 one-element arrays, so there is one implementation of what each write means, and a caller
 choosing between them is choosing only how many round trips to spend.
@@ -196,9 +197,22 @@ area per column spends a round trip on every repeat. Measured on the US SimpleMa
 (150,622 staged rows, 153,917 areas, 466,262 area writes): the normalizing phase costs
 2,449 statements and 39.6 s written as sets, against 1,755,328 statements and 994.8 s
 written one area at a time.
-`put_boundary` has no plural form and is called once per boundary; it validates and repairs
-a geometry, replaces the area's boundary and its subdivided parts, and recomputes the
-centroid from what it stored.
+`put_boundaries` validates and repairs the accepted geometries, replaces each area's
+boundary and subdivided parts, and recomputes its centroid from what it stored. The
+Elixir `put_boundary/4` API is a one-element plural call when its
+`simplify_tolerance` is zero or omitted. A nonzero tolerance retains the original
+singular SQL path and its display-geometry simplification behavior. The plural SQL
+takes an explicit `display_tier` and `source_properties` per boundary instead.
+
+Before touching a boundary row, both boundary calls acquire the collection's publication
+lock and then recheck release mutability. Publication acquires that same lock before it
+verifies a release. A writer that waited for publication therefore sees the completed
+release and fails, while a publisher that waited for a writer verifies the writer's
+committed result instead of an earlier snapshot. The plural call additionally upserts
+every accepted `release_area` row in area-id order, so overlapping batches take membership
+locks deterministically before either path locks `boundary` or `boundary_part`. Canonical
+repaired geometry is materialized once and reused for centroid, boundary, and subdivision
+writes.
 
 Four rules govern what a batch means, and all four are things a naive batching would get
 wrong:
@@ -217,9 +231,10 @@ wrong:
   batch legitimately repeats areas.
 - **Where a write is last-write-wins, the last occurrence in the arrays is the one that
   wins.** That is release membership (`put_area_in_release_many` overwrites `centroid` and
-  `data`) and relations (`put_relation_many` overwrites `relation_type`), matching what a
-  loop of scalar calls in the same order would leave. Names and codes accumulate instead,
-  so their deduplication changes nothing but the statement's legality.
+  `data`), boundaries (`put_boundaries` keeps the last row for an `area_key`), and
+  relations (`put_relation_many` overwrites `relation_type`), matching what a loop of
+  scalar calls in the same order would leave. Names and codes accumulate instead, so
+  their deduplication changes nothing but the statement's legality.
 
 ### One lock order for the whole write path
 
@@ -301,13 +316,13 @@ authority keys when they are genuinely describing different places.
 `boundary`, `boundary_part`, `relation`, and `release_area` are all partitioned by
 `release_id`. `open_release` creates a release's partitions as part of opening it, so a
 release created through `open_release` is always ready for `put_area_in_release`,
-`put_boundary`, and `put_relation` to write to. `create_release_partitions` stays
+`put_boundary`, `put_boundaries`, and `put_relation` to write to. `create_release_partitions` stays
 available directly for a release row created some other way; omitting it before writing
 to such a release fails with a `no partition of relation ... found for row` error, not a
-silent no-op. `put_boundary` calls `put_area_in_release` internally, so a polygon-first
+silent no-op. Both boundary write forms ensure release membership, so a polygon-first
 caller never needs to call both.
 
-A published release is immutable. `put_area_in_release`, `put_boundary`, `put_relation`,
+A published release is immutable. `put_area_in_release`, `put_boundary`, `put_boundaries`, `put_relation`,
 `rebuild_relations`, and `attach_source_release` all call `assert_release_mutable` first
 and raise SQLSTATE `55000` when the target release has status `completed` (the status
 `publish_release` sets) or has a non-null `retired_at`. `attach_source_release` is in that
@@ -317,16 +332,16 @@ what readers of a published release see. Build a new release and publish it to c
 hosts see; there is no way to edit a published release in place.
 
 Every write that targets an area also calls `assert_area_in_collection`, which raises
-SQLSTATE `23503` when the area's `collection_id` does not match the release's. `put_boundary`
-additionally requires that `target_source_release_id` be one the release has already
+SQLSTATE `23503` when the area's `collection_id` does not match the release's. The boundary writes
+additionally require that each source release id be one the release has already
 declared through `release_source` (see [Declaring provenance](#declaring-provenance)
-below); an undeclared source release also raises SQLSTATE `23503`. `put_boundary` rejects
+below); an undeclared source release also raises SQLSTATE `23503`. Both boundary writes reject
 a geometry whose coordinates fall outside the SRID 4326 domain (longitude beyond ±180,
 latitude beyond ±90) with SQLSTATE `22023`.
 
 ### Declaring provenance
 
-`put_boundary`'s `target_source_release_id` argument is not free-form: the release must
+The boundary writes' source release ids are not free-form: the release must
 declare it first by calling `attach_source_release`, which links a `release` to a
 `source_release` it draws data from. `attach_source_release` raises SQLSTATE `23503` if
 either id does not exist, or if the source release belongs to a different collection than
@@ -339,6 +354,11 @@ required. `record_artifact_observation` records what the import actually fetched
 the call that compares the two, raising SQLSTATE `23514` when the observed digest or byte
 count differs from the declared one.
 
+Both boundary calls also follow each accepted source release through `source_release` to
+`source` and independently check its collection. This is intentionally redundant with
+`attach_source_release`: `release_source` is directly writable, and its foreign keys cannot
+express that the release and source belong to the same collection.
+
 ## Lifecycle
 
 Move a release from staged to published, or roll one back.
@@ -346,7 +366,7 @@ Move a release from staged to published, or roll one back.
 | Function                                | Answers                                                             |
 |-----------------------------------------|---------------------------------------------------------------------|
 | `verify_release(target_release_id)`     | Check whether a release is ready to publish; returns a jsonb report |
-| `publish_release(target_release_id)`    | Verify, then atomically publish a release; returns the collection's id |
+| `publish_release(target_release_id)`    | Lock, verify, then atomically publish a release; returns the collection's id |
 | `rollback_publication(collection_key)`  | Swap the publication pointer to the previous release                |
 | `published_release(collection_key)`     | The release a collection publishes right now, or `NULL`             |
 | `retire_releases(collection_key, keep)` | Drop older completed releases' partitions beyond a retention count  |
@@ -362,6 +382,12 @@ Publishing the release that is already published is a no-op: it appends no
 `publication_event` row and leaves `previous_release_id` untouched, so
 `rollback_publication` still reaches the last release that was actually swapped away
 from, not the release that is currently published.
+
+Publication and boundary writes serialize on the collection's publication advisory lock.
+`publish_release` takes that lock before `verify_release`; each boundary writer takes it
+before `assert_release_mutable`. This common order closes both race directions: neither a
+write can commit after publication nor a publisher can accept verification performed before
+a waiting writer committed.
 
 `retire_releases` drops a retired release's partitions (`boundary`, `boundary_part`,
 `relation`, `release_area`) to reclaim storage, and sets `release.retired_at`, but keeps
@@ -636,9 +662,9 @@ The row exists but belongs somewhere else:
 
 | Function                                          | Message                                                         |
 |---------------------------------------------------|------------------------------------------------------------------|
-| `put_area_in_release`, `put_boundary` (via `assert_area_in_collection`) | `area % belongs to collection %, but release % belongs to collection %` |
+| `put_area_in_release`, `put_boundary`, `put_boundaries` (via `assert_area_in_collection`) | `area % belongs to collection %, but release % belongs to collection %` |
 | `attach_source_release`                           | `source release % belongs to collection %, but release % belongs to collection %` |
-| `put_boundary`                                    | `source release % is not declared by release %`                  |
+| `put_boundary`, `put_boundaries`                  | `source release % is not declared by release %`                  |
 
 Two families depart from `23503`, and a caller matching on SQLSTATE has to expect them.
 
@@ -661,7 +687,8 @@ makes it fire:
 | `put_area_name`, `put_area_code`, `put_area_in_release`, and their plural forms | an unknown `target_area_key` | named |
 | `put_relation`, `put_relation_many`               | an unknown `parent_area_key` or `child_area_key`      | named   |
 | `put_boundary`                                    | an unknown `target_area_key`                          | bare    |
-| `assert_release_mutable`                          | an unknown `target_release_id`, which is how `put_boundary`, `put_area_in_release`, `put_relation`, and `rebuild_relations` report one | bare |
+| `put_boundaries`                                  | an unknown `target_area_key`                          | named   |
+| `assert_release_mutable`                          | an unknown `target_release_id`, which is how `put_boundary`, `put_boundaries`, `put_area_in_release`, `put_relation`, and `rebuild_relations` report one | bare |
 | `assert_area_in_collection`                       | a release or area row deleted between the caller's lookup and this guard | bare |
 
 `verify_release` and `publish_release` each hold one `INTO STRICT` lookup as well, but

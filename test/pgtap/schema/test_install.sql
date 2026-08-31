@@ -1,9 +1,60 @@
 BEGIN;
 
-SELECT plan(13);
+SELECT plan(21);
 
 SELECT has_schema('geo_genius', 'geo_genius schema exists');
 SELECT has_view('geo_genius', 'geo_genius_version', 'version tracking view exists');
+SELECT has_view('geo_genius', 'geo_genius_contract', 'contract marker view exists');
+SELECT has_table('geo_genius', 'area_type', 'area_type is an ordinary table');
+SELECT is(
+  (SELECT schema_version FROM geo_genius.geo_genius_contract),
+  1,
+  'contract marker keeps the public schema at version 1'
+);
+SELECT is(
+  (SELECT contract_revision FROM geo_genius.geo_genius_contract),
+  'sha256:0bb7f017525771075a7cb4dfed5568d1b14edb261e8fadbb82d14acbfba53fb1',
+  'contract marker exposes the canonical content address'
+);
+SELECT is(
+  (SELECT capabilities FROM geo_genius.geo_genius_contract),
+  ARRAY[
+    'boundary_batches',
+    'boundary_canonical_repair_once',
+    'boundary_collection_provenance',
+    'boundary_publication_serialization',
+    'reversible_legacy_v01_reconciliation',
+    'type_scoped_geometry_requirements'
+  ]::text[],
+  'contract marker exposes the required capabilities in canonical order'
+);
+SELECT col_type_is(
+  'geo_genius',
+  'area_type',
+  'requires_geometry',
+  'boolean',
+  'area_type.requires_geometry is boolean'
+);
+SELECT col_not_null(
+  'geo_genius',
+  'area_type',
+  'requires_geometry',
+  'area_type.requires_geometry is required'
+);
+SELECT is(
+  (SELECT pg_get_expr(d.adbin, d.adrelid)
+     FROM pg_attribute a
+     JOIN pg_class c ON c.oid = a.attrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+    WHERE n.nspname = 'geo_genius'
+      AND c.relname = 'area_type'
+      AND a.attname = 'requires_geometry'
+      AND a.attnum > 0
+      AND NOT a.attisdropped),
+  'false',
+  'area_type.requires_geometry defaults to false'
+);
 SELECT has_function(
   'geo_genius',
   'assert_extensions',
@@ -149,7 +200,7 @@ SELECT is(
       AND p.provolatile <> 'v'
       AND p.proname = ANY(ARRAY[
         'upsert_collection', 'upsert_authority', 'upsert_area_type', 'upsert_area',
-        'put_area_name', 'put_area_code', 'put_area_in_release', 'put_boundary',
+        'put_area_name', 'put_area_code', 'put_area_in_release', 'put_boundary', 'put_boundaries',
         'put_relation', 'rebuild_relations', 'publish_release', 'rollback_publication',
         'retire_releases', 'open_release', 'attach_source_release', 'put_artifact',
         'record_artifact_observation', 'upsert_source', 'upsert_source_release',

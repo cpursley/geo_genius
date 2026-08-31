@@ -284,6 +284,91 @@ defmodule GeoGenius.CatalogTest do
     assert "release contains no areas" in failures
   end
 
+  test "verify_release requires boundaries only for area types marked as requiring geometry",
+       %{context: context} do
+    release_id = open_demo(context)
+    Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+
+    Catalog.upsert_area_type(context, "demo", %{
+      key: "bounded_zone",
+      rank: 10,
+      requires_geometry: true
+    })
+
+    Catalog.upsert_area_type(context, "demo", %{
+      key: "metadata_record",
+      rank: 20,
+      requires_geometry: false
+    })
+
+    Catalog.upsert_area_many(context, "demo", [
+      %{authority_key: "a", area_type_key: "bounded_zone", code: "alpha"},
+      %{authority_key: "a", area_type_key: "metadata_record", code: "detail"}
+    ])
+
+    Catalog.put_area_in_release_many(context, release_id, [
+      %{area_key: "a:bounded_zone:alpha", centroid: nil, attributes: %{}},
+      %{area_key: "a:metadata_record:detail", centroid: nil, attributes: %{}}
+    ])
+
+    Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
+
+    source_release_id =
+      Catalog.upsert_source_release(context, "demo", %{
+        source_key: "s",
+        release_key: "v1",
+        source_date: nil,
+        metadata: %{}
+      })
+
+    Catalog.attach_source_release(context, release_id, source_release_id)
+
+    assert %{"ok" => false, "failures" => ["1 areas lack a boundary"]} =
+             Catalog.verify_release(context, release_id)
+
+    Catalog.put_boundary(context, release_id, "a:bounded_zone:alpha", %{
+      source_release_id: source_release_id,
+      geometry: square(0.0, 1.0)
+    })
+
+    assert %{"ok" => true, "boundary_count" => 1} = Catalog.verify_release(context, release_id)
+  end
+
+  test "legacy uncast SQL upsert_area_type calls resolve to the false wrapper",
+       %{context: context} do
+    open_demo(context)
+
+    %{rows: [[_area_type_id]]} =
+      TestRepo.query!(
+        "SELECT geo_genius.upsert_area_type('demo', 'legacy_type', 90)::text",
+        []
+      )
+
+    assert query_rows(context, """
+           SELECT requires_geometry
+             FROM geo_genius.area_type
+            WHERE key = 'legacy_type'
+           """) == [[false]]
+  end
+
+  test "the explicit geometry-aware area type SQL function has no default argument" do
+    %{rows: [[arguments]]} =
+      TestRepo.query!(
+        """
+        SELECT pg_get_function_arguments(p.oid)
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE n.nspname = 'geo_genius'
+           AND p.proname = 'upsert_area_type'
+           AND pg_get_function_identity_arguments(p.oid) =
+               'collection_key text, key text, rank integer, requires_geometry boolean'
+        """,
+        []
+      )
+
+    assert arguments == "collection_key text, key text, rank integer, requires_geometry boolean"
+  end
+
   test "creates and drops a staging table, returning its name", %{context: context} do
     release_id = open_demo(context)
 
@@ -658,6 +743,7 @@ defmodule GeoGenius.CatalogTest do
       assert Catalog.put_area_code_many(recording, []) == []
       assert Catalog.put_area_in_release_many(recording, Ecto.UUID.generate(), []) == :ok
       assert Catalog.put_relation_many(recording, Ecto.UUID.generate(), []) == :ok
+      assert Catalog.put_boundaries(recording, Ecto.UUID.generate(), []) == :ok
 
       refute_received {:query, _sql, _params, _opts}
     end
@@ -671,6 +757,146 @@ defmodule GeoGenius.CatalogTest do
       assert_raise ArgumentError, fn ->
         Catalog.put_relation_many(context, "not-a-uuid", [])
       end
+
+      assert_raise ArgumentError, fn ->
+        Catalog.put_boundaries(context, "not-a-uuid", [])
+      end
+    end
+
+    test "a boundary batch is one typed query with ordered arrays and defaults",
+         %{context: context} do
+      {release_id, source_release_id} = boundary_fixture(context, ~w(one two))
+      recording = %{context | repo: GeoGenius.RecordingRepo}
+      first = square(0.0, 1.0)
+      second = square(2.0, 3.0)
+
+      assert :ok =
+               Catalog.put_boundaries(recording, release_id, [
+                 %{
+                   area_key: "a:t:one",
+                   source_release_id: source_release_id,
+                   geometry: first,
+                   display_tier: 3,
+                   source_properties: %{"vintage" => "2026"}
+                 },
+                 %{
+                   area_key: "a:t:two",
+                   source_release_id: source_release_id,
+                   geometry: second
+                 }
+               ])
+
+      assert_received {:query, sql,
+                       [dumped_release, area_keys, source_ids, geometries, tiers, properties],
+                       _opts}
+
+      assert sql =~
+               ~s|"geo_genius".put_boundaries($1::uuid, $2::text[], $3::uuid[], $4::geometry[], $5::integer[], $6::jsonb[])|
+
+      assert dumped_release == Ecto.UUID.dump!(release_id)
+      assert area_keys == ["a:t:one", "a:t:two"]
+
+      assert source_ids == [
+               Ecto.UUID.dump!(source_release_id),
+               Ecto.UUID.dump!(source_release_id)
+             ]
+
+      assert geometries == [first, second]
+      assert tiers == [3, 0]
+      assert properties == [%{"vintage" => "2026"}, %{}]
+      refute_received {:query, _sql, _params, _opts}
+    end
+
+    test "a boundary batch keeps the last geometry for a repeated area",
+         %{context: context} do
+      {release_id, source_release_id} = boundary_fixture(context, ["one"])
+
+      assert :ok =
+               Catalog.put_boundaries(context, release_id, [
+                 %{
+                   area_key: "a:t:one",
+                   source_release_id: source_release_id,
+                   geometry: square(0.0, 1.0),
+                   source_properties: %{"ordinal" => 1}
+                 },
+                 %{
+                   area_key: "a:t:one",
+                   source_release_id: source_release_id,
+                   geometry: square(2.0, 3.0),
+                   display_tier: 2,
+                   source_properties: %{"ordinal" => 2}
+                 }
+               ])
+
+      assert query_rows(context, """
+             SELECT display_tier, source_properties, ST_AsText(geom)
+               FROM geo_genius.boundary
+             """) == [[2, %{"ordinal" => 2}, "POLYGON((2 2,3 2,3 3,2 3,2 2))"]]
+    end
+
+    test "put_boundary remains a one-element compatibility wrapper",
+         %{context: context} do
+      {release_id, source_release_id} = boundary_fixture(context, ["one"])
+      recording = %{context | repo: GeoGenius.RecordingRepo}
+      geometry = square(0.0, 1.0)
+
+      assert :ok =
+               Catalog.put_boundary(recording, release_id, "a:t:one", %{
+                 source_release_id: source_release_id,
+                 geometry: geometry,
+                 source_properties: %{"origin" => "scalar"}
+               })
+
+      assert_received {:query, sql,
+                       [
+                         _release_id,
+                         ["a:t:one"],
+                         [_source_id],
+                         [^geometry],
+                         [0],
+                         [%{"origin" => "scalar"}]
+                       ], _opts}
+
+      assert sql =~ "put_boundaries"
+      refute_received {:query, _sql, _params, _opts}
+    end
+
+    test "put_boundary preserves a nonzero simplify tolerance on the singular SQL path",
+         %{context: context} do
+      {release_id, source_release_id} = boundary_fixture(context, ["one"])
+      recording = %{context | repo: GeoGenius.RecordingRepo}
+      geometry = square(0.0, 1.0)
+
+      assert :ok =
+               Catalog.put_boundary(recording, release_id, "a:t:one", %{
+                 source_release_id: source_release_id,
+                 geometry: geometry,
+                 simplify_tolerance: 0.25
+               })
+
+      assert_received {:query, sql, [dumped_release, "a:t:one", dumped_source, ^geometry, 0.25],
+                       _opts}
+
+      assert sql =~ ~s|"geo_genius".put_boundary($1, $2, $3, $4, $5)|
+      assert dumped_release == Ecto.UUID.dump!(release_id)
+      assert dumped_source == Ecto.UUID.dump!(source_release_id)
+      refute_received {:query, _sql, _params, _opts}
+    end
+
+    test "missing required boundary keys raise before the query", %{context: context} do
+      recording = %{context | repo: GeoGenius.RecordingRepo}
+      release_id = Ecto.UUID.generate()
+      source_release_id = Ecto.UUID.generate()
+
+      for boundary <- [
+            %{source_release_id: source_release_id, geometry: square(0.0, 1.0)},
+            %{area_key: "a:t:one", geometry: square(0.0, 1.0)},
+            %{area_key: "a:t:one", source_release_id: source_release_id}
+          ] do
+        assert_raise KeyError, fn -> Catalog.put_boundaries(recording, release_id, [boundary]) end
+      end
+
+      refute_received {:query, _sql, _params, _opts}
     end
 
     test "names and codes land in the columns their keys name", %{context: context} do
@@ -804,5 +1030,37 @@ defmodule GeoGenius.CatalogTest do
   defp query_rows(%Context{repo: repo}, sql) do
     %Postgrex.Result{rows: rows} = repo.query!(sql, [])
     rows
+  end
+
+  defp boundary_fixture(context, codes) do
+    release_id = open_demo(context)
+    Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
+    Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
+
+    Catalog.upsert_area_many(
+      context,
+      "demo",
+      Enum.map(codes, &%{authority_key: "a", area_type_key: "t", code: &1})
+    )
+
+    Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
+
+    source_release_id =
+      Catalog.upsert_source_release(context, "demo", %{
+        source_key: "s",
+        release_key: "v1",
+        source_date: nil,
+        metadata: %{}
+      })
+
+    Catalog.attach_source_release(context, release_id, source_release_id)
+    {release_id, source_release_id}
+  end
+
+  defp square(low, high) do
+    %Geo.Polygon{
+      coordinates: [[{low, low}, {high, low}, {high, high}, {low, high}, {low, low}]],
+      srid: 4326
+    }
   end
 end
