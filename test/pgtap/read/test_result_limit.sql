@@ -14,19 +14,22 @@ SELECT geo_genius_test.demo_fixture_build();
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'PROBE-' || to_char(g, 'FM00'))
   FROM generate_series(1, 60) AS g;
 
-SELECT geo_genius.put_area_name(
-  'demo_auth:outer:PROBE-' || to_char(g, 'FM00'),
-  'Probeton ' || to_char(g, 'FM00'),
-  'official', NULL)
-  FROM generate_series(1, 60) AS g;
-
 -- The probes sit far from the fixture's own areas, so the proximity reads
 -- below measure the probes and nothing else.
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:PROBE-' || to_char(g, 'FM00'),
   ST_GeogFromText('POINT(' || (100 + g * 0.001)::text || ' 40)'),
   '{}'::jsonb)
+  FROM generate_series(1, 60) AS g;
+
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:PROBE-' || to_char(g, 'FM00'),
+  'Probeton ' || to_char(g, 'FM00'),
+  'official', NULL)
   FROM generate_series(1, 60) AS g;
 
 SELECT geo_genius_test.demo_publish();

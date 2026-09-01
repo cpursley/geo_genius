@@ -6,8 +6,12 @@ BEGIN;
 -- parent_area_key scopes the name branch to a subtree, and that an
 -- explicit target_release_id reaches an unpublished release.
 
-SELECT geo_genius_test.demo_fixture();
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'postal', '30309');
+SELECT geo_genius_test.demo_fixture_build();
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:A', 'postal', '30309');
+SELECT geo_genius_test.demo_publish();
 
 -- A metadata-only collection: no boundaries anywhere, membership and
 -- hierarchy come entirely from release_area and relation rows.
@@ -21,41 +25,81 @@ SELECT geo_genius.upsert_area('refdir', 'ref_auth', 'city', 'springfield_ga');
 SELECT geo_genius.upsert_area('refdir', 'ref_auth', 'city', 'springfield_fl');
 SELECT geo_genius.upsert_area('refdir', 'ref_auth', 'city', 'macon');
 
-SELECT geo_genius.put_area_name('ref_auth:state:GA', 'Georgia', 'official', NULL);
-SELECT geo_genius.put_area_name('ref_auth:state:FL', 'Florida', 'official', NULL);
 -- Same name under two different states, to prove parent_area_key scoping
 -- actually restricts the name branch instead of just returning the first
 -- match: an unscoped search for "Springfield" has two equally-scored
 -- candidates.
-SELECT geo_genius.put_area_name('ref_auth:city:springfield_ga', 'Springfield', 'official', NULL);
-SELECT geo_genius.put_area_name('ref_auth:city:springfield_fl', 'Springfield', 'official', NULL);
-SELECT geo_genius.put_area_name('ref_auth:city:macon', 'Macon', 'official', NULL);
-SELECT geo_genius.put_area_code('ref_auth:city:springfield_ga', 'postal', '30301');
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"refdir",
+    "release":"refdir_r1",
+    "collection_name":"Reference Directory",
+    "requires_geometry":false,
+    "authorities":[{"key":"ref_auth","name":"Reference Authority"}],
+    "area_types":[
+      {"key":"state","rank":10,"requires_geometry":false},
+      {"key":"city","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-cascade","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'));
 
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'refdir_r1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'refdir';
-
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'normalizing');
 
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
   'ref_auth:state:GA', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
   'ref_auth:state:FL', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
   'ref_auth:city:springfield_ga', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
   'ref_auth:city:springfield_fl', NULL, '{}'::jsonb);
 
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'ref_auth:state:GA', 'Georgia', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'ref_auth:state:FL', 'Florida', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'ref_auth:city:springfield_ga', 'Springfield', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'ref_auth:city:springfield_fl', 'Springfield', 'official', NULL);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'ref_auth:city:springfield_ga', 'postal', '30301');
+
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'relating');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
   'ref_auth:state:GA', 'ref_auth:city:springfield_ga', 'contains');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
   'ref_auth:state:FL', 'ref_auth:city:springfield_fl', 'contains');
 
 INSERT INTO geo_genius.source (collection_id, source_key, provider, license)
@@ -66,21 +110,47 @@ INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT r.id, sr.id FROM geo_genius.release r, geo_genius.source_release sr
 WHERE r.release_key = 'refdir_r1';
 
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'),
+  'publishing');
+SELECT geo_genius.publish_import(
+  geo_genius_test.import_run_id('refdir', 'refdir_r1'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r1'));
 
 -- A second, unpublished release of the same collection carries an area
 -- ('Macon') that r1 never had -- only an explicit target_release_id can
 -- reach it.
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'refdir_r2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'refdir';
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"refdir",
+    "release":"refdir_r2",
+    "collection_name":"Reference Directory Candidate",
+    "requires_geometry":false,
+    "authorities":[{"key":"ref_auth","name":"Reference Authority"}],
+    "area_types":[
+      {"key":"state","rank":10,"requires_geometry":false},
+      {"key":"city","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-cascade","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('refdir', 'refdir_r2'));
 
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('refdir', 'refdir_r2'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r2'),
+  'normalizing');
 
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'refdir_r2'),
+  geo_genius_test.import_run_id('refdir', 'refdir_r2'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r2'),
   'ref_auth:city:macon', NULL, '{}'::jsonb);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('refdir', 'refdir_r2'),
+  geo_genius_test.import_executor_id('refdir', 'refdir_r2'),
+  'ref_auth:city:macon', 'Macon', 'official', NULL);
 
 SELECT plan(16);
 

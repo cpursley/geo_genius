@@ -16,11 +16,13 @@ defmodule GeoGenius.ImportFixture do
   alias GeoGenius.Caches.FileSystem
   alias GeoGenius.Catalog
   alias GeoGenius.Context
+  alias GeoGenius.ImportRun
   alias GeoGenius.Manifest
   alias GeoGenius.Registration
   alias GeoGenius.TestRepo
 
   @artifact Path.expand("artifacts/territories.geojson", __DIR__)
+  @active_phases ~w(pending downloading validating staging normalizing relating indexing verifying publishing)
 
   @doc "The bytes of the seeded GeoJSON fixture."
   @spec body() :: binary()
@@ -35,7 +37,7 @@ defmodule GeoGenius.ImportFixture do
   unique to the call, so repeat calls in one test do not collide),
   `:owner` (default `"runner-fixture"`) and `:runner_backend` (default
   `"test"`), both forwarded to
-  `Catalog.begin_or_resume_import/3`, and `:corrupt_artifact` (default
+  `Registration.prepare_import/3`, and `:corrupt_artifact` (default
   `false`) -- when `true`, the cache is seeded with bytes that do not match
   the manifest's own checksum, so the run genuinely fails in the
   `"downloading"` phase instead of completing. That is how a caller drives a
@@ -55,26 +57,96 @@ defmodule GeoGenius.ImportFixture do
     release_key = Keyword.get(opts, :release, "r#{unique}")
     corrupt? = Keyword.get(opts, :corrupt_artifact, false)
 
-    # Registered before anything is written: `register!/2` creates the
-    # collection with its very first statement, so a raise partway through
-    # it -- or through `seed_cache!/2` -- still leaves a row only this
-    # callback knows to remove. `teardown!/1` looks its releases up by
-    # collection key rather than taking a captured id, so it has nothing to
-    # be called with the wrong (or no) value for.
+    # Registered before anything is written: the atomic preparation statement
+    # creates the collection with its very first write, so a later cache error
+    # still leaves a row only this callback knows to remove.
     ExUnit.Callbacks.on_exit({__MODULE__, collection}, fn -> teardown!(collection) end)
 
     {:ok, manifest} = Manifest.from_map(manifest_map(collection, release_key))
-    release_id = Registration.register(context, manifest)
+    candidate = prepare!(context, manifest, opts)
     seed_cache!(manifest, corrupt?)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: Keyword.get(opts, :owner, "runner-fixture"),
-        runner_backend: Keyword.get(opts, :runner_backend, "test"),
-        stale_after_seconds: 300
-      })
+    {collection, candidate.release_id, candidate.run_id}
+  end
 
-    {collection, release_id, run_id}
+  @doc "Atomically prepares a manifest and returns its accepted candidate details."
+  @spec prepare!(Context.t(), Manifest.t(), keyword()) :: Registration.accepted()
+  def prepare!(%Context{} = context, %Manifest{} = manifest, opts \\ []) do
+    claim = %{
+      "owner" => Keyword.get(opts, :owner, "runner-fixture"),
+      "runner_backend" => Keyword.get(opts, :runner_backend, "test"),
+      "stale_after_seconds" => Keyword.get(opts, :stale_after_seconds, 300)
+    }
+
+    case Registration.prepare_import(context, manifest, claim) do
+      {:enqueue, candidate} -> candidate
+      {:existing, candidate} -> candidate
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc "Claims and returns the sole executor UUID for an import fixture."
+  @spec claim_executor!(Context.t(), Ecto.UUID.t()) :: Ecto.UUID.t()
+  def claim_executor!(%Context{} = context, run_id) do
+    executor_id = Ecto.UUID.generate()
+    :claimed = Catalog.claim_import_execution(context, run_id, executor_id)
+    executor_id
+  end
+
+  @doc "Advances a fixture through every required phase up to an active target status."
+  @spec advance_to!(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t()) :: :ok
+  def advance_to!(%Context{} = context, run_id, executor_id, target_status)
+      when is_binary(run_id) and is_binary(executor_id) and is_binary(target_status) do
+    %ImportRun{status: current_status} = Catalog.import_run(context, run_id)
+    current_index = phase_index!(current_status)
+    target_index = phase_index!(target_status)
+
+    if target_index < current_index do
+      raise ArgumentError,
+            "cannot advance fixture backward from #{current_status} to #{target_status}"
+    end
+
+    @active_phases
+    |> Enum.slice(current_index + 1, target_index - current_index)
+    |> Enum.each(&Catalog.advance_import(context, run_id, executor_id, &1, %{}))
+
+    :ok
+  end
+
+  @doc "Records matching observations for every artifact selected by a release fixture."
+  @spec observe_selected_artifacts!(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          :ok
+  def observe_selected_artifacts!(
+        %Context{} = context,
+        release_id,
+        run_id,
+        executor_id
+      )
+      when is_binary(release_id) and is_binary(run_id) and is_binary(executor_id) do
+    context
+    |> Catalog.release_artifacts(release_id)
+    |> Enum.each(fn artifact ->
+      :ok =
+        Catalog.record_artifact_observation(
+          context,
+          run_id,
+          executor_id,
+          artifact["artifact_id"],
+          %{
+            observed_sha256: artifact["expected_sha256"],
+            observed_bytes: artifact["expected_bytes"]
+          }
+        )
+    end)
+
+    :ok
+  end
+
+  defp phase_index!(status) do
+    case Enum.find_index(@active_phases, &(&1 == status)) do
+      nil -> raise ArgumentError, "expected an active import status, got: #{inspect(status)}"
+      index -> index
+    end
   end
 
   # Mirrors `geo_genius_test.demo_teardown()`'s order (`test/pgtap_support/fixtures.sql`):
@@ -97,6 +169,19 @@ defmodule GeoGenius.ImportFixture do
   @doc "Removes a collection and everything registered under it."
   @spec teardown!(String.t()) :: :ok
   def teardown!(collection) do
+    TestRepo.query!(
+      """
+      DELETE FROM geo_genius.import_run_lease
+       WHERE release_id IN (
+         SELECT release.id
+           FROM geo_genius.release
+           JOIN geo_genius.collection ON collection.id = release.collection_id
+          WHERE collection.key = $1
+       )
+      """,
+      [collection]
+    )
+
     Enum.each(release_ids(collection), fn dumped_release_id ->
       TestRepo.query!("SELECT geo_genius.drop_release_partitions($1)", [dumped_release_id])
     end)
@@ -111,6 +196,19 @@ defmodule GeoGenius.ImportFixture do
 
     TestRepo.query!(
       """
+      DELETE FROM geo_genius.release_artifact
+       WHERE release_id IN (
+         SELECT release.id
+           FROM geo_genius.release
+           JOIN geo_genius.collection ON collection.id = release.collection_id
+          WHERE collection.key = $1
+       )
+      """,
+      [collection]
+    )
+
+    TestRepo.query!(
+      """
       DELETE FROM geo_genius.release_source
        WHERE release_id IN (
          SELECT release.id
@@ -118,6 +216,14 @@ defmodule GeoGenius.ImportFixture do
            JOIN geo_genius.collection ON collection.id = release.collection_id
           WHERE collection.key = $1
        )
+      """,
+      [collection]
+    )
+
+    TestRepo.query!(
+      """
+      DELETE FROM geo_genius.release
+       WHERE collection_id IN (SELECT id FROM geo_genius.collection WHERE key = $1)
       """,
       [collection]
     )

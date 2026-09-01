@@ -9,14 +9,14 @@ SELECT has_table('geo_genius', 'area', 'area table exists');
 SELECT has_table('geo_genius', 'area_name', 'area_name table exists');
 SELECT has_table('geo_genius', 'area_code', 'area_code table exists');
 
-INSERT INTO geo_genius.collection (key, name)
-VALUES ('demo', 'Demo');
+INSERT INTO geo_genius.collection (key)
+VALUES ('demo');
 
-INSERT INTO geo_genius.authority (collection_id, key, name)
-SELECT id, 'demo_auth', 'Demo Authority' FROM geo_genius.collection WHERE key = 'demo';
+INSERT INTO geo_genius.authority (collection_id, key)
+SELECT id, 'demo_auth' FROM geo_genius.collection WHERE key = 'demo';
 
-INSERT INTO geo_genius.area_type (collection_id, key, rank)
-SELECT id, 'region', 10 FROM geo_genius.collection WHERE key = 'demo';
+INSERT INTO geo_genius.area_type (collection_id, key)
+SELECT id, 'region' FROM geo_genius.collection WHERE key = 'demo';
 
 INSERT INTO geo_genius.area (collection_id, authority_id, area_type_id, code, area_key)
 SELECT c.id, a.id, t.id, '01', 'demo_auth:region:01'
@@ -32,7 +32,7 @@ SELECT is(
 );
 
 SELECT throws_ok(
-  $$INSERT INTO geo_genius.collection (key, name) VALUES ('Bad Key', 'x')$$,
+  $$INSERT INTO geo_genius.collection (key) VALUES ('Bad Key')$$,
   '23514',
   NULL,
   'collection key must be a lowercase identifier'
@@ -58,11 +58,11 @@ SELECT throws_ok(
 );
 
 SELECT throws_ok(
-  $$INSERT INTO geo_genius.area_type (collection_id, key, rank)
-    SELECT id, 'other', 10 FROM geo_genius.collection WHERE key = 'demo'$$,
+  $$INSERT INTO geo_genius.area_type (collection_id, key)
+    SELECT id, 'region' FROM geo_genius.collection WHERE key = 'demo'$$,
   '23505',
   NULL,
-  'type rank is unique within a collection'
+  'area type key is unique within a collection'
 );
 
 INSERT INTO geo_genius.area_name (area_id, name, kind)

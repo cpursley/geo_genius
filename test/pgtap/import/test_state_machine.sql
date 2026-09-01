@@ -5,85 +5,95 @@ SELECT plan(21);
 SELECT has_table('geo_genius', 'import_run', 'import_run table exists');
 SELECT has_table('geo_genius', 'import_run_lease', 'import_run_lease table exists');
 
-SELECT geo_genius.upsert_collection('demo', 'Demo', NULL);
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
+CREATE TEMP TABLE state_machine_manifest (scenario text PRIMARY KEY, manifest jsonb NOT NULL);
+INSERT INTO state_machine_manifest (scenario, manifest) VALUES
+  ('r1', '{"collection":"demo","collection_name":"Demo","release":"r1",
+           "requires_geometry":false,"authorities":[],"area_types":[],"sources":[]}'::jsonb),
+  ('r2', '{"collection":"demo2","collection_name":"Demo Two","release":"r2",
+           "requires_geometry":false,"authorities":[],"area_types":[],"sources":[]}'::jsonb);
 
-SELECT ok(
-  geo_genius.begin_or_resume_import(
-    (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-    'worker-1', 'task', interval '5 minutes'
-  ) IS NOT NULL,
-  'a fresh import claims a run'
+SELECT is(
+  (SELECT decision || '/' || reason FROM geo_genius.prepare_import(
+    (SELECT manifest FROM state_machine_manifest WHERE scenario = 'r1'),
+    '{"owner":"worker-1","runner_backend":"task","stale_after_seconds":300}'::jsonb)),
+  'enqueue/registered',
+  'a fresh import registers and claims a run'
 );
 
 -- Age the lease, but keep it inside the staleness window, so the resume below
 -- takes the same-owner branch and has something to refresh.
 UPDATE geo_genius.import_run_lease SET heartbeat_at = now() - interval '2 minutes';
+CREATE TEMP TABLE lease_snapshot AS
+SELECT heartbeat_at FROM geo_genius.import_run_lease;
 
 SELECT is(
-  geo_genius.begin_or_resume_import(
-    (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-    'worker-1', 'task', interval '5 minutes'
-  ),
+  (SELECT run_id FROM geo_genius.prepare_import(
+    (SELECT manifest FROM state_machine_manifest WHERE scenario = 'r1'),
+    '{"owner":"worker-1","runner_backend":"task","stale_after_seconds":300}'::jsonb)),
   (SELECT id FROM geo_genius.import_run LIMIT 1),
-  'the same owner resumes its own run'
+  'the same owner receives its existing run for enqueue recovery'
 );
 
--- The third sibling of the property asserted for heartbeat_import and
--- advance_import below. A resume that hands back the run id without
--- refreshing its lease leaves the worker holding a claim that keeps ageing,
--- so the next caller can reclaim it as stale while it is still running.
-SELECT ok(
-  (SELECT heartbeat_at FROM geo_genius.import_run_lease) > now() - interval '1 minute',
-  'resuming a run refreshes the lease it hands back'
+-- Same-owner preparation closes the post-commit enqueue gap without changing
+-- durable claim state. Only an executing worker heartbeat renews the lease.
+SELECT is(
+  (SELECT heartbeat_at FROM geo_genius.import_run_lease),
+  (SELECT heartbeat_at FROM lease_snapshot),
+  'same-owner enqueue recovery leaves the lease unchanged'
 );
 
-SELECT throws_ok(
-  $$SELECT geo_genius.begin_or_resume_import(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-      'worker-2', 'task', interval '5 minutes')$$,
-  '55006',
-  NULL,
-  'a second owner cannot claim a live run'
+SELECT is(
+  (SELECT decision || '/' || reason FROM geo_genius.prepare_import(
+    (SELECT manifest FROM state_machine_manifest WHERE scenario = 'r1'),
+    '{"owner":"worker-2","runner_backend":"task","stale_after_seconds":300}'::jsonb)),
+  'error/live_import',
+  'a second owner receives a structured refusal for a live run'
 );
 
--- Age the lease past the staleness window and reclaim it.
+-- Age the lease past the staleness window. Preparation diagnoses the stale
+-- claim but never rewrites attempt history or silently transfers ownership.
 UPDATE geo_genius.import_run_lease SET heartbeat_at = now() - interval '1 hour';
 
-SELECT ok(
-  geo_genius.begin_or_resume_import(
-    (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-    'worker-2', 'task', interval '5 minutes'
-  ) IS NOT NULL,
-  'a stale run is reclaimed'
+SELECT is(
+  (SELECT decision || '/' || reason FROM geo_genius.prepare_import(
+    (SELECT manifest FROM state_machine_manifest WHERE scenario = 'r1'),
+    '{"owner":"worker-2","runner_backend":"task","stale_after_seconds":300}'::jsonb)),
+  'error/stale_import',
+  'a stale run is diagnosed without implicit reclamation'
 );
 
--- Reclaiming is not handing the same row to a new owner. guides/ingestion.md
--- promises the abandoned run is marked failed and a fresh attempt starts, and
--- a reclaim that returned the original id would satisfy the assertion above
--- while breaking both.
 SELECT is(
   (SELECT status FROM geo_genius.import_run ORDER BY attempt LIMIT 1),
-  'failed',
-  'reclaiming marks the abandoned run failed'
+  'pending',
+  'a stale-import refusal leaves the abandoned run unchanged'
 );
 
 SELECT is(
   (SELECT error ->> 'reason' FROM geo_genius.import_run ORDER BY attempt LIMIT 1),
-  'lease expired',
-  'the abandoned run records why it was reclaimed'
+  NULL,
+  'a stale-import refusal does not synthesize terminal history'
 );
 
 SELECT is(
   (SELECT array_agg(attempt ORDER BY attempt) FROM geo_genius.import_run),
-  ARRAY[1, 2],
-  'the reclaim starts a second attempt rather than reusing the first'
+  ARRAY[1],
+  'a stale-import refusal creates no replacement attempt'
 );
+
+CREATE TEMP TABLE state_machine_attempt (
+  scenario text PRIMARY KEY,
+  run_id uuid NOT NULL,
+  executor_id uuid NOT NULL
+);
+INSERT INTO state_machine_attempt (scenario, run_id, executor_id)
+SELECT 'r1', run_id, geo_genius_test.claim_import_executor(run_id)
+  FROM (SELECT id AS run_id FROM geo_genius.import_run
+        ORDER BY attempt DESC LIMIT 1) AS prepared;
 
 SELECT throws_ok(
   $$SELECT geo_genius.advance_import(
       (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+      (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
       'nonsense', '{}'::jsonb)$$,
   '22023',
   NULL,
@@ -97,6 +107,7 @@ UPDATE geo_genius.import_run_lease
 
 SELECT geo_genius.heartbeat_import(
   (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+  (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
   '{"stage": "loading"}'::jsonb
 );
 
@@ -109,14 +120,29 @@ SELECT ok(
 
 -- Age the lease again and advance a phase rather than heartbeating. A run
 -- whose liveness rested on emit-time heartbeats alone would go stale during
--- any long phase that emits nothing, and begin_or_resume_import would then
--- hand the release to a second worker.
+-- any long phase that emits nothing, and prepare_import would then diagnose
+-- the claim as stale.
 UPDATE geo_genius.import_run_lease
    SET heartbeat_at = now() - interval '10 minutes'
  WHERE run_id = (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1);
 
 SELECT geo_genius.advance_import(
   (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+  (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
+  'downloading',
+  '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+  (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
+  'validating',
+  '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+  (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
   'staging',
   '{}'::jsonb
 );
@@ -130,6 +156,7 @@ SELECT ok(
 
 SELECT geo_genius.fail_import(
   (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+  (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
   '{"reason": "boom"}'::jsonb
 );
 
@@ -149,7 +176,9 @@ SELECT ok(
 -- none.
 SELECT throws_ok(
   $$SELECT geo_genius.advance_import(
-      '00000000-0000-0000-0000-000000000000'::uuid, 'staging', '{}'::jsonb)$$,
+      '00000000-0000-0000-0000-000000000000'::uuid,
+      (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
+      'staging', '{}'::jsonb)$$,
   '23503',
   'import run 00000000-0000-0000-0000-000000000000 does not exist',
   'advance_import refuses a run that does not exist'
@@ -157,7 +186,9 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.fail_import(
-      '00000000-0000-0000-0000-000000000000'::uuid, '{"reason": "boom"}'::jsonb)$$,
+      '00000000-0000-0000-0000-000000000000'::uuid,
+      (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
+      '{"reason": "boom"}'::jsonb)$$,
   '23503',
   'import run 00000000-0000-0000-0000-000000000000 does not exist',
   'fail_import refuses a run that does not exist'
@@ -169,10 +200,13 @@ SELECT throws_ok(
 SELECT throws_ok(
   $$SELECT geo_genius.heartbeat_import(
       (SELECT id FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
+      (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
       '{"stage": "loading"}'::jsonb)$$,
-  '23503',
-  'import run ' || (SELECT id::text FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1) ||
-    ' has no active lease',
+  '55000',
+  'executor ' ||
+    (SELECT executor_id::text FROM state_machine_attempt WHERE scenario = 'r1') ||
+    ' does not own import run ' ||
+    (SELECT id::text FROM geo_genius.import_run ORDER BY attempt DESC LIMIT 1),
   'heartbeat_import refuses a run holding no active lease'
 );
 
@@ -198,26 +232,32 @@ SELECT is(
 -- failure -- a runner reporting its own error, a cleanup that failed after the
 -- pipeline already finished -- stamps 'failed' over a run that completed and
 -- published, leaving the catalog's history contradicting the release it holds.
-SELECT geo_genius.upsert_collection('demo2', 'Demo Two', NULL);
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo2';
-
-SELECT geo_genius.begin_or_resume_import(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
-  'worker-2', 'task', interval '5 minutes'
+SELECT * FROM geo_genius.prepare_import(
+  (SELECT manifest FROM state_machine_manifest WHERE scenario = 'r2'),
+  '{"owner":"worker-2","runner_backend":"task","stale_after_seconds":300}'::jsonb
 );
 
-SELECT geo_genius.advance_import(
-  (SELECT id FROM geo_genius.import_run
-    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')),
-  'completed',
-  '{}'::jsonb
-);
+INSERT INTO state_machine_attempt (scenario, run_id, executor_id)
+SELECT 'r2', run_id, geo_genius_test.claim_import_executor(run_id)
+  FROM (SELECT id AS run_id FROM geo_genius.import_run
+        WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')) AS prepared;
+
+-- Build the already-completed fixture directly. Only publish_import may create
+-- this terminal state through the public API; this row isolates fail_import's
+-- guard from publication's independent verification requirements.
+UPDATE geo_genius.import_run
+   SET status = 'completed', completed_at = now()
+ WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2');
+
+DELETE FROM geo_genius.import_run_lease
+ WHERE run_id = (SELECT id FROM geo_genius.import_run
+   WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
 
 SELECT throws_ok(
   $$SELECT geo_genius.fail_import(
       (SELECT id FROM geo_genius.import_run
         WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')),
+      (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r2'),
       '{"reason": "late"}'::jsonb)$$,
   '55000',
   'import run ' ||
@@ -234,6 +274,7 @@ SELECT lives_ok(
       (SELECT id FROM geo_genius.import_run
         WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
         ORDER BY attempt DESC LIMIT 1),
+      (SELECT executor_id FROM state_machine_attempt WHERE scenario = 'r1'),
       '{"reason": "again"}'::jsonb)$$,
   'fail_import is idempotent on a run that already failed'
 );

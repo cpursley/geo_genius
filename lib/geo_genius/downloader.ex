@@ -4,7 +4,7 @@ defmodule GeoGenius.Downloader do
 
   A downloader only reports what it observed while streaming: how many bytes
   arrived and what they hashed to. It never compares that observation against
-  an expectation drawn from a manifest. `record_artifact_observation/3` in
+  an expectation drawn from a manifest. `record_artifact_observation/5` in
   PostgreSQL is where expectation meets observation; keeping the comparison
   there, and only there, is what keeps the two from disagreeing.
   """
@@ -33,7 +33,7 @@ defmodule GeoGenius.Downloader do
   The SHA-256 and byte count of a file already on disk.
 
   A cache hit is verified with this before its observation is recorded, so a
-  downloaded artifact and a cached one reach `record_artifact_observation/3`
+  downloaded artifact and a cached one reach `record_artifact_observation/5`
   through the same check. It reads in chunks of #{@chunk_bytes} bytes rather
   than loading the file, because an artifact is routinely larger than memory.
 

@@ -2,7 +2,6 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   use ExUnit.Case, async: false
 
   alias GeoGenius.AppEnv
-  alias GeoGenius.Catalog
   alias GeoGenius.Context
   alias GeoGenius.ImportFixture
   alias GeoGenius.ImportRun
@@ -10,7 +9,6 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
   alias GeoGenius.Pipeline
   alias GeoGenius.Providers.SimpleMaps
   alias GeoGenius.Providers.SimpleMaps.Validation
-  alias GeoGenius.Registration
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
 
@@ -165,14 +163,13 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
       on_exit(fn -> ImportFixture.teardown!(collection) end)
 
       {:ok, manifest} = Manifest.from_map(uszips_manifest_map(collection, url, body))
-      release_id = Registration.register(context, manifest)
 
-      run_id =
-        Catalog.begin_or_resume_import(context, release_id, %{
+      candidate =
+        ImportFixture.prepare!(context, manifest,
           owner: "validation-e2e",
           runner_backend: "test",
           stale_after_seconds: 300
-        })
+        )
 
       unique = System.unique_integer([:positive])
       cache_dir = Path.join(System.tmp_dir!(), "gg_validation_e2e_cache_#{unique}")
@@ -181,7 +178,7 @@ defmodule GeoGenius.Providers.SimpleMaps.ValidationTest do
 
       opts = [bodies: %{url => body}, cache_dir: cache_dir, work_dir: work_dir]
 
-      assert {:error, %ImportRun{} = run} = Pipeline.execute(context, run_id, opts)
+      assert {:error, %ImportRun{} = run} = Pipeline.execute(context, candidate.run_id, opts)
 
       assert run.status == "failed"
       assert run.error["phase"] == "normalizing"

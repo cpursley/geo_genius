@@ -80,11 +80,27 @@ SELECT is(
 -- run, so it is still queryable directly by id. This is the scenario the
 -- bug missed: a non-null target_release_id must reach r1 even though r2 is
 -- now the published release.
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r2",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-spatial","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'r2'));
 
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'normalizing');
 
 INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT r.id, sr.id
@@ -92,15 +108,21 @@ SELECT r.id, sr.id
  WHERE r.release_key = 'r2' AND sr.release_key = 'v1';
 
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
   'demo_auth:outer:A',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((10 10, 11 10, 11 11, 10 11, 10 10))', 4326),
   0.0
 );
 
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'publishing');
+SELECT geo_genius.publish_import(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'));
 
 SELECT is(
   (SELECT count(*)::int
@@ -160,11 +182,24 @@ SELECT geo_genius.upsert_authority('demo3', 'demo3_auth', 'Demo Three Authority'
 SELECT geo_genius.upsert_area_type('demo3', 'zone', 10);
 SELECT geo_genius.upsert_area('demo3', 'demo3_auth', 'zone', 'Z');
 
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r3', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo3';
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo3",
+    "release":"r3",
+    "collection_name":"Demo Three",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo3_auth","name":"Demo Three Authority"}],
+    "area_types":[{"key":"zone","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-spatial","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo3', 'r3'));
 
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r3'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo3', 'r3'),
+  geo_genius_test.import_executor_id('demo3', 'r3'),
+  'normalizing');
 
 INSERT INTO geo_genius.source (collection_id, source_key, provider, license)
 SELECT id, 'demo3:src', 'demo3', 'test' FROM geo_genius.collection WHERE key = 'demo3';
@@ -180,7 +215,8 @@ SELECT
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v2');
 
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r3'),
+  geo_genius_test.import_run_id('demo3', 'r3'),
+  geo_genius_test.import_executor_id('demo3', 'r3'),
   'demo3_auth:zone:Z',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v2'),
   ST_GeomFromText('POLYGON((5 5, 6 5, 6 6, 5 6, 5 5))', 4326),

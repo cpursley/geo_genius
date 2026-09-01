@@ -1,40 +1,62 @@
 BEGIN;
 
-SELECT geo_genius_test.demo_fixture_build();
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'postal', '30309');
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Alpha City', 'alias', NULL);
+SELECT geo_genius_test.demo_fixture_build('[
+  {"key":"state","rank":5,"requires_geometry":false},
+  {"key":"city","rank":15,"requires_geometry":false}
+]'::jsonb);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:A', 'postal', '30309');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:A', 'Alpha City', 'alias', NULL);
 
 -- Two areas in different states share a slug, which is what makes an
 -- unscoped code lookup ambiguous for a host resolving /pa/washington. This
 -- extends r1 before publishing (a published release is immutable), so it
 -- has to land here rather than after the assertions that depend on r1
 -- already being published.
-SELECT geo_genius.upsert_area_type('demo', 'state', 5);
-SELECT geo_genius.upsert_area_type('demo', 'city', 15);
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'state', 'PA');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'state', 'OH');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'city', 'PA-WASH');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'city', 'OH-WASH');
-SELECT geo_genius.put_area_code('demo_auth:city:PA-WASH', 'slug', 'washington');
-SELECT geo_genius.put_area_code('demo_auth:city:OH-WASH', 'slug', 'washington');
-
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:state:PA', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:state:OH', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:city:PA-WASH', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:city:OH-WASH', NULL, '{}'::jsonb);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:city:PA-WASH', 'slug', 'washington');
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:city:OH-WASH', 'slug', 'washington');
+
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(),
+  'relating');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:state:PA', 'demo_auth:city:PA-WASH', 'contains');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:state:OH', 'demo_auth:city:OH-WASH', 'contains');
 
 SELECT geo_genius_test.demo_publish();

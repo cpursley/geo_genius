@@ -35,12 +35,27 @@ SELECT is(
 
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'B');
 
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'demo-2026', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
-
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'demo-2026')
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"demo-2026",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-upsert","runner_backend":"pgtap"}'::jsonb
 );
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'demo-2026'));
+
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'demo-2026'),
+  geo_genius_test.import_executor_id('demo', 'demo-2026'),
+  'normalizing');
 
 INSERT INTO geo_genius.source (collection_id, source_key, provider, license)
 SELECT id, 'demo:src', 'demo', 'test' FROM geo_genius.collection WHERE key = 'demo';
@@ -54,7 +69,8 @@ WHERE r.release_key = 'demo-2026';
 
 -- A 1-degree square and a 0.5-degree square fully inside it.
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'demo-2026'),
+  geo_genius_test.import_run_id('demo', 'demo-2026'),
+  geo_genius_test.import_executor_id('demo', 'demo-2026'),
   'demo_auth:outer:A',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326),
@@ -62,7 +78,8 @@ SELECT geo_genius.put_boundary(
 );
 
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'demo-2026'),
+  geo_genius_test.import_run_id('demo', 'demo-2026'),
+  geo_genius_test.import_executor_id('demo', 'demo-2026'),
   'demo_auth:inner:B',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((0.1 0.1, 0.6 0.1, 0.6 0.6, 0.1 0.6, 0.1 0.1))', 4326),
@@ -89,7 +106,8 @@ SELECT ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundary(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'demo-2026'),
+      geo_genius_test.import_run_id('demo', 'demo-2026'),
+      geo_genius_test.import_executor_id('demo', 'demo-2026'),
       'demo_auth:outer:A',
       (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
       ST_GeomFromText('POINT(0 0)', 4326),
@@ -100,9 +118,16 @@ SELECT throws_ok(
   'put_boundary rejects non-polygonal geometry'
 );
 
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'demo-2026'),
+  geo_genius_test.import_executor_id('demo', 'demo-2026'),
+  'relating'
+);
+
 SELECT is(
   geo_genius.rebuild_relations(
-    (SELECT id FROM geo_genius.release WHERE release_key = 'demo-2026')
+    geo_genius_test.import_run_id('demo', 'demo-2026'),
+    geo_genius_test.import_executor_id('demo', 'demo-2026')
   ),
   1::bigint,
   'one containment relation measured'

@@ -18,7 +18,8 @@ defmodule GeoGenius.Stores.PostgresResultLimitTest do
   alias GeoGenius.{Context, Query, Stores.Postgres, TestRepo}
 
   @probes 60
-  @release "SELECT id FROM geo_genius.release WHERE release_key = 'r1'"
+  @run "SELECT geo_genius_test.demo_run_id()"
+  @executor "SELECT geo_genius_test.demo_executor_id()"
 
   setup do
     TestRepo.query!("SELECT geo_genius_test.demo_fixture_build()", [])
@@ -28,15 +29,15 @@ defmodule GeoGenius.Stores.PostgresResultLimitTest do
       [@probes]
     )
 
-    TestRepo.query!(
-      "SELECT geo_genius.put_area_name('demo_auth:outer:PROBE-' || to_char(g, 'FM00'), 'Probeton ' || to_char(g, 'FM00'), 'official', NULL) FROM generate_series(1, $1) AS g",
-      [@probes]
-    )
-
     # The probes sit far from the fixture's own areas, so a radius drawn around
     # them holds the probes and nothing else.
     TestRepo.query!(
-      "SELECT geo_genius.put_area_in_release((#{@release}), 'demo_auth:outer:PROBE-' || to_char(g, 'FM00'), ST_GeogFromText('POINT(' || (100 + g * 0.001)::text || ' 40)'), '{}'::jsonb) FROM generate_series(1, $1) AS g",
+      "SELECT geo_genius.put_area_in_release((#{@run}), (#{@executor}), 'demo_auth:outer:PROBE-' || to_char(g, 'FM00'), ST_GeogFromText('POINT(' || (100 + g * 0.001)::text || ' 40)'), '{}'::jsonb) FROM generate_series(1, $1) AS g",
+      [@probes]
+    )
+
+    TestRepo.query!(
+      "SELECT geo_genius.put_area_name((#{@run}), (#{@executor}), 'demo_auth:outer:PROBE-' || to_char(g, 'FM00'), 'Probeton ' || to_char(g, 'FM00'), 'official', NULL) FROM generate_series(1, $1) AS g",
       [@probes]
     )
 

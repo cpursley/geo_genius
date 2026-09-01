@@ -6,9 +6,14 @@
 -- stays terminal.
 BEGIN;
 
-SELECT plan(26);
+SELECT plan(27);
 
-SELECT geo_genius_test.demo_fixture_build();
+SELECT geo_genius_test.demo_fixture_build(
+  '[{"key":"reference","rank":90,"requires_geometry":false}]'::jsonb);
+
+CREATE TEMP TABLE lifecycle_demo_attempt AS
+SELECT geo_genius_test.demo_run_id() AS run_id,
+       geo_genius_test.demo_executor_id() AS executor_id;
 
 -- ---------------------------------------------------------------------------
 -- Collection isolation
@@ -21,7 +26,8 @@ SELECT geo_genius.upsert_area('other', 'other_auth', 'zone', 'X');
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_area_in_release(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'other_auth:zone:X', NULL, '{}'::jsonb)$$,
   '23503',
   NULL,
@@ -30,7 +36,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundary(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'other_auth:zone:X',
       (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
       ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326), 0.0)$$,
@@ -65,7 +72,8 @@ SELECT id, 'v9' FROM geo_genius.source WHERE source_key = 'demo:src';
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundary(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'demo_auth:outer:A',
       (SELECT id FROM geo_genius.source_release WHERE release_key = 'v9'),
       ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326), 0.0)$$,
@@ -79,7 +87,8 @@ SELECT throws_ok(
 -- containment and distance would disagree about where the area is.
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundary(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'demo_auth:outer:A',
       (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
       ST_GeomFromText('POLYGON((199 5, 201 5, 201 6, 199 6, 199 5))', 4326), 0.0)$$,
@@ -92,21 +101,48 @@ SELECT throws_ok(
 -- Asserted relations survive a geometry rebuild
 -- ---------------------------------------------------------------------------
 
-SELECT geo_genius.upsert_area_type('demo', 'reference', 90);
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'reference', 'P');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'reference', 'Q');
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt),
   'demo_auth:reference:P', NULL, '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt),
   'demo_auth:reference:Q', NULL, '{}'::jsonb);
-SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:reference:P', 'demo_auth:reference:Q', 'contains');
 
+-- ---------------------------------------------------------------------------
+-- Repeated code types survive the area_match projection
+-- ---------------------------------------------------------------------------
+
+SELECT geo_genius.put_area_code(
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt),
+  'demo_auth:outer:A', 'postal', '30309');
+SELECT geo_genius.put_area_code(
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt),
+  'demo_auth:outer:A', 'postal', '30310');
+
+SELECT is(
+  (SELECT codes -> 'postal'
+     FROM geo_genius.areas_by_code('postal', '30309', NULL, NULL,
+       (SELECT id FROM geo_genius.release WHERE release_key = 'r1'))),
+  '["30309", "30310"]'::jsonb,
+  'an area carrying two codes of one type reports both, including the one looked up'
+);
+
+SELECT geo_genius_test.advance_import_to(
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt), 'relating');
+SELECT geo_genius.put_relation(
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt),
+  'demo_auth:reference:P', 'demo_auth:reference:Q', 'contains');
 SELECT geo_genius.rebuild_relations(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'));
+  (SELECT run_id FROM lifecycle_demo_attempt),
+  (SELECT executor_id FROM lifecycle_demo_attempt));
 
 SELECT is(
   (SELECT count(*)::int FROM geo_genius.relation r
@@ -140,21 +176,6 @@ SELECT throws_ok(
 );
 
 -- ---------------------------------------------------------------------------
--- Repeated code types survive the area_match projection
--- ---------------------------------------------------------------------------
-
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'postal', '30309');
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'postal', '30310');
-
-SELECT is(
-  (SELECT codes -> 'postal'
-     FROM geo_genius.areas_by_code('postal', '30309', NULL, NULL,
-       (SELECT id FROM geo_genius.release WHERE release_key = 'r1'))),
-  '["30309", "30310"]'::jsonb,
-  'an area carrying two codes of one type reports both, including the one looked up'
-);
-
--- ---------------------------------------------------------------------------
 -- A published release is immutable
 -- ---------------------------------------------------------------------------
 
@@ -162,7 +183,8 @@ SELECT geo_genius_test.demo_publish();
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_area_in_release(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'demo_auth:inner:B', NULL, '{}'::jsonb)$$,
   '55000',
   NULL,
@@ -171,7 +193,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundary(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'demo_auth:outer:A',
       (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
       ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))', 4326), 0.0)$$,
@@ -182,7 +205,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_relation(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt),
       'demo_auth:reference:Q', 'demo_auth:reference:P', 'contains')$$,
   '55000',
   NULL,
@@ -191,7 +215,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.rebuild_relations(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'))$$,
+      (SELECT run_id FROM lifecycle_demo_attempt),
+      (SELECT executor_id FROM lifecycle_demo_attempt))$$,
   '55000',
   NULL,
   'rebuild_relations refuses a published release'
@@ -202,21 +227,42 @@ SELECT throws_ok(
 -- ---------------------------------------------------------------------------
 
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'R');
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r2",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[{"key":"outer","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-lifecycle","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'normalizing'
+);
 INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT
   (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1');
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
   'demo_auth:outer:R',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((40 40, 41 40, 41 41, 40 41, 40 40))', 4326), 0.0);
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'publishing'
+);
+SELECT geo_genius.publish_import(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'));
 
 -- Publishing what is already published is a no-op. Letting it fall through
 -- would set previous_release_id to the current release, erasing the only
@@ -315,26 +361,57 @@ SELECT is(
 -- ---------------------------------------------------------------------------
 
 SELECT throws_ok(
-  $$SELECT geo_genius.begin_or_resume_import(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-      'worker-1', 'test', interval '-1 minute')$$,
+  $$SELECT * FROM geo_genius.prepare_import(
+      '{"collection":"terminal","collection_name":"Terminal","release":"r1",
+        "requires_geometry":false,"authorities":[],"area_types":[],"sources":[]}'::jsonb,
+      '{"owner":"worker-1","runner_backend":"test","stale_after_seconds":-60}'::jsonb)$$,
   '22023',
   NULL,
-  'begin_or_resume_import refuses a negative staleness window'
+  'prepare_import refuses a negative staleness window'
 );
 
-SELECT geo_genius.advance_import(
-  geo_genius.begin_or_resume_import(
-    (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-    'worker-1', 'test'),
-  'completed',
-  '{}'::jsonb);
+SELECT throws_ok(
+  $$SELECT * FROM geo_genius.prepare_import(
+      '{"collection":"terminal","collection_name":"Terminal","release":"r1",
+        "requires_geometry":false,"authorities":[],"area_types":[],"sources":[]}'::jsonb,
+      '{"owner":"worker-1","runner_backend":"test","stale_after_seconds":0}'::jsonb)$$,
+  '22023',
+  NULL,
+  'prepare_import refuses a zero-length staleness window'
+);
+
+SELECT * FROM geo_genius.prepare_import(
+  '{"collection":"terminal","collection_name":"Terminal","release":"r1",
+    "requires_geometry":false,"authorities":[],"area_types":[],"sources":[]}'::jsonb,
+  '{"owner":"worker-1","runner_backend":"test","stale_after_seconds":300}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('terminal', 'r1'));
+
+CREATE TEMP TABLE terminal_attempt AS
+SELECT geo_genius_test.import_run_id('terminal', 'r1') AS run_id,
+       geo_genius_test.import_executor_id('terminal', 'r1') AS executor_id;
+
+-- Build the impossible terminal fixture directly: the public API can only
+-- complete a structurally valid release from verifying, while this test is
+-- specifically about refusing resurrection after terminal state exists.
+UPDATE geo_genius.import_run
+   SET status = 'completed', completed_at = now()
+ WHERE id = (SELECT run_id FROM terminal_attempt);
+
+DELETE FROM geo_genius.import_run_lease
+ WHERE run_id = (SELECT run_id FROM terminal_attempt);
 
 SELECT throws_ok(
   $$SELECT geo_genius.advance_import(
       (SELECT id FROM geo_genius.import_run
-        WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+        WHERE release_id = (
+          SELECT release.id
+            FROM geo_genius.release
+            JOIN geo_genius.collection ON collection.id = release.collection_id
+           WHERE collection.key = 'terminal' AND release.release_key = 'r1')
         ORDER BY attempt DESC LIMIT 1),
+      (SELECT executor_id FROM terminal_attempt),
       'pending',
       '{}'::jsonb)$$,
   '55000',

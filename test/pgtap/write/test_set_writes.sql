@@ -20,11 +20,27 @@ SELECT geo_genius.upsert_authority('mirror', 'mirror_auth', 'Mirror Authority');
 SELECT geo_genius.upsert_area_type('mirror', 'outer', 10);
 SELECT geo_genius.upsert_area_type('mirror', 'inner', 20);
 
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'm1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'mirror';
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"mirror",
+    "release":"m1",
+    "collection_name":"Mirror",
+    "requires_geometry":false,
+    "authorities":[{"key":"mirror_auth","name":"Mirror Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-set-writes","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('mirror', 'm1'));
 
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'm1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('mirror', 'm1'),
+  geo_genius_test.import_executor_id('mirror', 'm1'),
+  'normalizing');
 
 -- A batch naming the same area twice is the shape a denormalised source
 -- produces: every city row repeats its county. ON CONFLICT DO UPDATE raises
@@ -86,6 +102,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_area_name_many(
+      geo_genius_test.import_run_id('mirror', 'm1'),
+      geo_genius_test.import_executor_id('mirror', 'm1'),
       ARRAY['mirror_auth:outer:A'], ARRAY[NULL]::text[], ARRAY['official'],
       ARRAY[NULL]::text[])$$,
   '22004',
@@ -95,6 +113,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_area_code_many(
+      geo_genius_test.import_run_id('mirror', 'm1'),
+      geo_genius_test.import_executor_id('mirror', 'm1'),
       ARRAY['mirror_auth:nosuch:X'], ARRAY['fips'], ARRAY['01'])$$,
   'P0002',
   'query returned no rows for area key mirror_auth:nosuch:X',
@@ -105,8 +125,17 @@ SELECT throws_ok(
 -- carrying an area twice with different names writes both. A null locale is a
 -- legal element, and area_name_uq compares locale NULLS NOT DISTINCT, so the
 -- two unlocalized 'Alpha' rows here are one row.
+SELECT geo_genius.put_area_in_release_many(
+  geo_genius_test.import_run_id('mirror', 'm1'),
+  geo_genius_test.import_executor_id('mirror', 'm1'),
+  ARRAY['mirror_auth:outer:A', 'mirror_auth:inner:B', 'mirror_auth:inner:C'],
+  ARRAY[NULL, NULL, NULL]::geography(Point, 4326)[],
+  ARRAY[NULL, NULL, NULL]::jsonb[]);
+
 SELECT is(
   cardinality(geo_genius.put_area_name_many(
+    geo_genius_test.import_run_id('mirror', 'm1'),
+    geo_genius_test.import_executor_id('mirror', 'm1'),
     ARRAY['mirror_auth:outer:A', 'mirror_auth:outer:A', 'mirror_auth:outer:A',
           'mirror_auth:inner:B', 'mirror_auth:inner:C'],
     ARRAY['Alpha', 'Alpha', 'Aardvark', 'Bravo', 'Charlie'],
@@ -123,16 +152,23 @@ SELECT is(
   'a name repeated in one batch is one row, and a second distinct name is another'
 );
 
--- The statement trigger recomputes official_name from every name of the area,
--- so the winner is the first by locale then name, not the last one written.
+-- The plural write recomputes the release's official_name from every selected
+-- official name, so the winner is the first by locale then name, not the last
+-- one written.
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'mirror_auth:outer:A'),
+  (SELECT release_area.official_name
+     FROM geo_genius.release_area
+     JOIN geo_genius.area ON area.id = release_area.area_id
+    WHERE release_area.release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'm1')
+      AND area.area_key = 'mirror_auth:outer:A'),
   'Aardvark',
   'the area_name statement trigger maintains official_name through the plural write'
 );
 
 SELECT is(
   cardinality(geo_genius.put_area_code_many(
+    geo_genius_test.import_run_id('mirror', 'm1'),
+    geo_genius_test.import_executor_id('mirror', 'm1'),
     ARRAY['mirror_auth:outer:A', 'mirror_auth:outer:A', 'mirror_auth:inner:B'],
     ARRAY['fips', 'fips', 'fips'],
     ARRAY['01', '01', '01001'])),
@@ -144,7 +180,8 @@ SELECT is(
 -- keep the last of its occurrences rather than an arbitrary one. The two
 -- payloads differ in both columns the upsert overwrites.
 SELECT geo_genius.put_area_in_release_many(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'm1'),
+  geo_genius_test.import_run_id('mirror', 'm1'),
+  geo_genius_test.import_executor_id('mirror', 'm1'),
   ARRAY['mirror_auth:outer:A', 'mirror_auth:inner:B', 'mirror_auth:outer:A',
         'mirror_auth:inner:C'],
   ARRAY[
@@ -173,8 +210,14 @@ SELECT is(
   'the last occurrence wins on every column the upsert overwrites, centroid included'
 );
 
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('mirror', 'm1'),
+  geo_genius_test.import_executor_id('mirror', 'm1'),
+  'relating'
+);
 SELECT geo_genius.put_relation_many(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'm1'),
+  geo_genius_test.import_run_id('mirror', 'm1'),
+  geo_genius_test.import_executor_id('mirror', 'm1'),
   ARRAY['mirror_auth:outer:A', 'mirror_auth:outer:A'],
   ARRAY['mirror_auth:inner:B', 'mirror_auth:inner:B'],
   ARRAY['overlaps', 'contains']);
@@ -188,7 +231,8 @@ SELECT is(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_relation_many(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'm1'),
+      geo_genius_test.import_run_id('mirror', 'm1'),
+      geo_genius_test.import_executor_id('mirror', 'm1'),
       ARRAY['mirror_auth:outer:A'], ARRAY['mirror_auth:inner:B'], ARRAY['adjoins'])$$,
   '22023',
   'unknown relation type adjoins',
@@ -199,33 +243,46 @@ SELECT throws_ok(
 -- fixture already gave demo A and B with their names, so only what mirror
 -- received above is added, in the order the plural forms received it.
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'C');
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Alpha', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Alpha', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Aardvark', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:inner:B', 'Bravo', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:inner:C', 'Charlie', 'official', NULL);
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'fips', '01');
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'fips', '01');
-SELECT geo_genius.put_area_code('demo_auth:inner:B', 'fips', '01001');
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:inner:C', NULL, NULL);
+SELECT geo_genius.put_area_name(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:outer:A', 'Alpha', 'official', NULL);
+SELECT geo_genius.put_area_name(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:outer:A', 'Alpha', 'official', NULL);
+SELECT geo_genius.put_area_name(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:outer:A', 'Aardvark', 'official', NULL);
+SELECT geo_genius.put_area_name(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:inner:B', 'Bravo', 'official', NULL);
+SELECT geo_genius.put_area_name(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:inner:C', 'Charlie', 'official', NULL);
+SELECT geo_genius.put_area_code(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:outer:A', 'fips', '01');
+SELECT geo_genius.put_area_code(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:outer:A', 'fips', '01');
+SELECT geo_genius.put_area_code(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'demo_auth:inner:B', 'fips', '01001');
 
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:A', ST_GeogFromText('POINT(1 1)'), '{"pass": 1}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:inner:B', ST_GeogFromText('POINT(2 2)'), '{"pass": 1}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:A', ST_GeogFromText('POINT(9 9)'), '{"pass": 2}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:inner:C', NULL, NULL);
 
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(),
+  'relating');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:A', 'demo_auth:inner:B', 'overlaps');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:A', 'demo_auth:inner:B', 'contains');
 
 -- to_jsonb renders a whole row keyed by column name, so a value landing in the

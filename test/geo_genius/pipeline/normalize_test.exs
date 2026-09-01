@@ -4,6 +4,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   alias GeoGenius.Catalog
   alias GeoGenius.Context
   alias GeoGenius.ImportFixture
+  alias GeoGenius.Manifest
   alias GeoGenius.Pipeline.Normalize
   alias GeoGenius.Pipeline.State
   alias GeoGenius.Provider.Area
@@ -219,7 +220,7 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
          centroid: nil,
          geometry: geometry,
          names: [%Name{name: code, kind: :official}],
-         codes: [],
+         codes: [%Area.Code{code_type: "fixture", code_value: code}],
          attributes: %{}
        }}
     end
@@ -325,15 +326,47 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
       recorded_queries()
       |> Enum.filter(fn {sql, _params} -> sql =~ ~s|"geo_genius".put_boundaries(| end)
 
-    assert [{_sql, [_release_id, area_keys, source_ids, geometries, tiers, properties]}] =
+    assert [{_sql, [run_id, executor_id, area_keys, source_ids, geometries, tiers, properties]}] =
              boundary_queries
 
+    assert run_id == Ecto.UUID.dump!(state.run.run_id)
+    assert executor_id == Ecto.UUID.dump!(state.executor_id)
     assert area_keys == ["demo_auth:city:first", "demo_auth:city:third"]
     assert length(source_ids) == 2
     assert length(geometries) == 2
     assert Enum.map(geometries, &hd(hd(&1.coordinates))) == [{0.0, 0.0}, {2.0, 2.0}]
     assert tiers == [0, 0]
     assert properties == [%{}, %{}]
+  end
+
+  test "every set-based write disables checkout retries and keeps the phase timeout" do
+    state =
+      normalize_fixture(
+        MixedGeometryProvider,
+        [%{key: "city", rank: 30}],
+        [%{"code" => "first", "geometry" => true}]
+      )
+
+    recording = %{state | context: %{state.context | repo: RecordingRepo}}
+
+    assert {:ok, %State{}} = Normalize.normalize(recording)
+    recorded = recorded_queries_with_params_and_opts()
+    expected_run_id = Ecto.UUID.dump!(state.run.run_id)
+
+    for fragment <- ~w(
+      upsert_area_many
+      put_area_name_many
+      put_area_code_many
+      put_area_in_release_many
+      put_boundaries
+    ) do
+      {_sql, [run_id | _params], opts} =
+        Enum.find(recorded, fn {sql, _params, _opts} -> sql =~ fragment end)
+
+      assert run_id == expected_run_id, "#{fragment} is not fenced by the import run"
+      assert opts[:timeout] == 30_000, "#{fragment} lost the phase timeout"
+      assert opts[:checkout_retries] == 0, "#{fragment} permits an ambiguous retry"
+    end
   end
 
   # Registers a collection carrying `area_types` under a fixed authority key,
@@ -349,23 +382,53 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
       ImportFixture.teardown!(collection)
     end)
 
-    Catalog.upsert_collection(context, %{key: collection, name: collection})
-    Catalog.upsert_authority(context, collection, %{key: "demo_auth", name: "Demo Authority"})
+    manifest_map = %{
+      "collection" => collection,
+      "collection_name" => collection,
+      "release" => "r1",
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "authorities" => [%{"key" => "demo_auth", "name" => "Demo Authority"}],
+      "area_types" =>
+        Enum.map(area_types, fn area_type ->
+          %{
+            "key" => area_type.key,
+            "rank" => area_type.rank,
+            "requires_geometry" => Map.get(area_type, :requires_geometry, false)
+          }
+        end),
+      "sources" => [
+        %{
+          "source_key" => "fixture:source",
+          "provider" => "geojson",
+          "license" => "test",
+          "release_key" => "v1",
+          "artifacts" => [
+            %{
+              "logical_name" => "fixture",
+              "operator_supplied" => true,
+              "format" => "json",
+              "sha256" => String.duplicate("0", 64),
+              "bytes" => 1
+            }
+          ]
+        }
+      ],
+      "options" => %{"area_type" => hd(area_types).key, "code_property" => "code"}
+    }
 
-    Enum.each(area_types, fn area_type ->
-      Catalog.upsert_area_type(context, collection, area_type)
-    end)
+    {:ok, manifest} = Manifest.from_map(manifest_map)
 
-    release_id =
-      Catalog.open_release(context, collection, %{
-        release_key: "r1",
-        manifest: %{"collection" => collection},
-        source_date: ~D[2026-01-15]
-      })
+    candidate =
+      ImportFixture.prepare!(context, manifest,
+        owner: "normalize-fixture",
+        runner_backend: "test",
+        stale_after_seconds: 300
+      )
 
     Catalog.upsert_source(context, collection, %{
       source_key: "fixture:source",
-      provider: "fixture",
+      provider: "geojson",
       license: "test"
     })
 
@@ -377,24 +440,26 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
         metadata: %{}
       })
 
-    Catalog.attach_source_release(context, release_id, source_release_id)
+    Catalog.attach_source_release(context, candidate.release_id, source_release_id)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "normalize-fixture",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    run_id = candidate.run_id
+    executor_id = Ecto.UUID.generate()
+    assert :claimed = Catalog.claim_import_execution(context, run_id, executor_id)
 
-    on_exit({__MODULE__, {:staging, run_id}}, fn -> Staging.drop(context, run_id) end)
+    on_exit({__MODULE__, {:staging, run_id}}, fn ->
+      Staging.drop(context, run_id, executor_id)
+    end)
 
-    Staging.create(context, run_id)
+    ImportFixture.advance_to!(context, run_id, executor_id, "staging")
+    Staging.create(context, run_id, executor_id)
     rows = Enum.map(payloads, &%Staging.Row{artifact: "fixture", payload: &1, geom: nil})
-    Staging.insert(context, run_id, rows)
+    Staging.insert(context, run_id, executor_id, rows)
+    ImportFixture.advance_to!(context, run_id, executor_id, "normalizing")
 
     %State{
       context: context,
       run: Catalog.import_run(context, run_id),
+      executor_id: executor_id,
       opts: [],
       work_dir: System.tmp_dir!(),
       publish?: false,
@@ -435,6 +500,15 @@ defmodule GeoGenius.Pipeline.NormalizeTest do
   defp recorded_queries do
     receive do
       {:query, sql, params, _opts} -> [{sql, params} | recorded_queries()]
+    after
+      0 -> []
+    end
+  end
+
+  defp recorded_queries_with_params_and_opts do
+    receive do
+      {:query, sql, params, opts} ->
+        [{sql, params, opts} | recorded_queries_with_params_and_opts()]
     after
       0 -> []
     end

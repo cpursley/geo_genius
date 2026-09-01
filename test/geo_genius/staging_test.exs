@@ -1,37 +1,22 @@
 defmodule GeoGenius.StagingTest do
   use ExUnit.Case, async: false
 
-  alias GeoGenius.{Catalog, Context, GraphFixture, Staging, StagingError}
+  alias GeoGenius.{CatalogError, Context, ImportFixture, Staging, StagingError}
 
   setup do
-    GraphFixture.teardown!()
-    on_exit(&GraphFixture.teardown!/0)
-
     context = Context.new(repo: GeoGenius.TestRepo, prefix: "geo_genius")
-    Catalog.upsert_collection(context, %{key: "demo", name: "Demo", description: nil})
+    {_, _, run_id} = ImportFixture.claim_run!(context, owner: "worker-1")
+    executor_id = ImportFixture.claim_executor!(context, run_id)
+    ImportFixture.advance_to!(context, run_id, executor_id, "staging")
 
-    release_id =
-      Catalog.open_release(context, "demo", %{
-        release_key: "r1",
-        manifest: %{},
-        source_date: nil
-      })
+    on_exit(fn -> Staging.drop(context, run_id, executor_id) end)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
-
-    on_exit(fn -> Staging.drop(context, run_id) end)
-
-    {:ok, context: context, run_id: run_id}
+    {:ok, context: context, run_id: run_id, executor_id: executor_id}
   end
 
   test "the Elixir table-name derivation matches the SQL one",
-       %{context: context, run_id: run_id} do
-    assert Staging.create(context, run_id) == Staging.table_name(run_id)
+       %{context: context, run_id: run_id, executor_id: executor_id} do
+    assert Staging.create(context, run_id, executor_id) == Staging.table_name(run_id)
   end
 
   test "table_name refuses anything that is not a uuid" do
@@ -49,8 +34,8 @@ defmodule GeoGenius.StagingTest do
     end
   end
 
-  test "inserts a batch and reads it back", %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+  test "inserts a batch and reads it back", fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
     rows = [
       %Staging.Row{
@@ -65,76 +50,123 @@ defmodule GeoGenius.StagingTest do
       }
     ]
 
-    assert Staging.insert(context, run_id, rows) == 2
-    assert Staging.count(context, run_id) == 2
+    assert Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, rows) == 2
+    assert Staging.count(fixture.context, fixture.run_id) == 2
 
-    read = context |> Staging.stream(run_id) |> Enum.to_list()
+    read = fixture.context |> Staging.stream(fixture.run_id) |> Enum.to_list()
 
     assert length(read) == 2
     assert Enum.map(read, & &1.payload["id"]) == ["1", "2"]
     assert Enum.map(read, & &1.artifact) == ["a.geojson", "a.geojson"]
   end
 
-  test "the payload arrives as a decoded object, not a JSON string",
-       %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+  test "an insert disables connection checkout retries without losing its timeout",
+       fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
+    recording = %{fixture.context | repo: GeoGenius.RecordingRepo}
 
-    Staging.insert(context, run_id, [
+    assert Staging.insert(
+             recording,
+             fixture.run_id,
+             fixture.executor_id,
+             [%Staging.Row{artifact: "a", payload: %{"id" => "1"}, geom: nil}],
+             timeout: 42_000,
+             checkout_retries: 7
+           ) == 1
+
+    assert_received {:query, sql, [bound_run_id, bound_executor_id, artifacts, payloads, geoms],
+                     opts}
+
+    assert sql =~ ~s|"geo_genius".insert_staging_many($1, $2, $3, $4, $5)|
+    assert bound_run_id == Ecto.UUID.dump!(fixture.run_id)
+    assert bound_executor_id == Ecto.UUID.dump!(fixture.executor_id)
+    assert artifacts == ["a"]
+    assert payloads == [%{"id" => "1"}]
+    assert geoms == [nil]
+    assert opts[:timeout] == 42_000
+    assert opts[:checkout_retries] == 0
+  end
+
+  test "an insert accepts an executor UUID already dumped for Postgrex", fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
+    recording = %{fixture.context | repo: GeoGenius.RecordingRepo}
+    dumped_executor_id = Ecto.UUID.dump!(fixture.executor_id)
+
+    assert Staging.insert(
+             recording,
+             fixture.run_id,
+             dumped_executor_id,
+             [%Staging.Row{artifact: "a", payload: %{"id" => "1"}, geom: nil}]
+           ) == 1
+
+    assert_received {:query, _sql, [_run_id, ^dumped_executor_id, _artifacts, _payloads, _geoms],
+                     _opts}
+  end
+
+  test "the payload arrives as a decoded object, not a JSON string",
+       fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
+
+    Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, [
       %Staging.Row{artifact: "a", payload: %{"nested" => %{"k" => [1, 2]}}, geom: nil}
     ])
 
-    assert [row] = context |> Staging.stream(run_id) |> Enum.to_list()
+    assert [row] = fixture.context |> Staging.stream(fixture.run_id) |> Enum.to_list()
     assert row.payload == %{"nested" => %{"k" => [1, 2]}}
     refute is_binary(row.payload)
   end
 
   test "geometry round-trips as a Geo struct and nil stays nil",
-       %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+       fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
     polygon = %Geo.Polygon{
       coordinates: [[{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}, {0.0, 1.0}, {0.0, 0.0}]],
       srid: 4326
     }
 
-    Staging.insert(context, run_id, [
+    Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, [
       %Staging.Row{artifact: "a", payload: %{"n" => 1}, geom: polygon},
       %Staging.Row{artifact: "a", payload: %{"n" => 2}, geom: nil}
     ])
 
-    assert [first, second] = context |> Staging.stream(run_id) |> Enum.to_list()
+    assert [first, second] = fixture.context |> Staging.stream(fixture.run_id) |> Enum.to_list()
     assert %Geo.Polygon{srid: 4326} = first.geom
     assert first.geom.coordinates == polygon.coordinates
     assert second.geom == nil
   end
 
-  test "streams across more rows than one batch holds", %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+  test "streams across more rows than one batch holds", fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
     rows =
       for n <- 1..2500 do
         %Staging.Row{artifact: "a", payload: %{"n" => n}, geom: nil}
       end
 
-    rows |> Enum.chunk_every(500) |> Enum.each(&Staging.insert(context, run_id, &1))
+    rows
+    |> Enum.chunk_every(500)
+    |> Enum.each(&Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, &1))
 
-    assert Staging.count(context, run_id) == 2500
+    assert Staging.count(fixture.context, fixture.run_id) == 2500
 
-    read = context |> Staging.stream(run_id, batch_size: 100) |> Enum.to_list()
+    read = fixture.context |> Staging.stream(fixture.run_id, batch_size: 100) |> Enum.to_list()
 
     assert length(read) == 2500
     assert Enum.map(read, & &1.payload["n"]) == Enum.to_list(1..2500)
   end
 
-  test "streams in pages rather than one unbounded query", %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+  test "streams in pages rather than one unbounded query", fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
     rows =
       for n <- 1..2500 do
         %Staging.Row{artifact: "a", payload: %{"n" => n}, geom: nil}
       end
 
-    rows |> Enum.chunk_every(500) |> Enum.each(&Staging.insert(context, run_id, &1))
+    rows
+    |> Enum.chunk_every(500)
+    |> Enum.each(&Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, &1))
 
     test_pid = self()
     handler_id = "staging-round-trip-#{System.unique_integer([:positive])}"
@@ -152,7 +184,7 @@ defmodule GeoGenius.StagingTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    read = context |> Staging.stream(run_id, batch_size: 100) |> Enum.to_list()
+    read = fixture.context |> Staging.stream(fixture.run_id, batch_size: 100) |> Enum.to_list()
 
     assert length(read) == 2500
 
@@ -166,39 +198,43 @@ defmodule GeoGenius.StagingTest do
   end
 
   test "an empty batch inserts nothing and does not fail",
-       %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+       fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
-    assert Staging.insert(context, run_id, []) == 0
-    assert Staging.count(context, run_id) == 0
+    assert Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, []) == 0
+    assert Staging.count(fixture.context, fixture.run_id) == 0
   end
 
   test "an empty batch still validates run_id rather than short-circuiting", %{context: context} do
-    assert_raise ArgumentError, fn -> Staging.insert(context, "not-a-uuid", []) end
+    assert_raise ArgumentError, fn ->
+      Staging.insert(context, "not-a-uuid", Ecto.UUID.generate(), [])
+    end
   end
 
-  test "drop removes the table and is idempotent", %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+  test "drop removes the table and is idempotent", fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
-    Staging.insert(context, run_id, [
+    Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, [
       %Staging.Row{artifact: "a", payload: %{"n" => 1}, geom: nil}
     ])
 
-    assert Staging.count(context, run_id) == 1
+    assert Staging.count(fixture.context, fixture.run_id) == 1
 
-    assert :ok = Staging.drop(context, run_id)
-    assert_raise StagingError, fn -> Staging.count(context, run_id) end
+    assert_raise CatalogError, fn -> Staging.drop(fixture.context, fixture.run_id) end
 
-    assert :ok = Staging.drop(context, run_id)
+    assert :ok = Staging.drop(fixture.context, fixture.run_id, fixture.executor_id)
+    assert_raise StagingError, fn -> Staging.count(fixture.context, fixture.run_id) end
+
+    assert :ok = Staging.drop(fixture.context, fixture.run_id, fixture.executor_id)
   end
 
   test "a value the driver cannot encode surfaces as a StagingError, not a bare driver error",
-       %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+       fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
     error =
       assert_raise StagingError, fn ->
-        Staging.insert(context, run_id, [
+        Staging.insert(fixture.context, fixture.run_id, fixture.executor_id, [
           %Staging.Row{artifact: "a", payload: %{"n" => 1}, geom: %{"type" => "Point"}}
         ])
       end
@@ -206,11 +242,16 @@ defmodule GeoGenius.StagingTest do
     assert error.operation == "insert"
   end
 
-  test "stream refuses a non-positive batch_size", %{context: context, run_id: run_id} do
-    Staging.create(context, run_id)
+  test "stream refuses a non-positive batch_size", fixture do
+    Staging.create(fixture.context, fixture.run_id, fixture.executor_id)
 
-    assert_raise ArgumentError, fn -> Staging.stream(context, run_id, batch_size: 0) end
-    assert_raise ArgumentError, fn -> Staging.stream(context, run_id, batch_size: -1) end
+    assert_raise ArgumentError, fn ->
+      Staging.stream(fixture.context, fixture.run_id, batch_size: 0)
+    end
+
+    assert_raise ArgumentError, fn ->
+      Staging.stream(fixture.context, fixture.run_id, batch_size: -1)
+    end
   end
 
   defp count_received(tag, acc \\ 0) do

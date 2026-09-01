@@ -12,13 +12,12 @@
   output, substitutes the quoted host-selected schema, and renders the consolidated v1 install
   or uninstall. GeoGenius still never migrates a host automatically; the host commits and applies
   the rendered SQL or generated Ecto wrapper itself.
-- **Historical pre-release v1 installs have an explicit reconciliation path.**
-  `GeoGenius.Migration.contract_status/2` distinguishes the frozen `legacy_v01_aebc28a`
-  shape, the current content-addressed contract, and unknown drift;
-  `render_reconciliation_sql/1`, `reconcile/1`, and
-  `mix geo_genius.reconciliation_sql` produce or apply only a literal reversible edge.
-  Reconciliation is host-owned and transactional and never runs from Preflight, startup, or a
-  catalog call.
+- **Pre-production installs use a return-and-reinstall policy.** Schema version 1 describes only
+  the package's current schema contract; no reconciliation API, task, or compatibility edge is
+  published for older development snapshots that also called themselves version 1. Return the
+  host-owned setup migration, update GeoGenius, reinstall v1, and run `check_schema`. This is a
+  destructive pre-production policy for catalogs reproducible from reviewed manifests and
+  checksummed artifacts, not a production migration strategy.
 - **PgFlow `>= 0.3.4 and < 0.4.0` is an optional integration dependency.** This establishes
   dependency compile order whenever a host opts into PgFlow, so
   `GeoGenius.Runners.PgFlow.Job` is compiled after `PgFlow.Job`; hosts without PgFlow still
@@ -211,6 +210,25 @@
 
 ### Ingestion
 
+- **Import ownership is exact-attempt and run-fenced.** `prepare_import/2` registers the exact
+  manifest and returns a candidate decision; `retry_failed/3` is the only replacement path and
+  creates a new run while preserving the failed attempt's manifest, artifact observations,
+  metrics, and error. Release-owned ingestion writes now take `run_id`, verify the latest lease
+  and permitted phase, and refuse failed or superseded attempts.
+- **Executor ownership is single-flight.** `claim_import_execution/2` latches the first executor
+  for a pending attempt and returns `occupied` to duplicate deliveries. A stale heartbeat is
+  diagnostic and never authorizes takeover; an abandoned attempt is failed explicitly and then
+  retried as a new attempt.
+- **Import publication is atomic.** `publish_import/2` completes the publishing run, removes its
+  lease, verifies the release, and swaps publication in one transaction. `publish_release/1`
+  remains the operator API and refuses an active or incompletely imported release.
+- **Lost-reply and retry policy are explicit.** Catalog mutations disable DBConnection checkout
+  retries. An unresolved executor claim terminalizes with the same executor id or keeps the
+  guardian armed. `fail_import` can claim an unclaimed pending lease in the same statement.
+  `retry_failed` is idempotent against its immediate pending successor. `complete_import` lost
+  replies reread completed instead of recording failure. Duplicate `logical_name` values across
+  sources are rejected. `prepare_import` no longer contains an unreachable reset branch.
+
 - **Six set writes: `upsert_area_many`, `put_area_name_many`, `put_area_code_many`,
   `put_area_in_release_many`, `put_relation_many`, and `put_boundaries`,** each taking one array per column
   and pairing them by position, with `GeoGenius.Catalog` wrappers of the same names taking
@@ -237,7 +255,7 @@
   it is written, so a provider returning an illegal name kind, or a staged row naming an
   artifact the run did not stage, fails the phase with nothing of that page written rather
   than with the areas ahead of the failure already in the catalog. Earlier pages stay
-  committed, which is what keeps the phase resumable.
+  committed during that attempt; a failed attempt is preserved and retried under a new run id.
 - **An unresolved key now names itself.** The plural writes resolve keys by joining, and
   report an unresolved one through the new `assert_resolved` guard, which raises the same
   `P0002` that `SELECT ... INTO STRICT` raised but appends the key: `query returned no rows
@@ -296,8 +314,8 @@
   measured import reported 150,622 staged rows into a table holding 301,244. Doubling the
   work is the mild half; the other half is that the stale rows are normalized too, so a
   row deleted from the source between attempts is resurrected into the release. The new
-  `GeoGenius.Staging.reset/2` drops and recreates the table, and the staging phase calls
-  it in place of `create/2`. No SQL changed: `create_staging` still keeps what it finds,
+  `GeoGenius.Staging.reset/3` drops and recreates the table, and the staging phase calls
+  it in place of `create/3`. No SQL changed: `create_staging` still keeps what it finds,
   and a host driving staging through the SQL API calls `drop_staging` before it.
 - **Every `authorities` and `area_types` entry is validated field by field.** An entry
   naming no `key`, an authority naming no `name`, or an area type whose `rank` is not a
@@ -377,11 +395,11 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
   `related_areas` for hierarchy traversal. The `resolve` cascade tries containment, code,
   name, and proximity in order against a single JSON input and returns the first
   strategy's matches, with `parent_area_key` scoping the code and name strategies.
-- **Import runs** — a durable `import_run` state machine (`begin_or_resume_import`,
-  `heartbeat_import`, `advance_import`, `fail_import`) with a heartbeat lease and stale
-  reclaim, so a crashed or replaced worker can resume rather than double-run an import.
-  `completed` is terminal on both write paths: neither advancing nor failing can move a
-  run out of it, so a late error cannot overwrite the outcome of a run that published.
+- **Import runs** — a durable exact-attempt state machine (`prepare_import`, `retry_failed`,
+  `claim_import_execution`, `heartbeat_import`, `advance_import`, `fail_import`) with one
+  executor per attempt and explicit retry. A stale run is never taken over or rewritten; its
+  manifest, artifact observations, metrics, and error remain evidence while a retry gets a new
+  run id. `completed` and `failed` are terminal, so a late error cannot overwrite history.
 - **Host integration** — `GeoGenius.Preflight` for a startup-time prerequisite check
   (extensions, geometry and jsonb decoding, and schema version), and `mix geo_genius.setup`,
   `mix geo_genius.gen.migration`, `mix geo_genius.check_schema`, and
@@ -409,9 +427,10 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
   nothing and an operator-supplied file is the same lookup as a fetched one. Cache hits
   are hashed on every run, and `record_artifact_observation` in PostgreSQL is the only
   place an expectation meets an observation.
-- **Providers** — `GeoGenius.Provider` (`area_types/0`, `required_options/0`,
-  `artifacts/1`, `stage/5`, `normalize/2`, `relations/1`) with three implementations:
-  `Providers.GeoJSON`, `Providers.CSV`, and `Providers.Shapefile`, the last converting its
+- **Providers** — `GeoGenius.Provider` (`required_options/0`, `validate_options/1`,
+  `validate_manifest/1`, `artifacts/1`, `stage/5`, `normalize/2`, `relations/1`, and
+  `asserted_relations/2`) with four implementations: `Providers.GeoJSON`, `Providers.CSV`,
+  `Providers.Shapefile`, and `Providers.SimpleMaps`; the shapefile provider converts its
   archive through `ogr2ogr`. A host registers its own under
   `config :geo_genius, :providers`.
 - **Adapters** — `GeoGenius.Cache` (`Caches.FileSystem`), `GeoGenius.Downloader`
@@ -423,8 +442,9 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
 - **The import pipeline** — `GeoGenius.Pipeline` walks a claimed run through downloading,
   validating, staging, normalizing, relating, indexing, and verifying, advancing the
   durable run row at each boundary and heartbeating its lease from inside long phases. It
-  opens no transaction, drops its staging table on success and failure alike, and records
-  every failure durably before returning it.
+  opens no transaction around the full run, drops its staging table on success and failure
+  alike, records every failure durably, and uses `publish_import` for atomic completion and
+  publication.
 - **Runner backends** — `GeoGenius.Runner` with `Runners.Task` (the zero-configuration
   default, running each import under a supervised `Task.Supervisor`), `Runners.Inline`
   (the calling process), and `Runners.PgFlow` (available only to a host that has installed
@@ -433,9 +453,9 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
   `GeoGenius.Runner.module_for_backend/1`. Nothing in the library reads it back: run
   cancellation, the feature that would have, is not shipped, and the column stands as the
   durable record of which backend claimed a run.
-- **Elixir ingestion API** — `GeoGenius.import/1`, `status/2`, `await/3`, `publish/2`,
-  `rollback/2`, and `published_release/2`. Registration is idempotent end to end, and
-  importing never publishes unless asked.
+- **Elixir ingestion API** — `GeoGenius.import/1`, `retry_failed/2`, `status/2`, `await/3`,
+  `publish/2`, `rollback/2`, and `published_release/2`. Registration is idempotent end to
+  end, failed replacement is explicit, and importing never publishes unless asked.
 - **Operational mix tasks** — `mix geo_genius.import`, `mix geo_genius.publish`,
   `mix geo_genius.rollback`, `mix geo_genius.status`, and `mix geo_genius.sweep_staging`.
   The two that change what hosts see, and the one that drops tables, do nothing without
@@ -443,19 +463,18 @@ host-selected PostgreSQL schema through [EctoEvolver](https://github.com/agoodwa
 - **Boot-time enqueue** — `GeoGenius.Bootstrap`, an optional child a host places in its
   own supervision tree, disabled unless `config :geo_genius, :bootstrap` sets
   `enabled: true`.
-- **New SQL** — `upsert_source`, `upsert_source_release`, `put_artifact`,
+- **New SQL** — `prepare_import`, `retry_failed`, `claim_import_execution`,
+  `publish_import`, `upsert_source`, `upsert_source_release`, `put_artifact`,
   `record_artifact_observation`, `open_release`, `attach_source_release`,
-  `staging_table_name`, `create_staging`, `drop_staging`, `analyze_release`, and
-  `published_release`, plus the `import_run_status` and `release_artifacts` views.
+  `staging_table_name`, `create_staging`, `insert_staging_many`, `drop_staging`,
+  `analyze_release`, `analyze_import`, and `published_release`, plus the
+  `import_run_status`, `run_artifacts`, and `release_artifacts` views.
 
 ### Registration
 
-- **`GeoGenius.Registration.register/2`** writes the catalog rows a manifest describes --
-  the collection, its authorities and area types, the release, and every source, source
-  release and artifact -- and returns the release id. This is steps 2 through 6 of
-  `GeoGenius.import/1`, lifted out so a host or a test that claims an import run directly
-  registers through the same function the public entry point does, rather than
-  reimplementing it. Registration remains idempotent end to end.
+- **`GeoGenius.Registration.prepare_import/3` and `retry_failed/4`** translate the catalog's closed
+  candidate decisions into the public import lifecycle. Registration and attempt creation are
+  one transaction; retry targets one failed latest run explicitly rather than reopening it.
 
 ### Deliberate deviations from the specification
 

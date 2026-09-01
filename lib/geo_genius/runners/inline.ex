@@ -34,19 +34,29 @@ defmodule GeoGenius.Runners.Inline do
   Returns `:ok` for both an import that completed and one that ran and
   recorded a failure -- either outcome is durably in the catalog, and a
   caller reads it back from there rather than from this return value.
-  Returns `{:error, reason}` only when nothing was recorded and nothing ever
-  will be: `Pipeline.execute/3`'s own `{:unrecorded, reason}` case, the one
-  situation where there is no run state for a caller to read back.
+  Returns `{:error, {:not_enqueued, reason}}` only when the pipeline reports
+  `:not_started`. A missing durable outcome after executor claim returns
+  `{:error, {:outcome_unknown, reason}}`, because the import may have mutated
+  its candidate even though its final state could not be confirmed.
   """
   @spec enqueue(GeoGenius.Context.t(), Ecto.UUID.t(), Runner.args()) ::
-          :ok | {:error, String.t()}
+          :ok | {:error, Runner.enqueue_error()}
   def enqueue(context, run_id, args) do
-    opts = [publish: Runner.publish?(args), stale_after_seconds: Runner.stale_after_seconds(args)]
+    case Pipeline.execute(context, run_id, Runner.pipeline_opts(args)) do
+      {:ok, _run} ->
+        :ok
 
-    case Pipeline.execute(context, run_id, opts) do
-      {:ok, _run} -> :ok
-      {:error, {:unrecorded, reason}} -> {:error, reason}
-      {:error, %GeoGenius.ImportRun{}} -> :ok
+      {:noop, _run} ->
+        :ok
+
+      {:error, {:unrecorded, :not_started, reason}} ->
+        {:error, {:not_enqueued, reason}}
+
+      {:error, {:unrecorded, :outcome_unknown, reason}} ->
+        {:error, {:outcome_unknown, reason}}
+
+      {:error, %GeoGenius.ImportRun{}} ->
+        :ok
     end
   end
 end

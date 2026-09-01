@@ -20,7 +20,7 @@ defmodule GeoGenius.Pipeline.Relate do
 
   Asserted edges are written after normalization, so an edge may name any
   area the run produced rather than only the ones its own row emitted --
-  `GeoGenius.Catalog.put_relation_many/3` requires both areas to already be
+  `GeoGenius.Catalog.put_relation_many/4` requires both areas to already be
   members of the release, which every area `GeoGenius.Pipeline.Normalize`
   wrote already is by the time this phase runs.
 
@@ -32,7 +32,7 @@ defmodule GeoGenius.Pipeline.Relate do
   lease with nothing renewing it.
 
   A provider's own defect -- an edge naming an area absent from the release,
-  an unknown `relation_type` -- raises out of `Catalog.put_relation_many/3` and is
+  an unknown `relation_type` -- raises out of `Catalog.put_relation_many/4` and is
   left to propagate. It is not rescued here: `GeoGenius.Pipeline` catches
   whatever a phase raises and records it as `{:exception, exception,
   stacktrace}`, the same structured detail every other phase's provider call
@@ -52,7 +52,7 @@ defmodule GeoGenius.Pipeline.Relate do
   `relations/1` returns `:rebuild`) and `"asserted_relations"`, which counts
   edges asserted rather
   than distinct edges written: two rows asserting the same edge each add
-  one, even though `put_relation_many/3` deduplicates and the edge itself
+  one, even though `put_relation_many/4` deduplicates and the edge itself
   converges to a single row.
   """
   @spec relate(State.t()) :: State.result()
@@ -78,7 +78,9 @@ defmodule GeoGenius.Pipeline.Relate do
   end
 
   defp rebuild_relations(state) do
-    Catalog.rebuild_relations(state.context, state.run.release_id, timeout: state.timeout)
+    Catalog.rebuild_relations(state.context, state.run.run_id, state.executor_id,
+      timeout: state.timeout
+    )
   end
 
   defp write_asserted_relations(%State{} = state) do
@@ -94,7 +96,14 @@ defmodule GeoGenius.Pipeline.Relate do
   # repeat was its own round trip before.
   defp assert_batch(rows, state, count) do
     edges = Enum.flat_map(rows, &asserted_edges(&1, state))
-    Catalog.put_relation_many(state.context, state.run.release_id, edges)
+
+    Catalog.put_relation_many(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      edges,
+      timeout: state.timeout
+    )
 
     count = count + length(edges)
     heartbeat(state, count)
@@ -102,7 +111,12 @@ defmodule GeoGenius.Pipeline.Relate do
   end
 
   defp heartbeat(state, count) do
-    Catalog.heartbeat_import(state.context, state.run.run_id, %{"asserted_relations" => count})
+    Catalog.heartbeat_import(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      %{"asserted_relations" => count}
+    )
   end
 
   # A row's edges come from the provider that staged it, the same dispatch

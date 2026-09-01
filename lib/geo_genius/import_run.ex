@@ -30,7 +30,10 @@ defmodule GeoGenius.ImportRun do
     :completed_at,
     :error,
     :stage_metrics,
-    :progress
+    :progress,
+    :executor_id,
+    :execution_started_at,
+    :manifest
   ]
 
   @type t :: %__MODULE__{
@@ -47,7 +50,10 @@ defmodule GeoGenius.ImportRun do
           completed_at: DateTime.t() | nil,
           error: map() | nil,
           stage_metrics: map() | nil,
-          progress: map() | nil
+          progress: map() | nil,
+          executor_id: Ecto.UUID.t() | nil,
+          execution_started_at: DateTime.t() | nil,
+          manifest: map() | nil
         }
 
   @fields %{
@@ -64,7 +70,10 @@ defmodule GeoGenius.ImportRun do
     "completed_at" => :completed_at,
     "error" => :error,
     "stage_metrics" => :stage_metrics,
-    "progress" => :progress
+    "progress" => :progress,
+    "executor_id" => :executor_id,
+    "execution_started_at" => :execution_started_at,
+    "manifest" => :manifest
   }
 
   @doc """

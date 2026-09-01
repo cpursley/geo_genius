@@ -1,6 +1,6 @@
 BEGIN;
 
-SELECT plan(30);
+SELECT plan(37);
 
 SELECT has_function('geo_genius', 'staging_table_name', 'staging_table_name exists');
 SELECT has_function('geo_genius', 'create_staging', 'create_staging exists');
@@ -10,16 +10,47 @@ SELECT has_function('geo_genius', 'published_release', 'published_release exists
 SELECT has_view('geo_genius', 'import_run_status', 'import_run_status view exists');
 SELECT has_view('geo_genius', 'release_artifacts', 'release_artifacts view exists');
 
-SELECT geo_genius.upsert_collection('demo', 'Demo', NULL);
-SELECT geo_genius.open_release('demo', 'r1', '{}'::jsonb, NULL);
-
 SELECT is(
-  geo_genius.begin_or_resume_import(
-    (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-    'worker-1', 'test', interval '5 minutes'
-  ) IS NOT NULL,
-  true,
+  (SELECT decision FROM geo_genius.prepare_import(
+    '{"collection":"demo","collection_name":"Demo","release":"r1",
+      "requires_geometry":false,"authorities":[],"area_types":[],"sources":[]}'::jsonb,
+    '{"owner":"worker-1","runner_backend":"test","stale_after_seconds":300}'::jsonb
+  )),
+  'enqueue',
   'a run is claimed for the staging test'
+);
+
+CREATE TEMP TABLE staging_attempt (
+  run_id uuid PRIMARY KEY,
+  executor_id uuid NOT NULL
+);
+
+INSERT INTO staging_attempt (run_id, executor_id)
+SELECT run_id, geo_genius_test.claim_import_executor(run_id)
+  FROM (SELECT geo_genius_test.import_run_id('demo', 'r1') AS run_id) AS prepared;
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  'downloading', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  'validating', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  'staging', '{}'::jsonb
 );
 
 SELECT is(
@@ -42,14 +73,20 @@ SELECT throws_ok(
 -- is missing has nothing to join to and mix geo_genius.sweep_staging can
 -- never reclaim it.
 SELECT throws_ok(
-  $$SELECT geo_genius.create_staging('00000000-0000-0000-0000-000000000000'::uuid)$$,
+  $$SELECT geo_genius.create_staging(
+      '00000000-0000-0000-0000-000000000000'::uuid,
+      (SELECT executor_id FROM staging_attempt LIMIT 1))$$,
   '23503',
   'import run 00000000-0000-0000-0000-000000000000 does not exist',
   'create_staging refuses a run that does not exist'
 );
 
 SELECT is(
-  geo_genius.create_staging((SELECT id FROM geo_genius.import_run LIMIT 1)),
+  geo_genius.create_staging(
+    (SELECT run_id FROM staging_attempt
+      WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+    (SELECT executor_id FROM staging_attempt
+      WHERE run_id = geo_genius_test.import_run_id('demo', 'r1'))),
   geo_genius.staging_table_name((SELECT id FROM geo_genius.import_run LIMIT 1)),
   'create_staging returns the table name it created'
 );
@@ -133,7 +170,11 @@ END;
 $seed$;
 
 SELECT lives_ok(
-  $$SELECT geo_genius.create_staging((SELECT id FROM geo_genius.import_run LIMIT 1))$$,
+  $$SELECT geo_genius.create_staging(
+      (SELECT run_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+      (SELECT executor_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')))$$,
   'create_staging is idempotent'
 );
 
@@ -146,7 +187,46 @@ SELECT results_eq(
   'create_staging keeps rows already in the table rather than replacing it'
 );
 
-SELECT geo_genius.drop_staging((SELECT id FROM geo_genius.import_run LIMIT 1));
+SELECT throws_ok(
+  $$SELECT geo_genius.drop_staging((SELECT id FROM geo_genius.import_run LIMIT 1))$$,
+  '55000',
+  NULL,
+  'operator staging cleanup refuses an active import'
+);
+
+SELECT throws_ok(
+  $$SELECT geo_genius.drop_staging(NULL)$$,
+  '22004',
+  NULL,
+  'operator staging cleanup requires a run id'
+);
+
+SELECT throws_ok(
+  $$SELECT geo_genius.drop_staging(
+      (SELECT run_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+      NULL)$$,
+  '22004',
+  NULL,
+  'executor-fenced staging cleanup requires an executor id'
+);
+
+SELECT throws_ok(
+  $$SELECT geo_genius.drop_staging(
+      (SELECT run_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+      '00000000-0000-0000-0000-000000000001'::uuid)$$,
+  '55000',
+  NULL,
+  'executor-fenced staging cleanup rejects a different executor'
+);
+
+SELECT geo_genius.drop_staging(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1'))
+);
 
 SELECT hasnt_table(
   'geo_genius',
@@ -155,8 +235,46 @@ SELECT hasnt_table(
 );
 
 SELECT lives_ok(
-  $$SELECT geo_genius.drop_staging((SELECT id FROM geo_genius.import_run LIMIT 1))$$,
-  'drop_staging is idempotent'
+  $$SELECT geo_genius.drop_staging(
+      (SELECT run_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+      (SELECT executor_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')))$$,
+  'executor-fenced drop_staging is idempotent'
+);
+
+SELECT geo_genius.create_staging(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1'))
+);
+
+SELECT geo_genius.fail_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')),
+  '{"reason":"staging cleanup fixture"}'::jsonb
+);
+
+SELECT lives_ok(
+  $$SELECT geo_genius.drop_staging(
+      (SELECT run_id FROM staging_attempt
+        WHERE run_id = geo_genius_test.import_run_id('demo', 'r1')))$$,
+  'operator staging cleanup permits a terminal import'
+);
+
+SELECT hasnt_table(
+  'geo_genius',
+  geo_genius.staging_table_name((SELECT id FROM geo_genius.import_run LIMIT 1)),
+  'operator staging cleanup removes a terminal import table'
+);
+
+SELECT lives_ok(
+  $$SELECT geo_genius.drop_staging(
+      '00000000-0000-0000-0000-000000000002'::uuid)$$,
+  'operator staging cleanup permits an orphan run id'
 );
 
 SELECT lives_ok(
@@ -207,12 +325,57 @@ SELECT is(
 SELECT geo_genius.upsert_authority('demo', 'demo_auth', 'Demo Authority');
 SELECT geo_genius.upsert_area_type('demo', 'outer', 10);
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'A');
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Area A', 'official', NULL);
 
 SELECT geo_genius.upsert_source('demo', 'demo:src', 'demo', 'test');
 SELECT geo_genius.upsert_source_release('demo', 'demo:src', 'v1', NULL, '{}'::jsonb);
 
-SELECT geo_genius.open_release('demo', 'r2', '{}'::jsonb, NULL);
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r2",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[{"key":"outer","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-staging","runner_backend":"pgtap"}'::jsonb
+);
+
+INSERT INTO staging_attempt (run_id, executor_id)
+SELECT run_id, geo_genius_test.claim_import_executor(run_id)
+  FROM (SELECT geo_genius_test.import_run_id('demo', 'r2') AS run_id) AS prepared;
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'downloading', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'validating', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'staging', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'normalizing', '{}'::jsonb
+);
 
 SELECT geo_genius.attach_source_release(
   (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
@@ -220,14 +383,59 @@ SELECT geo_genius.attach_source_release(
 );
 
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
   'demo_auth:outer:A',
   ST_GeogFromText('POINT(0 0)'),
   '{}'::jsonb
 );
 
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT geo_genius.put_area_name(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'demo_auth:outer:A', 'Area A', 'official', NULL);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'relating', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'indexing', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'verifying', '{}'::jsonb
+);
+
+SELECT geo_genius.advance_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  'publishing', '{}'::jsonb
+);
+SELECT geo_genius.publish_import(
+  (SELECT run_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2')),
+  (SELECT executor_id FROM staging_attempt
+    WHERE run_id = geo_genius_test.import_run_id('demo', 'r2'))
+);
 
 -- A published_release stubbed as `RETURN NULL;` would pass the earlier
 -- nothing-published check too, so the positive case is required to close

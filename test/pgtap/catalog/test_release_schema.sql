@@ -10,7 +10,7 @@ SELECT has_table('geo_genius', 'release_source', 'release_source table exists');
 SELECT has_table('geo_genius', 'publication', 'publication table exists');
 SELECT has_table('geo_genius', 'publication_event', 'publication_event table exists');
 
-INSERT INTO geo_genius.collection (key, name) VALUES ('demo', 'Demo');
+INSERT INTO geo_genius.collection (key) VALUES ('demo');
 
 INSERT INTO geo_genius.release (collection_id, release_key, manifest)
 SELECT id, 'demo-2026', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
@@ -66,7 +66,7 @@ SELECT throws_ok(
   'release status is constrained to the declared phases'
 );
 
-INSERT INTO geo_genius.collection (key, name) VALUES ('demo2', 'Demo Two');
+INSERT INTO geo_genius.collection (key) VALUES ('demo2');
 
 SELECT lives_ok(
   $$INSERT INTO geo_genius.release (collection_id, release_key, manifest)

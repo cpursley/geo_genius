@@ -1,7 +1,6 @@
--- area.official_name is denormalized, so the only thing standing between a
--- host and a stale name is the trigger that maintains it. Every way a name can
--- change has to leave the column agreeing with the rule the column stands for:
--- the official-kind name, locale NULLS FIRST, then name.
+-- Official names are release-selected metadata. The stable area row carries
+-- identity only, while each candidate records the names it reviewed and the
+-- deterministic winner projected by release_areas.
 BEGIN;
 
 SELECT plan(9);
@@ -12,93 +11,160 @@ SELECT geo_genius.upsert_area_type('names', 'unit', 10);
 SELECT geo_genius.upsert_area('names', 'n_auth', 'unit', 'A');
 SELECT geo_genius.upsert_area('names', 'n_auth', 'unit', 'B');
 
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"names",
+    "release":"r1",
+    "collection_name":"Names",
+    "requires_geometry":false,
+    "authorities":[{"key":"n_auth","name":"Names Authority"}],
+    "area_types":[{"key":"unit","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-official-name","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('names', 'r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'normalizing');
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:A', NULL, '{}'::jsonb);
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:B', NULL, '{}'::jsonb);
+
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:A'),
+  (SELECT official_name FROM geo_genius.release_area
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+      AND area_id = (SELECT id FROM geo_genius.area WHERE area_key = 'n_auth:unit:A')),
   NULL,
-  'an area with no names has no official name'
+  'an area with no names has no official name in the release'
 );
 
-SELECT geo_genius.put_area_name('n_auth:unit:A', 'Alpha', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:A', 'Alpha', 'official', NULL);
 
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:A'),
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+      AND area_key = 'n_auth:unit:A'),
   'Alpha',
-  'adding an official name sets it'
+  'adding an official name sets the release projection'
 );
 
--- An alias must not win, however it sorts.
-SELECT geo_genius.put_area_name('n_auth:unit:A', 'Aaaa', 'alias', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:A', 'Aaaa', 'alias', NULL);
 
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:A'),
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+      AND area_key = 'n_auth:unit:A'),
   'Alpha',
-  'a non-official name never becomes the official name'
+  'a non-official name never becomes the release official name'
 );
 
--- A localized official name that sorts earlier must still lose to the
--- unlocalized one: locale NULLS FIRST decides before name does.
-SELECT geo_genius.put_area_name('n_auth:unit:A', 'Aaa', 'official', 'aa');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:A', 'Aaa', 'official', 'aa');
 
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:A'),
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+      AND area_key = 'n_auth:unit:A'),
   'Alpha',
-  'an unlocalized official name outranks an alphabetically earlier localized one'
+  'an unlocalized official name outranks an earlier localized name'
 );
 
--- With no unlocalized name at all, locale order decides.
-SELECT geo_genius.put_area_name('n_auth:unit:B', 'Zulu', 'official', 'en');
-SELECT geo_genius.put_area_name('n_auth:unit:B', 'Bravo', 'official', 'aa');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:B', 'Zulu', 'official', 'en');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:B', 'Bravo', 'official', 'aa');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r1'),
+  geo_genius_test.import_executor_id('names', 'r1'),
+  'n_auth:unit:B', 'Bee', 'alias', NULL);
 
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:B'),
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+      AND area_key = 'n_auth:unit:B'),
   'Bravo',
-  'locale ordering decides when no unlocalized official name exists'
+  'locale ordering ignores a non-official attachment when no unlocalized official name exists'
 );
 
--- Removing the winner promotes the next one rather than leaving it stale.
-DELETE FROM geo_genius.area_name
- WHERE area_id = (SELECT id FROM geo_genius.area WHERE area_key = 'n_auth:unit:A')
-   AND name = 'Alpha';
-
-SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:A'),
-  'Aaa',
-  'deleting the winning name promotes the next candidate'
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"names",
+    "release":"r2",
+    "collection_name":"Candidate Names",
+    "requires_geometry":false,
+    "authorities":[{"key":"n_auth","name":"Candidate Authority"}],
+    "area_types":[{"key":"unit","rank":20,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-official-name","runner_backend":"pgtap"}'::jsonb
 );
-
--- Reassigning a name has to settle both the area losing it and the one
--- gaining it, which is the case a single-area refresh would miss.
-UPDATE geo_genius.area_name
-   SET area_id = (SELECT id FROM geo_genius.area WHERE area_key = 'n_auth:unit:B')
- WHERE area_id = (SELECT id FROM geo_genius.area WHERE area_key = 'n_auth:unit:A')
-   AND name = 'Aaa';
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('names', 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('names', 'r2'),
+  geo_genius_test.import_executor_id('names', 'r2'),
+  'normalizing');
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.import_run_id('names', 'r2'),
+  geo_genius_test.import_executor_id('names', 'r2'),
+  'n_auth:unit:A', NULL, '{}'::jsonb);
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.import_run_id('names', 'r2'),
+  geo_genius_test.import_executor_id('names', 'r2'),
+  'n_auth:unit:B', NULL, '{}'::jsonb);
 
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:A'),
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')
+      AND area_key = 'n_auth:unit:A'),
   NULL,
-  'moving a name away clears the official name of the area that lost it'
+  'a second release does not inherit the first release selected names'
+);
+
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('names', 'r2'),
+  geo_genius_test.import_executor_id('names', 'r2'),
+  'n_auth:unit:A', 'Candidate Alpha', 'official', NULL);
+
+SELECT is(
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r1')
+      AND area_key = 'n_auth:unit:A'),
+  'Alpha',
+  'a candidate official name cannot contaminate another release'
 );
 
 SELECT is(
-  (SELECT official_name FROM geo_genius.area WHERE area_key = 'n_auth:unit:B'),
-  'Aaa',
-  'moving a name in updates the official name of the area that gained it'
+  (SELECT name FROM geo_genius.release_areas
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')
+      AND area_key = 'n_auth:unit:A'),
+  'Candidate Alpha',
+  'the candidate projects its own selected official name'
 );
 
--- One statement touching many areas must settle all of them, not just one.
-SELECT geo_genius.upsert_area('names', 'n_auth', 'unit', 'C');
-SELECT geo_genius.upsert_area('names', 'n_auth', 'unit', 'D');
-
-INSERT INTO geo_genius.area_name (area_id, name, kind, locale)
-SELECT id, 'Bulk ' || code, 'official', NULL
-  FROM geo_genius.area WHERE area_key IN ('n_auth:unit:C', 'n_auth:unit:D');
-
 SELECT is(
-  (SELECT count(*)::int FROM geo_genius.area
-    WHERE area_key IN ('n_auth:unit:C', 'n_auth:unit:D')
-      AND official_name = 'Bulk ' || code),
-  2,
-  'one statement inserting names for several areas settles every one of them'
+  (SELECT count(*)::int FROM geo_genius.release_area_names
+    WHERE release_id = (SELECT id FROM geo_genius.release WHERE release_key = 'r2')),
+  1,
+  'release_area_names exposes only names explicitly selected by the candidate'
 );
 
 SELECT finish();

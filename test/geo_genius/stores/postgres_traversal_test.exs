@@ -9,7 +9,12 @@ defmodule GeoGenius.Stores.PostgresTraversalTest do
     TestRepo.query!("SELECT geo_genius_test.demo_fixture_build()", [])
 
     TestRepo.query!(
-      "SELECT geo_genius.rebuild_relations((SELECT id FROM geo_genius.release WHERE release_key = 'r1'))",
+      "SELECT geo_genius.advance_import(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'relating', '{}'::jsonb)",
+      []
+    )
+
+    TestRepo.query!(
+      "SELECT geo_genius.rebuild_relations(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id())",
       []
     )
 

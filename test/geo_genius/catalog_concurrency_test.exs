@@ -20,6 +20,7 @@ defmodule GeoGenius.CatalogConcurrencyTest do
   alias GeoGenius.Catalog
   alias GeoGenius.Context
   alias GeoGenius.ImportFixture
+  alias GeoGenius.Manifest
   alias GeoGenius.TestRepo
 
   # Sized to reproduce reliably rather than to be large. The window is
@@ -51,23 +52,25 @@ defmodule GeoGenius.CatalogConcurrencyTest do
 
     on_exit(fn -> ImportFixture.teardown!(collection) end)
 
-    Catalog.upsert_collection(context, %{key: collection, name: collection})
-    Catalog.upsert_authority(context, collection, %{key: authority, name: "Authority"})
-    Catalog.upsert_area_type(context, collection, %{key: "t", rank: 10})
+    {:ok, manifest} = Manifest.from_map(manifest_map(collection, authority))
+    candidate = ImportFixture.prepare!(context, manifest)
+    executor_id = Ecto.UUID.generate()
+    assert :claimed = Catalog.claim_import_execution(context, candidate.run_id, executor_id)
+    ImportFixture.advance_to!(context, candidate.run_id, executor_id, "normalizing")
 
     codes = Enum.map(1..@areas, &("c" <> String.pad_leading(Integer.to_string(&1), 5, "0")))
-    Catalog.upsert_area_many(context, collection, Enum.map(codes, &area_attrs(authority, &1)))
 
-    release_id =
-      Catalog.open_release(context, collection, %{
-        release_key: "r1",
-        manifest: %{"collection" => collection},
-        source_date: nil
-      })
+    Catalog.upsert_area_many(
+      context,
+      candidate.run_id,
+      executor_id,
+      Enum.map(codes, &area_attrs(authority, &1))
+    )
 
     Catalog.put_area_in_release_many(
       context,
-      release_id,
+      candidate.run_id,
+      executor_id,
       Enum.map(codes, &membership_attrs(authority, &1))
     )
 
@@ -75,7 +78,9 @@ defmodule GeoGenius.CatalogConcurrencyTest do
      context: context,
      collection: collection,
      authority: authority,
-     release_id: release_id,
+     release_id: candidate.release_id,
+     run_id: candidate.run_id,
+     executor_id: executor_id,
      codes: codes}
   end
 
@@ -128,6 +133,14 @@ defmodule GeoGenius.CatalogConcurrencyTest do
     @tag :integration
     @tag timeout: 300_000
     test "relating", fixtures do
+      Catalog.advance_import(
+        fixtures.context,
+        fixtures.run_id,
+        fixtures.executor_id,
+        "relating",
+        %{}
+      )
+
       race(&relate(fixtures, &1), &relate(fixtures, &1), narrow(fixtures), @narrow_passes)
     end
   end
@@ -206,7 +219,8 @@ defmodule GeoGenius.CatalogConcurrencyTest do
   defp upsert(fixtures, codes) do
     Catalog.upsert_area_many(
       fixtures.context,
-      fixtures.collection,
+      fixtures.run_id,
+      fixtures.executor_id,
       Enum.map(codes, &area_attrs(fixtures.authority, &1))
     )
   end
@@ -214,6 +228,8 @@ defmodule GeoGenius.CatalogConcurrencyTest do
   defp name(fixtures, codes) do
     Catalog.put_area_name_many(
       fixtures.context,
+      fixtures.run_id,
+      fixtures.executor_id,
       Enum.map(codes, &name_attrs(fixtures.authority, &1))
     )
   end
@@ -221,6 +237,8 @@ defmodule GeoGenius.CatalogConcurrencyTest do
   defp code(fixtures, codes) do
     Catalog.put_area_code_many(
       fixtures.context,
+      fixtures.run_id,
+      fixtures.executor_id,
       Enum.map(codes, &code_attrs(fixtures.authority, &1))
     )
   end
@@ -228,7 +246,8 @@ defmodule GeoGenius.CatalogConcurrencyTest do
   defp place(fixtures, codes) do
     Catalog.put_area_in_release_many(
       fixtures.context,
-      fixtures.release_id,
+      fixtures.run_id,
+      fixtures.executor_id,
       Enum.map(codes, &membership_attrs(fixtures.authority, &1))
     )
   end
@@ -244,7 +263,8 @@ defmodule GeoGenius.CatalogConcurrencyTest do
 
     Catalog.put_relation_many(
       fixtures.context,
-      fixtures.release_id,
+      fixtures.run_id,
+      fixtures.executor_id,
       Enum.map(pairs, fn {parent, child} ->
         %{
           parent_area_key: area_key(fixtures.authority, parent),
@@ -271,5 +291,45 @@ defmodule GeoGenius.CatalogConcurrencyTest do
 
   defp membership_attrs(authority, code) do
     %{area_key: area_key(authority, code), centroid: nil, attributes: %{"code" => code}}
+  end
+
+  defp manifest_map(collection, authority) do
+    %{
+      "collection" => collection,
+      "collection_name" => collection,
+      "release" => "r1",
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "authorities" => [%{"key" => authority, "name" => "Authority"}],
+      "area_types" => [%{"key" => "t", "rank" => 10, "requires_geometry" => false}],
+      "sources" => [
+        %{
+          "source_key" => "#{collection}:source",
+          "provider" => "geojson",
+          "license" => "test",
+          "release_key" => "v1",
+          "artifacts" => [fixture_artifact(collection)]
+        }
+      ],
+      "options" => %{
+        "code_property" => "code",
+        "name_property" => "name",
+        "area_type" => "t"
+      }
+    }
+  end
+
+  defp fixture_artifact(collection) do
+    %{
+      "logical_name" => "fixture.geojson",
+      "url" => "https://example.test/#{collection}/fixture.geojson",
+      "operator_supplied" => false,
+      "format" => "geojson",
+      "required" => true,
+      "sha256" => String.duplicate("a", 64),
+      "bytes" => 1,
+      "members" => [],
+      "metadata" => %{}
+    }
   end
 end

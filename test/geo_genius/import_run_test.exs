@@ -19,7 +19,10 @@ defmodule GeoGenius.ImportRunTest do
         "completed_at",
         "error",
         "stage_metrics",
-        "progress"
+        "progress",
+        "executor_id",
+        "execution_started_at",
+        "manifest"
       ],
       rows: [
         [
@@ -36,7 +39,10 @@ defmodule GeoGenius.ImportRunTest do
           nil,
           nil,
           %{"staged" => 10},
-          %{"rows" => 10}
+          %{"rows" => 10},
+          "33333333-3333-4333-8333-333333333333",
+          ~U[2026-08-25 00:00:30Z],
+          %{"collection" => "demo", "release" => "r1"}
         ]
       ],
       num_rows: 1,
@@ -57,6 +63,9 @@ defmodule GeoGenius.ImportRunTest do
     assert run.completed_at == nil
     assert run.stage_metrics == %{"staged" => 10}
     assert run.progress == %{"rows" => 10}
+    assert run.executor_id == "33333333-3333-4333-8333-333333333333"
+    assert run.execution_started_at == ~U[2026-08-25 00:00:30Z]
+    assert run.manifest == %{"collection" => "demo", "release" => "r1"}
   end
 
   test "reports whether a run has reached a terminal state" do

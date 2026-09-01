@@ -76,8 +76,9 @@ defmodule GeoGenius.ProviderTest do
     # `behaviour_info(:callbacks)` counts optional callbacks among the rest, so
     # the required set above is only meaningful alongside this: without it, a
     # callback made optional by mistake would still leave the six intact.
-    test "declares validate_options/1 as its only optional callback" do
-      assert GeoGenius.Provider.behaviour_info(:optional_callbacks) == [validate_options: 1]
+    test "declares option and whole-manifest validation as optional callbacks" do
+      assert GeoGenius.Provider.behaviour_info(:optional_callbacks) |> Enum.sort() ==
+               [validate_manifest: 1, validate_options: 1]
     end
   end
 

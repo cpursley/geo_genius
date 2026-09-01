@@ -89,15 +89,20 @@ module name in config :geo_genius, :providers, and that the module is compiled i
 
 ## Asynchronous imports need no configuration
 
-`GeoGenius.import/1` picks a runner backend through `GeoGenius.Runner.configured/1`: PgFlow if
-installed and running, otherwise a `Task.Supervisor` this package starts on its own, otherwise
-`GeoGenius.Runners.Inline`, which runs the import in the calling process and blocks it for the
-import's full duration. `:geo_genius` starts at most one process of its own — a `Task.Supervisor`
-registered as `GeoGenius.TaskSupervisor` — for exactly this reason: without it, a host that has
-not installed PgFlow and has not wired up its own `Task.Supervisor` falls all the way through to
-`Runners.Inline`, and a national vintage takes hours to import synchronously in whatever process
-called `GeoGenius.import/1`. (It starts *no* process at all when the host has already configured
-`:task_supervisor` — see the override below.)
+`GeoGenius.import/1` picks a runner backend through `GeoGenius.Runner.configured/1`: a
+`Task.Supervisor` this package starts on its own, then `GeoGenius.Runners.Inline`, which runs the
+import in the calling process and blocks it for the import's full duration. PgFlow is never selected
+automatically merely because another workflow started it; imports have no fixed upper bound, so a
+host opts into that backend explicitly after choosing an appropriate compile-time job deadline.
+Set a positive `:pgflow_job_timeout_seconds` before compiling GeoGenius, generate and apply the
+`GeoGenius.Runners.PgFlow.Job` migration, and keep each import's effective
+`stale_after_seconds` below that deadline. PgFlow and GeoGenius must use the same Repo; the runner
+checks that alignment and the stored flow/step timeout before it accepts work. `:geo_genius`
+starts an execution-guardian supervisor and, unless the host configured its own task supervisor, a
+`Task.Supervisor` registered as `GeoGenius.TaskSupervisor`. Without that task supervisor, a host
+that has not wired up its own falls through to `Runners.Inline`, and a national vintage takes hours
+to import synchronously in whatever process called `GeoGenius.import/1`. When the host configures
+`:task_supervisor`, the package omits only its own task supervisor; the execution guardian remains.
 
 Nothing needs to be configured for this — but the default's shutdown ordering is backwards, and a
 host that cares about it should configure the override below rather than live with that.
@@ -120,21 +125,22 @@ order, so a later-listed `TaskSupervisor` stops — and every task under it is k
 actually correct for a host running import work under this backend, and this library cannot arrange
 it from the outside. The configured name takes precedence over the library's own supervisor
 whenever it is set, whether or not it is actually running (more on what that means below), and
-when it is set, the library skips starting its own supervisor entirely, so a host that placed one
-of its own is never left with an idle, unreachable second one sitting in the tree.
+when it is set, the library skips starting its own task supervisor, so a host that placed one
+of its own is never left with an idle, unreachable second task supervisor. GeoGenius still starts
+its execution-guardian supervisor because it monitors every runner backend.
 
-Killing a task this way is still not graceful: a `Task` does not trap exits, so it dies the instant
-its supervisor tells it to, mid-statement if that is where it happens to be — the standard shutdown
-timeout is never actually spent, because there is no cleanup phase to spend it on. Neither
-arrangement lets a task write `fail_import/3` or drop its own staging table on the way out: under
-the default ordering it keeps running and both calls fail against a Repo that is already gone;
-under the override it is killed before it gets the chance to make either call at all. What the
-correct ordering buys is narrower than graceful shutdown: the task dies while the Repo can still be
-reached rather than while it cannot, so it fails cleanly instead of repeatedly against a connection
-that no longer exists. Either way, what actually recovers the run is the same as always: the lease,
-reclaimed once `stale_after` elapses. This supervisor is not durability regardless of where it is
-placed — a host that needs an import to survive a VM restart, not merely a crashed task, installs
-PgFlow.
+Killing a task this way is still not graceful: a `Task` does not trap exits, so it dies wherever it
+happens to be and cannot clean up its staging table. The separate execution guardian monitors the
+task. Under the host-owned ordering, the task dies while the guardian and Repo remain alive, and
+the guardian records a durable failure with the exact executor identity before the Repo stops.
+Under the package-owned default, the host Repo has already stopped when the dependency application's
+task eventually dies, so the guardian may be unable to persist that outcome. Whole-VM or whole-node
+loss likewise leaves no local guardian alive. In those cases a stale heartbeat is diagnostic only:
+it does not transfer ownership, and an operator must fail the abandoned attempt explicitly before
+starting a replacement with `GeoGenius.retry_failed/2`. The failed run, manifest, artifact
+observations, and error remain immutable evidence. A host that needs queued work to survive a VM
+restart uses a durable runner such as PgFlow; the guardian covers executor-process death, not queue
+durability.
 
 A host can list the pids of tasks running under either supervisor with `Task.Supervisor.children/1`
 — bare pids, not run ids, and, under the override, potentially mixed with any unrelated tasks the
@@ -146,10 +152,11 @@ host started under that same supervisor itself. A host that wants to see actual 
 all, even a name nothing has registered — a typo, or a supervisor the host has not started yet.
 The alternative would be worse: falling back to `Runners.Inline` and blocking the caller for the
 length of a national import, silently, with no indication the configured supervisor was never
-reached. Instead `GeoGenius.import/1` returns `{:error, reason}` naming the configured module, the
-same way it would if `:runner` were pinned to `Runners.Task` directly. This only ever surfaces for
-a host that set `:task_supervisor` and has not (yet) started it; a host running with no
-configuration at all always resolves to the library's own, genuinely running supervisor.
+reached. Instead `GeoGenius.import/1` returns `{:error, %GeoGenius.EnqueueError{}}` carrying the
+run id, `:not_enqueued` certainty, and a reason naming the configured module—the same result it
+would return if `:runner` were pinned to `Runners.Task` directly. This only ever surfaces for a
+host that set `:task_supervisor` and has not (yet) started it; a host running with no configuration
+at all always resolves to the library's own, genuinely running supervisor.
 
 Tests need no different treatment for this default: see
 ["`Runners.Task` needs no sandbox setup, with two real caveats"](#runners-task-needs-no-sandbox-setup-with-two-real-caveats)
@@ -232,66 +239,35 @@ installed schema version and the content-addressed schema contract against the l
 and exits non-zero on a mismatch — usable as a CI or deploy gate. `GeoGenius.Preflight` performs
 the same contract check at startup. Neither surface creates, repairs, or migrates anything.
 
-## Reconciling an historical pre-release v1 install
+## Returning a pre-production install
 
-GeoGenius remains at public schema version 1, but a database installed from an earlier
-pre-release v1 contract may not have the reviewed batch-boundary, publication-locking, or
-type-scoped geometry contract. Version alone cannot distinguish that database from a fresh
-revised v1 install. `geo_genius_contract` therefore records a SHA-256 identity derived from
-the canonical list of required SQL signatures and capabilities. Inspect it without changing
-the database:
+GeoGenius is pre-production and publishes one current schema contract at version 1. There is no
+in-place reconciliation API, generated reconciliation SQL, or compatibility edge between earlier
+development snapshots that also called themselves version 1. A database installed from an older
+snapshot must be returned and installed again from the current package.
 
-```elixir
-GeoGenius.Migration.contract_status(MyApp.Repo, "geo_genius")
-```
-
-An historical install reports `:legacy_unmarked`; the reviewed pre-type-scoped v1 contract
-reports `:reviewed_v01`; an unknown partial modification reports `:drifted`; a fresh or
-reconciled install reports `:compatible`. For each supported frozen shape, the comparison
-includes the affected functions' exact arguments and return, body, language, volatility,
-security mode, strictness, parallel/leakproof flags, and pinned settings such as
-`search_path`; an extra same-name overload is drift too. Render a literal, transactional SQL
-edge for a SQL-first host:
+This policy is destructive and is only appropriate while the catalog is reproducible from its
+reviewed manifests and checksummed source artifacts. Before returning the migration, confirm that
+no irreplaceable data or unrelated objects live under the selected prefix. Then use the host's own
+migration system:
 
 ```console
-mix geo_genius.reconciliation_sql \
-  --prefix geo_genius \
-  --from legacy_v01_aebc28a \
-  --to sha256:0bb7f017525771075a7cb4dfed5568d1b14edb261e8fadbb82d14acbfba53fb1 \
-  > priv/repo/reconciliation/geo_genius_v1.sql
+mix ecto.rollback --repo MyApp.Repo --step 1
+mix deps.update geo_genius
+mix ecto.migrate --repo MyApp.Repo
+mix geo_genius.check_schema --repo MyApp.Repo --prefix geo_genius
 ```
 
-An Ecto host pins the same literal identities in its own reversible migration:
+The rollback must target the host-owned GeoGenius setup migration. If later migrations depend on
+it, return those migrations in their normal reverse order first. A SQL-first host applies the
+rendered `1 -> 0` transition from the package version that installed the schema, updates the
+dependency, renders the current `0 -> 1` transition, and applies that as a new host-owned
+migration. Do not edit an already-deployed production migration in place.
 
-```elixir
-defmodule MyApp.Repo.Migrations.ReconcileGeoGeniusV1 do
-  use Ecto.Migration
-
-  @legacy :legacy_v01_aebc28a
-  @target "sha256:0bb7f017525771075a7cb4dfed5568d1b14edb261e8fadbb82d14acbfba53fb1"
-
-  def up do
-    GeoGenius.Migration.reconcile(prefix: "geo_genius", from: @legacy, to: @target)
-  end
-
-  def down do
-    GeoGenius.Migration.reconcile(prefix: "geo_genius", from: @target, to: @legacy)
-  end
-end
-```
-
-Do not call `current_contract_revision/0` from a durable migration: pinning the literal target
-prevents a later package update from changing what that committed migration means. Reconciliation
-takes a prefix-scoped transaction lock, accepts only supported pinned edges among
-`legacy_v01_aebc28a`, the reviewed pre-type-scoped v1 revision
-`sha256:8c5adea2c1fab08fdbc67137ff99ea0864c69a3dff5a3952dd9d6e62d971ab25`, and the current
-revision, preserves catalog rows, verifies the result, and stamps the marker last. Reverse edges
-drop only the metadata introduced after the requested target contract; area and release rows
-remain. Unknown drift is rejected before writes and requires inspection; GeoGenius never
-reconciles automatically at boot or from ordinary catalog operations. The Ecto API also refuses
-calls outside an active Ecto migration transaction: leave Ecto's default DDL transaction enabled
-and do not set
-`@disable_ddl_transaction true`, or the advisory lock could not cover the complete operation.
+`GeoGenius.Preflight` and `mix geo_genius.check_schema` remain read-only gates: they report that an
+older or drifted install is incompatible, but never repair it. Once GeoGenius has a production
+schema history, changes will ship as adjacent versioned migrations rather than by extending this
+pre-production reinstall policy.
 
 ## Hosts that keep migrations as SQL
 
@@ -365,11 +341,11 @@ supervisor, which is correct only for a Repo the host has arranged to be checked
 
 ### Publication and import tests are `async: false`
 
-`publish_release`, `rollback_publication`, `retire_releases`, `rebuild_relations` and
-`begin_or_resume_import` each take a `pg_advisory_xact_lock` keyed on the collection or release
-they touch. Outside a transaction that lock is released when the statement commits, which is
-what the design intends: two publishes of the same collection serialize for the length of one
-statement.
+`publish_release`, `rollback_publication`, `retire_releases`, `rebuild_relations`,
+`prepare_import`, and `retry_failed` each take a `pg_advisory_xact_lock` keyed on the collection
+or release they touch. Outside a transaction that lock is released when the statement commits,
+which is what the design intends: two publishes of the same collection serialize for the length
+of one statement.
 
 Inside the sandbox the statement is part of the test's transaction, so the lock is held until
 the test checks its connection back in. Two `async: true` tests publishing the same collection

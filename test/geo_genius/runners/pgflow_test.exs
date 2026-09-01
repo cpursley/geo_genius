@@ -1,7 +1,8 @@
 defmodule GeoGenius.Runners.PgFlowTest do
-  # PgFlow is optional. The ordinary development graph includes it and
-  # compiles the real Job module; the separate no-optional-dependencies gate
-  # proves the always-compiled backend remains warning-free without it.
+  # PgFlow is optional. The ordinary test graph includes its DSL and chooses a
+  # neutral compile-time deadline so it exercises the real shipped Job module.
+  # The separate no-optional-dependencies gate proves the always-compiled
+  # backend remains warning-free without PgFlow itself.
   use ExUnit.Case, async: false
 
   alias GeoGenius.AppEnv
@@ -37,12 +38,17 @@ defmodule GeoGenius.Runners.PgFlowTest do
     assert Runner.module_for_backend("pgflow") == {:ok, Runners.PgFlow}
   end
 
-  test "the optional dependency compiles the GeoGenius PgFlow job after PgFlow.Job" do
+  test "the test consumer compiles the real job with its explicit deadline" do
     assert Code.ensure_loaded?(PgFlow.Job)
+    assert Runners.PgFlow.job_timeout_seconds() == 1_200
     assert Code.ensure_loaded?(Runners.PgFlow.Job)
+
+    definition = Runners.PgFlow.Job.__pgflow_definition__()
+    assert definition.opts[:timeout] == 1_200
+    assert hd(definition.steps).timeout == 1_200
   end
 
-  test "available?/0 is false until the optional engine's supervisor is running" do
+  test "available?/0 is false without a running engine supervisor" do
     assert Code.ensure_loaded?(PgFlow)
     assert Code.ensure_loaded?(Runners.PgFlow.Job)
     assert Process.whereis(PgFlow.Supervisor) == nil
@@ -55,7 +61,9 @@ defmodule GeoGenius.Runners.PgFlowTest do
     # A backend that called straight into `PgFlow.enqueue/2` without checking
     # `available?/0` first would try to submit against an unstarted engine.
     # The guard turns that into a plain, callable error.
-    assert {:error, reason} = Runners.PgFlow.enqueue(context, run_id, %{publish: false})
+    assert {:error, {:not_enqueued, reason}} =
+             Runners.PgFlow.enqueue(context, run_id, %{publish: false})
+
     assert reason =~ "pgflow"
     assert reason =~ "PgFlow"
 
@@ -83,19 +91,153 @@ defmodule GeoGenius.Runners.PgFlowTest do
     assert message =~ "GeoGenius.Runner"
   end
 
+  describe "PgFlow host readiness" do
+    test "the operation repo must be the repo PgFlow actually uses" do
+      context = Context.new(repo: GeoGenius.TestRepo, prefix: "geo_genius")
+
+      assert :ok = Runners.PgFlow.repository_alignment(context, GeoGenius.TestRepo)
+
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.repository_alignment(context, GeoGenius.SandboxedRepo)
+
+      assert message =~ inspect(GeoGenius.TestRepo)
+      assert message =~ inspect(GeoGenius.SandboxedRepo)
+      assert message =~ "same Repo"
+    end
+
+    test "a missing PgFlow repo is a definite pre-enqueue configuration failure" do
+      context = Context.new(repo: GeoGenius.TestRepo, prefix: "geo_genius")
+
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.repository_alignment(context, nil)
+
+      assert message =~ "configured Repo"
+      assert message =~ "not available"
+    end
+
+    test "the host must choose a timeout and an explicit staleness window" do
+      assert {:error, {:not_enqueued, no_timeout}} =
+               Runners.PgFlow.timeout_readiness(nil, 900)
+
+      assert {:error, {:not_enqueued, no_stale_window}} =
+               Runners.PgFlow.timeout_readiness(3_900, nil)
+
+      assert no_timeout =~ ":pgflow_job_timeout_seconds"
+      assert no_timeout =~ "compile"
+      assert no_stale_window =~ "stale_after_seconds"
+    end
+
+    test "the compiled job timeout must exceed the per-statement staleness window" do
+      assert {:error, {:not_enqueued, equal_message}} =
+               Runners.PgFlow.timeout_readiness(900, 900)
+
+      assert {:error, {:not_enqueued, shorter_message}} =
+               Runners.PgFlow.timeout_readiness(899, 900)
+
+      assert equal_message =~ "900"
+      assert equal_message =~ "must exceed"
+      assert shorter_message =~ "899"
+      assert :ok = Runners.PgFlow.timeout_readiness(901, 900)
+    end
+
+    test "the stored PgFlow definition must carry the compiled host timeout" do
+      assert :ok =
+               Runners.PgFlow.job_definition_readiness({:ok, %{opt_timeout: 1_200}}, 1_200)
+
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.job_definition_readiness({:ok, %{opt_timeout: 3_900}}, 1_200)
+
+      assert message =~ "3900"
+      assert message =~ "1200"
+      assert message =~ "migration"
+    end
+
+    test "the stored execute step must carry the compiled host timeout" do
+      assert :ok =
+               Runners.PgFlow.job_step_readiness({:ok, %{opt_timeout: 1_200}}, 1_200)
+
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.job_step_readiness({:ok, %{opt_timeout: 3_900}}, 1_200)
+
+      assert message =~ "execute"
+      assert message =~ "3900"
+      assert message =~ "1200"
+      assert message =~ "migration"
+    end
+
+    test "a missing stored job definition retains the exact migration remedy" do
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.job_definition_readiness({:error, :not_found}, 1_200)
+
+      assert message == Runners.PgFlow.flow_not_compiled_message()
+    end
+
+    test "a missing compiled flow returns the exact migration remedy" do
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.flow_registration({:ok, false})
+
+      assert message =~ "GeoGenius.Runners.PgFlow.Job"
+      assert message =~ "mix pgflow.gen.job_migration GeoGenius.Runners.PgFlow.Job"
+      assert message =~ "mix ecto.migrate"
+    end
+
+    test "a missing flow reported during enqueue keeps the same actionable contract" do
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.enqueue_result({:error, {:flow_not_compiled, "geo_genius_import"}})
+
+      assert message == Runners.PgFlow.flow_not_compiled_message()
+    end
+
+    test "an unhealthy worker fails before a durable job can sit queued forever" do
+      assert {:error, {:not_enqueued, message}} =
+               Runners.PgFlow.worker_readiness({:ok, false})
+
+      assert message =~ "no healthy worker"
+      assert message =~ "GeoGenius.Runners.PgFlow.Job"
+      assert message =~ "jobs: [GeoGenius.Runners.PgFlow.Job]"
+    end
+
+    test "database probe failures remain errors rather than pretending the host is ready" do
+      reason = %DBConnection.ConnectionError{message: "database unavailable", severity: :error}
+
+      assert {:error, {:not_enqueued, flow_message}} =
+               Runners.PgFlow.flow_registration({:error, reason})
+
+      assert {:error, {:not_enqueued, worker_message}} =
+               Runners.PgFlow.worker_readiness({:error, reason})
+
+      assert flow_message =~ "could not verify"
+      assert worker_message =~ "could not verify"
+      assert flow_message =~ "database unavailable"
+      assert worker_message =~ "database unavailable"
+    end
+
+    test "a generic error after PgFlow.enqueue/2 reports an unknown acceptance outcome" do
+      reason = %DBConnection.ConnectionError{message: "connection lost", severity: :error}
+
+      assert {:error, {:outcome_unknown, ^reason}} =
+               Runners.PgFlow.enqueue_result({:error, reason})
+    end
+
+    test "successful probes and enqueue results retain their plain success contracts" do
+      assert :ok = Runners.PgFlow.flow_registration({:ok, true})
+      assert :ok = Runners.PgFlow.worker_readiness({:ok, true})
+      assert :ok = Runners.PgFlow.enqueue_result({:ok, Ecto.UUID.generate()})
+    end
+  end
+
   test "the availability chain skips PgFlow and lands on Task or Inline" do
-    # Stronger than membership in the full three-backend list: `Runners.PgFlow`
-    # can never be available in this repository, so `configured/1` must
-    # resolve to one of the other two -- never `Runners.PgFlow` -- every
-    # single time, not merely as one of three possibilities.
+    # The real Job module is compiled in this test consumer, but no engine is
+    # running. Resolution must still land on one of the automatic backends,
+    # never infer PgFlow merely from its compiled integration.
     assert Runner.configured([]) in [Runners.Task, Runners.Inline]
   end
 
   describe "job_outcome/2" do
-    # `Job.run/1` -- the module that actually calls `job_outcome/2` from
-    # inside PgFlow's `perform :execute` step -- never compiles in this
-    # repository, so these are the only tests anywhere that cover the
-    # mapping from `GeoGenius.Pipeline.execute/3`'s return shapes to the
+    # `Job.run/2` -- the module that actually calls `job_outcome/2` from
+    # inside PgFlow's `perform :execute` step -- is absent only from the
+    # no-optional-dependencies build, so these tests keep the mapping covered
+    # from `GeoGenius.Pipeline.execute/3`'s return shapes to the
     # plain outcome PgFlow gets back. Each clause of `Pipeline.execute/3`'s
     # own `@spec` has exactly one test below.
 
@@ -119,7 +261,35 @@ defmodule GeoGenius.Runners.PgFlowTest do
       assert Runners.PgFlow.job_outcome({:error, run}, run.run_id) == %{"outcome" => "failed"}
     end
 
-    test "{:error, {:unrecorded, reason}} raises naming the run rather than returning" do
+    test "{:noop, run} maps duplicate delivery to already_running without claiming completion" do
+      run = %ImportRun{run_id: Ecto.UUID.generate(), status: "pending"}
+
+      assert Runners.PgFlow.job_outcome({:noop, run}, run.run_id) == %{
+               "outcome" => "already_running"
+             }
+    end
+
+    test "{:ok, malformed} raises a clear invalid-outcome error" do
+      run_id = Ecto.UUID.generate()
+
+      assert_raise RuntimeError,
+                   ~r/GeoGenius import run #{run_id} returned an invalid pipeline outcome/,
+                   fn ->
+                     Runners.PgFlow.job_outcome({:ok, %{status: "completed"}}, run_id)
+                   end
+    end
+
+    test "{:noop, malformed} raises a clear invalid-outcome error" do
+      run_id = Ecto.UUID.generate()
+
+      assert_raise RuntimeError,
+                   ~r/GeoGenius import run #{run_id} returned an invalid pipeline outcome/,
+                   fn ->
+                     Runners.PgFlow.job_outcome({:noop, %{status: "pending"}}, run_id)
+                   end
+    end
+
+    test "an unrecorded pipeline outcome raises naming the run rather than returning" do
       run_id = Ecto.UUID.generate()
 
       # A `job_outcome/2` that swallowed the `:unrecorded` case and
@@ -127,14 +297,16 @@ defmodule GeoGenius.Runners.PgFlowTest do
       # signal that nothing happened for this run id at all -- this is the
       # one assertion that would catch it.
       assert_raise RuntimeError, ~r/#{run_id}/, fn ->
-        Runners.PgFlow.job_outcome({:error, {:unrecorded, "does not exist"}}, run_id)
+        Runners.PgFlow.job_outcome(
+          {:error, {:unrecorded, :not_started, "does not exist"}},
+          run_id
+        )
       end
     end
   end
 
   describe "job_input_opts/1" do
-    # `Job.run/1` -- which never compiles in this repository -- is the only
-    # caller, so this is the only coverage the opts it hands to
+    # `Job.run/1` is the only caller, so this is the direct coverage for the opts it hands to
     # `Pipeline.execute/3` ever gets.
 
     test "reads publish and stale_after_seconds from string-keyed input" do
@@ -148,21 +320,19 @@ defmodule GeoGenius.Runners.PgFlowTest do
     end
   end
 
-  describe "job_context/1" do
-    # Same rationale as `job_input_opts/1`: the only place this logic would
-    # otherwise run is inside `Job.run/1`, which never compiles here.
+  describe "job_context/2" do
+    # Same rationale as `job_input_opts/1`: the only production caller is
+    # `Job.run/2`; the no-optional-dependencies build omits that module.
 
-    setup do
-      AppEnv.put(:repo, GeoGenius.TestRepo)
-    end
+    test "rebuilds a context from PgFlow's execution repo and the job's own prefix" do
+      AppEnv.put(:repo, GeoGenius.SandboxedRepo)
 
-    test "rebuilds a context from application environment and the job's own prefix" do
-      assert Runners.PgFlow.job_context(%{"prefix" => "geo_genius"}) ==
+      assert Runners.PgFlow.job_context(%{"prefix" => "geo_genius"}, GeoGenius.TestRepo) ==
                Context.new(repo: GeoGenius.TestRepo, prefix: "geo_genius")
     end
 
     test "raises naming the missing key when input carries no prefix" do
-      assert_raise KeyError, fn -> Runners.PgFlow.job_context(%{}) end
+      assert_raise KeyError, fn -> Runners.PgFlow.job_context(%{}, GeoGenius.TestRepo) end
     end
   end
 end

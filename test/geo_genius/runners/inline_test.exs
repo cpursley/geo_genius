@@ -70,7 +70,9 @@ defmodule GeoGenius.Runners.InlineTest do
   test "an unknown run id comes back as an error naming the run, not :ok", %{context: context} do
     run_id = Ecto.UUID.generate()
 
-    assert {:error, reason} = Runners.Inline.enqueue(context, run_id, %{publish: false})
+    assert {:error, {:not_enqueued, reason}} =
+             Runners.Inline.enqueue(context, run_id, %{publish: false})
+
     assert reason =~ run_id
     assert reason =~ "does not exist"
   end
@@ -88,6 +90,36 @@ defmodule GeoGenius.Runners.InlineTest do
     run = Catalog.import_run(context, run_id)
     assert run.status == "failed"
     assert run.error != nil
+  end
+
+  test "a post-claim failure that cannot be recorded has unknown enqueue outcome",
+       %{context: context} do
+    {_collection, _release_id, run_id} =
+      ImportFixture.claim_run!(context, corrupt_artifact: true)
+
+    RecordingRepo.fail_on("fail_import")
+    recording_context = %{context | repo: RecordingRepo}
+
+    assert {:error, {:outcome_unknown, reason}} =
+             Runners.Inline.enqueue(recording_context, run_id, %{publish: false})
+
+    assert reason =~ "artifact"
+  end
+
+  test "duplicate delivery is successful without claiming completion", %{context: context} do
+    {collection, _release_id, run_id} = ImportFixture.claim_run!(context)
+    first_executor = Ecto.UUID.generate()
+
+    assert Catalog.claim_import_execution(context, run_id, first_executor) == :claimed
+    assert :ok = Runners.Inline.enqueue(context, run_id, %{publish: true})
+
+    assert %GeoGenius.ImportRun{
+             status: "pending",
+             executor_id: ^first_executor,
+             completed_at: nil
+           } = Catalog.import_run(context, run_id)
+
+    assert Catalog.published_release(context, collection) == nil
   end
 
   test "forwards :stale_after_seconds from args into Pipeline.execute/3's derived timeout",

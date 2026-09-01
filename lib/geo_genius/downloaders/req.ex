@@ -57,6 +57,14 @@ defmodule GeoGenius.Downloaders.Req do
   @spec fold_chunk(File.io_device(), {:data, binary()}, {term(), map()}) ::
           {:cont, {term(), map()}}
   def fold_chunk(handle, {:data, data}, {req, resp}) do
+    {_hash_state, bytes} = Map.get(resp.private, @private_key, initial_state())
+    max_bytes = max_bytes(req)
+    incoming = bytes + byte_size(data)
+
+    if is_integer(max_bytes) and incoming > max_bytes do
+      raise ArgumentError, overflow_message(max_bytes)
+    end
+
     :ok = IO.binwrite(handle, data)
     {:cont, {req, record_chunk(resp, data)}}
   end
@@ -81,7 +89,23 @@ defmodule GeoGenius.Downloaders.Req do
   defp build_request_opts(opts, handle) do
     opts
     |> Keyword.take(@request_opt_keys)
-    |> Keyword.merge(retry: false, into: into_fun(handle))
+    |> Keyword.merge(
+      retry: false,
+      into: into_fun(handle),
+      redirect: false
+    )
+    |> maybe_put_max_bytes(opts)
+  end
+
+  defp maybe_put_max_bytes(request_opts, opts) do
+    case Keyword.get(opts, :max_bytes) do
+      max_bytes when is_integer(max_bytes) and max_bytes > 0 ->
+        private = Keyword.get(request_opts, :private, %{})
+        Keyword.put(request_opts, :private, Map.put(private, :geo_genius_max_bytes, max_bytes))
+
+      _other ->
+        request_opts
+    end
   end
 
   defp into_fun(handle) do
@@ -113,4 +137,13 @@ defmodule GeoGenius.Downloaders.Req do
   end
 
   defp initial_state, do: {:crypto.hash_init(:sha256), 0}
+
+  defp max_bytes(%{private: private}) when is_map(private),
+    do: Map.get(private, :geo_genius_max_bytes)
+
+  defp max_bytes(_req), do: nil
+
+  defp overflow_message(max_bytes) do
+    "download exceeded the reviewed #{max_bytes} bytes before completion"
+  end
 end

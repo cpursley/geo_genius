@@ -2,41 +2,44 @@ BEGIN;
 
 -- r1 is extended below, so it is built unpublished and published once the
 -- whole graph is in place: a published release is immutable.
-SELECT geo_genius_test.demo_fixture_build();
-
-SELECT geo_genius.upsert_area_type('demo', 'innermost', 30);
+SELECT geo_genius_test.demo_fixture_build('[
+  {"key":"innermost","rank":30,"requires_geometry":false},
+  {"key":"unranked","rank":40,"requires_geometry":false}
+]'::jsonb);
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'innermost', 'C');
-SELECT geo_genius.put_area_name('demo_auth:innermost:C', 'Charlie', 'official', NULL);
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:innermost:C',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((0 0, 0.2 0, 0.2 0.2, 0 0.2, 0 0))', 4326), 0.0);
-
-SELECT geo_genius.rebuild_relations(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'));
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:innermost:C', 'Charlie', 'official', NULL);
 
 -- A two-node cycle asserted directly (not measured from geometry): D
 -- overlaps E, E overlaps D. Neither area needs a boundary -- put_relation
 -- accepts any two areas that are already members of the release, which is
 -- exactly how a cyclic overlap graph can show up from asserted source data.
-SELECT geo_genius.upsert_area_type('demo', 'unranked', 40);
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'D');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'E');
-SELECT geo_genius.put_area_name('demo_auth:unranked:D', 'Delta', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:unranked:E', 'Echo', 'official', NULL);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:D', ST_GeogFromText('POINT(5 5)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:E', ST_GeogFromText('POINT(6 6)'), '{}'::jsonb);
-SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:unranked:D', 'demo_auth:unranked:E', 'overlaps');
-SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:unranked:E', 'demo_auth:unranked:D', 'overlaps');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:D', 'Delta', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:E', 'Echo', 'official', NULL);
 
 -- A three-node cycle asserted directly: F overlaps G, G overlaps H, H
 -- overlaps F -- a longer walk back to the origin than the two-node case
@@ -44,60 +47,110 @@ SELECT geo_genius.put_relation(
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'F');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'G');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'H');
-SELECT geo_genius.put_area_name('demo_auth:unranked:F', 'Foxtrot', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:unranked:G', 'Golf', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:unranked:H', 'Hotel', 'official', NULL);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:F', ST_GeogFromText('POINT(7 7)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:G', ST_GeogFromText('POINT(8 8)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:H', ST_GeogFromText('POINT(9 9)'), '{}'::jsonb);
-SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:unranked:F', 'demo_auth:unranked:G', 'overlaps');
-SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:unranked:G', 'demo_auth:unranked:H', 'overlaps');
-SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:unranked:H', 'demo_auth:unranked:F', 'overlaps');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:F', 'Foxtrot', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:G', 'Golf', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:H', 'Hotel', 'official', NULL);
 
 -- A diamond: two independent paths (W->X->Z and W->Y->Z) converge on Z.
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'W');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'X');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'Y');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'unranked', 'Z');
-SELECT geo_genius.put_area_name('demo_auth:unranked:W', 'Whiskey', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:unranked:X', 'Xray', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:unranked:Y', 'Yankee', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:unranked:Z', 'Zulu', 'official', NULL);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:W', ST_GeogFromText('POINT(10 10)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:X', ST_GeogFromText('POINT(11 11)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:Y', ST_GeogFromText('POINT(12 12)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:Z', ST_GeogFromText('POINT(13 13)'), '{}'::jsonb);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:W', 'Whiskey', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:X', 'Xray', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:Y', 'Yankee', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:Z', 'Zulu', 'official', NULL);
+
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(),
+  'relating');
+SELECT geo_genius.rebuild_relations(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id());
+
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:D', 'demo_auth:unranked:E', 'overlaps');
+SELECT geo_genius.put_relation(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:E', 'demo_auth:unranked:D', 'overlaps');
+SELECT geo_genius.put_relation(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:F', 'demo_auth:unranked:G', 'overlaps');
+SELECT geo_genius.put_relation(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:G', 'demo_auth:unranked:H', 'overlaps');
+SELECT geo_genius.put_relation(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:unranked:H', 'demo_auth:unranked:F', 'overlaps');
+SELECT geo_genius.put_relation(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:W', 'demo_auth:unranked:X', 'overlaps');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:W', 'demo_auth:unranked:Y', 'overlaps');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:X', 'demo_auth:unranked:Z', 'overlaps');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:unranked:Y', 'demo_auth:unranked:Z', 'overlaps');
 
 SELECT plan(10);
@@ -107,7 +160,8 @@ SELECT plan(10);
 -- r1 is still mutable.
 SELECT throws_ok(
   $$SELECT geo_genius.put_relation(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      geo_genius_test.demo_run_id(),
+      geo_genius_test.demo_executor_id(),
       'demo_auth:unranked:F', 'demo_auth:unranked:F', 'overlaps')$$,
   '23514',
   NULL,

@@ -128,6 +128,10 @@ DROP VIEW IF EXISTS $SCHEMA$.release_artifacts;
 
 --SPLIT--
 
+DROP VIEW IF EXISTS $SCHEMA$.run_artifacts;
+
+--SPLIT--
+
 DROP VIEW IF EXISTS $SCHEMA$.import_run_status;
 
 --SPLIT--
@@ -138,7 +142,36 @@ DROP FUNCTION IF EXISTS $SCHEMA$.published_release(text);
 
 -- The durable import run state machine
 
+DROP FUNCTION IF EXISTS $SCHEMA$.analyze_import(uuid, uuid);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.analyze_release(uuid);
+
+--SPLIT--
+
+-- Staging tables are named only from durable import-run ids. Remove exactly
+-- those catalog-owned relations while both the history and naming helper are
+-- still available; a shared schema may also contain unrelated tables whose
+-- names merely begin with staging_ and those remain host-owned.
+DO $fn$
+DECLARE
+  target_run_id uuid;
+BEGIN
+  FOR target_run_id IN
+    SELECT import_run.id FROM $SCHEMA$.import_run
+  LOOP
+    EXECUTE format(
+      'DROP TABLE IF EXISTS $SCHEMA$.%I',
+      $SCHEMA$.staging_table_name(target_run_id)
+    );
+  END LOOP;
+END;
+$fn$;
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.drop_staging(uuid, uuid);
 
 --SPLIT--
 
@@ -146,7 +179,11 @@ DROP FUNCTION IF EXISTS $SCHEMA$.drop_staging(uuid);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.create_staging(uuid);
+DROP FUNCTION IF EXISTS $SCHEMA$.insert_staging_many(uuid, uuid, text[], jsonb[], geometry[]);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.create_staging(uuid, uuid);
 
 --SPLIT--
 
@@ -154,27 +191,35 @@ DROP FUNCTION IF EXISTS $SCHEMA$.staging_table_name(uuid);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.fail_import(uuid, jsonb);
+DROP FUNCTION IF EXISTS $SCHEMA$.fail_import(uuid, uuid, jsonb);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.advance_import(uuid, text, jsonb);
+DROP FUNCTION IF EXISTS $SCHEMA$.complete_import(uuid, uuid, jsonb);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.heartbeat_import(uuid, jsonb);
+DROP FUNCTION IF EXISTS $SCHEMA$.advance_import(uuid, uuid, text, jsonb);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.begin_or_resume_import(uuid, text, text, interval);
+DROP FUNCTION IF EXISTS $SCHEMA$.heartbeat_import(uuid, uuid, jsonb);
 
 --SPLIT--
 
-DROP TABLE IF EXISTS $SCHEMA$.import_run_lease;
+DROP FUNCTION IF EXISTS $SCHEMA$.retry_failed(uuid, jsonb, jsonb);
 
 --SPLIT--
 
-DROP TABLE IF EXISTS $SCHEMA$.import_run;
+DROP FUNCTION IF EXISTS $SCHEMA$.prepare_import(jsonb, jsonb);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.claim_import_execution(uuid, uuid);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.record_artifact_observation(uuid, uuid, uuid, text, bigint);
 
 --SPLIT--
 
@@ -188,7 +233,19 @@ DROP FUNCTION IF EXISTS $SCHEMA$.rollback_publication(text);
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.publish_import(uuid, uuid);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.publish_release(uuid);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.assert_required_artifact_observations(uuid);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.verify_import(uuid, uuid);
 
 --SPLIT--
 
@@ -198,47 +255,47 @@ DROP FUNCTION IF EXISTS $SCHEMA$.verify_release(uuid);
 
 -- Write-side functions for areas, boundaries, and relations
 
-DROP FUNCTION IF EXISTS $SCHEMA$.rebuild_relations(uuid);
+DROP FUNCTION IF EXISTS $SCHEMA$.rebuild_relations(uuid, uuid);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_relation(uuid, text, text, text);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_relation(uuid, uuid, text, text, text);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_relation_many(uuid, text[], text[], text[]);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_relation_many(uuid, uuid, text[], text[], text[]);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release(uuid, text, geography, jsonb);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release(uuid, uuid, text, geography, jsonb);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release_many(uuid, text[], geography[], jsonb[]);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_in_release_many(uuid, uuid, text[], geography[], jsonb[]);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_boundaries(uuid, text[], uuid[], geometry[], integer[], jsonb[]);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_boundaries(uuid, uuid, text[], uuid[], geometry[], integer[], jsonb[]);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_boundary(uuid, text, uuid, geometry, double precision);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_boundary(uuid, uuid, text, uuid, geometry, double precision);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_area_code(text, text, text);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_code(uuid, uuid, text, text, text);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_area_code_many(text[], text[], text[]);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_code_many(uuid, uuid, text[], text[], text[]);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_area_name(text, text, text, text);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_name(uuid, uuid, text, text, text, text);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.put_area_name_many(text[], text[], text[], text[]);
+DROP FUNCTION IF EXISTS $SCHEMA$.put_area_name_many(uuid, uuid, text[], text[], text[], text[]);
 
 --SPLIT--
 
@@ -246,7 +303,27 @@ DROP FUNCTION IF EXISTS $SCHEMA$.upsert_area(text, text, text, text);
 
 --SPLIT--
 
+DROP FUNCTION IF EXISTS $SCHEMA$.upsert_area_many(uuid, uuid, text[], text[], text[]);
+
+--SPLIT--
+
 DROP FUNCTION IF EXISTS $SCHEMA$.upsert_area_many(text, text[], text[], text[]);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.assert_import_write(uuid, uuid, text[]);
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.import_run_lease;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.import_run_artifact;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.import_run;
 
 --SPLIT--
 
@@ -270,11 +347,11 @@ DROP FUNCTION IF EXISTS $SCHEMA$.attach_source_release(uuid, uuid);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.open_release(text, text, jsonb, date);
+DROP FUNCTION IF EXISTS $SCHEMA$.attach_artifact(uuid, uuid);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.record_artifact_observation(uuid, text, bigint);
+DROP FUNCTION IF EXISTS $SCHEMA$.open_release(text, text, jsonb, date);
 
 --SPLIT--
 
@@ -310,7 +387,11 @@ DROP FUNCTION IF EXISTS $SCHEMA$.release_at(text, timestamptz);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.area_codes_json(uuid);
+DROP FUNCTION IF EXISTS $SCHEMA$.area_codes_json(uuid, uuid);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.assert_area_declared(uuid, uuid);
 
 --SPLIT--
 
@@ -322,7 +403,11 @@ DROP FUNCTION IF EXISTS $SCHEMA$.assert_release_mutable(uuid);
 
 --SPLIT--
 
-DROP FUNCTION IF EXISTS $SCHEMA$.publication_lock_key(uuid);
+DROP FUNCTION IF EXISTS $SCHEMA$.publication_lock_key(text);
+
+--SPLIT--
+
+DROP FUNCTION IF EXISTS $SCHEMA$.release_lock_key(text, text);
 
 --SPLIT--
 
@@ -378,6 +463,30 @@ DROP TABLE IF EXISTS $SCHEMA$.release_source;
 
 --SPLIT--
 
+DROP TABLE IF EXISTS $SCHEMA$.release_area_code;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.release_area_name;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.release_artifact;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.release_area_type;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.release_authority;
+
+--SPLIT--
+
+DROP TABLE IF EXISTS $SCHEMA$.release_collection_policy;
+
+--SPLIT--
+
 DROP TABLE IF EXISTS $SCHEMA$.release;
 
 --SPLIT--
@@ -401,26 +510,6 @@ DROP FUNCTION IF EXISTS $SCHEMA$.publication_release_is_publishable();
 -- Collections, authorities, area types, and stable area identity
 
 DROP TABLE IF EXISTS $SCHEMA$.area_code;
-
---SPLIT--
-
-DROP TRIGGER IF EXISTS area_name_official_name_delete_trg ON $SCHEMA$.area_name;
-
---SPLIT--
-
-DROP TRIGGER IF EXISTS area_name_official_name_update_trg ON $SCHEMA$.area_name;
-
---SPLIT--
-
-DROP TRIGGER IF EXISTS area_name_official_name_insert_trg ON $SCHEMA$.area_name;
-
---SPLIT--
-
-DROP FUNCTION IF EXISTS $SCHEMA$.area_name_maintains_official_name();
-
---SPLIT--
-
-DROP FUNCTION IF EXISTS $SCHEMA$.refresh_area_official_names(uuid[]);
 
 --SPLIT--
 

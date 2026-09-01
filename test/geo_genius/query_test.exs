@@ -19,8 +19,18 @@ defmodule GeoGenius.QueryTest do
   # release-scoped writes of its own can add them before the release becomes
   # immutable. Every test calls `publish!/0` once it is done with any such
   # writes.
-  setup do
-    GraphFixture.build!()
+  setup context do
+    extra_names =
+      if context[:zephyr_aliases] do
+        [
+          {"demo_auth:outer:A", "Zephyr", "alias", nil},
+          {"demo_auth:inner:B", "Zephyr", "alias", nil}
+        ]
+      else
+        []
+      end
+
+    GraphFixture.build!(extra_names: extra_names)
     on_exit(&GraphFixture.teardown!/0)
     :ok
   end
@@ -308,21 +318,8 @@ defmodule GeoGenius.QueryTest do
     # trigram scoring, and pins the argument at position 4 -- if it landed
     # somewhere else, either every row would still come back or Postgrex would
     # reject the bind outright, not silently keep working.
+    @tag zephyr_aliases: true
     test "binds :limit, and returns score as a float" do
-      TestRepo.query!("SELECT geo_genius.put_area_name($1, $2, $3, $4)", [
-        "demo_auth:outer:A",
-        "Zephyr",
-        "alias",
-        nil
-      ])
-
-      TestRepo.query!("SELECT geo_genius.put_area_name($1, $2, $3, $4)", [
-        "demo_auth:inner:B",
-        "Zephyr",
-        "alias",
-        nil
-      ])
-
       publish!()
 
       assert [

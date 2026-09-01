@@ -186,6 +186,17 @@ defmodule GeoGenius.ManifestTest do
     assert reason =~ "artifacts"
   end
 
+  test "rejects the same logical_name on two sources" do
+    map = valid_map()
+    [source] = map["sources"]
+    second = %{source | "source_key" => "other"}
+    map = %{map | "sources" => [source, second]}
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ "logical_name"
+    assert reason =~ "more than one artifact"
+  end
+
   test "rejects an artifact whose logical_name is not a safe name" do
     map = put_in_artifact(valid_map(), "logical_name", "../escape")
 
@@ -692,7 +703,10 @@ defmodule GeoGenius.ManifestTest do
     # provider a manifest names, and the demo fixture's options carry
     # `code_property` but not `code_column`.
     test "a source's own provider overrides the manifest's" do
-      map = put_source_provider(valid_map(), "simplemaps")
+      map =
+        valid_map()
+        |> put_source_provider("simplemaps")
+        |> Map.update!("area_types", &[%{"key" => "state", "rank" => 10} | &1])
 
       assert {:ok, manifest} = Manifest.from_map(map)
       assert manifest.provider == "geojson"
@@ -750,11 +764,23 @@ defmodule GeoGenius.ManifestTest do
       assert reason =~ ~s(implied_areas entry requires "code_property")
     end
 
+    test "runs a source provider's whole-manifest validation" do
+      map =
+        valid_map()
+        |> put_source_provider("simplemaps")
+        |> put_option("non_census_state_area_type", "postal_region")
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+      assert reason =~ ~s(non_census_state_area_type "postal_region")
+      assert reason =~ "area_types"
+    end
+
     test "accepts options that satisfy both the release and source providers" do
       map =
         valid_map()
         |> Map.put("provider", "simplemaps")
         |> put_source_provider("geojson")
+        |> Map.update!("area_types", &[%{"key" => "state", "rank" => 10} | &1])
         |> put_option("implied_areas", [
           %{"area_type" => "cluster", "code_property" => "C", "names" => %{"1" => "One"}}
         ])

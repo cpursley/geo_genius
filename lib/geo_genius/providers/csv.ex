@@ -63,7 +63,7 @@ defmodule GeoGenius.Providers.CSV do
   alias GeoGenius.Providers.ManifestOptions
   alias GeoGenius.Staging
 
-  # Bounds both the size of a single unnest bind (Staging.insert/3 binds
+  # Bounds both the size of a single unnest bind (Staging.insert/4 binds
   # every row in one round trip) and how long a slow artifact can run
   # between heartbeats -- each chunk is one emit call, and the pipeline
   # heartbeats the run's lease from inside that call.

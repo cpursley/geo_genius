@@ -23,8 +23,9 @@ defmodule Mix.Tasks.GeoGenius.Import do
   A `--timeout` that elapses stops the waiting, not the run. The named run is
   still executing wherever its backend put it, and `mix geo_genius.status
   --run-id` reads its outcome afterwards. Re-running the import instead is
-  safe but pointless: the same owner resumes the same run rather than starting
-  a second one.
+  safe but pointless: the same owner re-enqueues the same run, and its latched
+  executor makes the duplicate delivery a no-op rather than starting a second
+  execution.
 
   `--publish` publishes through the pipeline's own publishing phase, which
   bounds its statement by the window the run was claimed under (900 seconds by
@@ -103,8 +104,8 @@ defmodule Mix.Tasks.GeoGenius.Import do
   end
 
   # `:owner` is omitted rather than passed as nil when `--owner` is absent, so
-  # `GeoGenius.import/1`'s own default -- the node name, which is what lets a
-  # worker restarting on the same node resume its own run -- still applies.
+  # `GeoGenius.import/1`'s own default -- the node name, which identifies an
+  # exact same-owner re-enqueue without transferring execution -- still applies.
   # A literal nil would override that default and fail the run's NOT NULL owner.
   defp import_opts(repo, parsed) do
     opts = [

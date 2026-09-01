@@ -187,9 +187,11 @@ defmodule GeoGenius do
   end
 
   alias GeoGenius.{
+    CandidateError,
     Catalog,
     CatalogError,
     Config,
+    EnqueueError,
     ImportRun,
     Manifest,
     ManifestError,
@@ -201,44 +203,54 @@ defmodule GeoGenius do
   @default_publish_timeout 900_000
 
   @doc """
-  Registers a release from its manifest, claims an import run, and enqueues
-  it. Never runs the import itself -- `runner.enqueue/3` starts that, and
-  `status/2` or `await/3` reads it back.
+  Atomically registers an exact release candidate, claims its import run, and
+  enqueues it. Never runs the import itself -- `runner.enqueue/3` starts that,
+  and `status/2` or `await/3` reads it back.
 
   `opts[:manifest]` is used as given; otherwise the manifest is loaded via
   `GeoGenius.Manifest.load/3` from `opts[:collection]` and `opts[:release]`
-  (both required in that case). Registering the collection, its authorities,
-  area types, source, source release, artifacts, and release-source link is
-  idempotent, so importing the same release twice re-registers the same rows
-  rather than duplicating them.
+  (both required in that case). A completed unpublished candidate returns its
+  existing run without enqueueing, while the owner of a live run may safely
+  submit that same run to its runner again.
 
-  `:owner` defaults to `to_string(node())`, so a worker restarting on the
-  same node resumes its own run instead of colliding with it or waiting out
-  its lease. A caller running two importers on one node passes `:owner`
-  explicitly. `:stale_after_seconds` (default 900) is the window
-  `GeoGenius.Catalog.begin_or_resume_import/3` claims the run under; it also
-  travels through the runner's `args` so `GeoGenius.Pipeline` can derive its
-  own statement timeout from the window the run was actually claimed under,
-  rather than a value that merely resembles it. `:publish` (default `false`)
-  is forwarded the same way.
+  Repeating an import whose latest attempt failed returns
+  `{:error, %GeoGenius.CandidateError{reason: :failed}}` with that attempt's
+  run id. It never creates a replacement implicitly; pass the failed run id
+  to `retry_failed/2` to create the next attempt.
+
+  `:owner` defaults to `to_string(node())`. Repeating the exact request under
+  the same owner closes a post-commit enqueue gap by delivering the existing
+  run again; the run's executor claim makes a duplicate delivery a no-op, not
+  a takeover. A caller running two importers on one node passes `:owner`
+  explicitly. `:stale_after_seconds` (default 900) is the window used to
+  diagnose an abandoned run; staleness never transfers its executor or
+  creates a retry. The value also travels through the runner's `args` so
+  `GeoGenius.Pipeline` can derive its statement timeout from the original
+  claim. `:publish` (default `false`) is forwarded the same way.
 
   Returns `{:error, exception}` -- never raises -- for a manifest that
   cannot be resolved (`GeoGenius.ManifestError`) or a catalog write that
-  cannot be completed (`GeoGenius.CatalogError`), including a release that is
-  already published: `open_release` raises with a hint naming the fix
-  (import under a new release key), and that hint is part of the message.
+  cannot be completed (`GeoGenius.CatalogError`). Expected candidate
+  refusals, including a published release, return
+  `GeoGenius.CandidateError` with a closed `:reason` and the conflicting
+  release/run identifiers. A runner enqueue failure returns
+  `GeoGenius.EnqueueError`, including the run id, backend, acceptance
+  certainty, original reason, and safe status/redelivery guidance.
   """
   @spec import(keyword()) :: {:ok, Ecto.UUID.t()} | {:error, term()}
-  def import(opts \\ []) do
-    context = Context.new(opts)
+  def import(opts \\ []), do: request_import(:prepare, opts)
 
-    case resolve_manifest(opts) do
-      {:ok, manifest} -> start_import(context, manifest, opts)
-      {:error, %ManifestError{}} = error -> error
-    end
-  rescue
-    error in [ManifestError, CatalogError] -> {:error, error}
-  end
+  @doc """
+  Explicitly replaces a failed latest attempt with the supplied exact
+  manifest and enqueues the newly claimed attempt.
+
+  The manifest and runner options resolve exactly as they do for `import/1`.
+  Candidate mismatches, protected releases, non-latest attempts, and runs that
+  are not failed return a structured `GeoGenius.CandidateError` without
+  enqueueing anything.
+  """
+  @spec retry_failed(Ecto.UUID.t(), keyword()) :: {:ok, Ecto.UUID.t()} | {:error, term()}
+  def retry_failed(failed_run_id, opts \\ []), do: request_import({:retry, failed_run_id}, opts)
 
   @doc "One import run, or nil when no run carries that id."
   @spec status(Ecto.UUID.t(), keyword()) :: ImportRun.t() | nil
@@ -384,42 +396,165 @@ defmodule GeoGenius do
     end
   end
 
-  defp start_import(context, %Manifest{} = manifest, opts) do
+  defp request_import(operation, opts) do
+    context = Context.new(opts)
+
+    case resolve_manifest(opts) do
+      {:ok, manifest} -> start_import(context, manifest, operation, opts)
+      {:error, %ManifestError{}} = error -> error
+    end
+  rescue
+    error in [ManifestError, CatalogError] -> {:error, error}
+  end
+
+  defp start_import(context, %Manifest{} = manifest, operation, opts) do
     stale_after_seconds = Keyword.get(opts, :stale_after_seconds, @default_stale_after_seconds)
     owner = Keyword.get(opts, :owner, to_string(node()))
     runner = Context.adapter(context, :runner)
-    release_id = Registration.register(context, manifest)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: owner,
-        runner_backend: runner.name(),
-        stale_after_seconds: stale_after_seconds
-      })
+    claim = %{
+      owner: owner,
+      runner_backend: runner.name(),
+      stale_after_seconds: stale_after_seconds
+    }
 
     args = %{
       publish: Keyword.get(opts, :publish, false),
       stale_after_seconds: stale_after_seconds
     }
 
-    enqueue_import(context, opts, runner, run_id, release_id, manifest, args)
+    operation
+    |> register_import(context, manifest, claim)
+    |> finish_import_request(context, opts, runner, manifest, args)
   end
 
-  defp enqueue_import(context, opts, runner, run_id, release_id, manifest, args) do
-    case runner.enqueue(context, run_id, args) do
+  defp register_import(:prepare, context, manifest, claim) do
+    Registration.prepare_import(context, manifest, claim)
+  end
+
+  defp register_import({:retry, failed_run_id}, context, manifest, claim) do
+    Registration.retry_failed(context, failed_run_id, manifest, claim)
+  end
+
+  defp finish_import_request(
+         {:error, %CandidateError{}} = error,
+         _context,
+         _opts,
+         _runner,
+         _manifest,
+         _args
+       ),
+       do: error
+
+  defp finish_import_request(
+         {:existing, %{run_id: run_id}},
+         _context,
+         _opts,
+         _runner,
+         _manifest,
+         _args
+       ),
+       do: {:ok, run_id}
+
+  defp finish_import_request(
+         {:enqueue, decision},
+         context,
+         opts,
+         runner,
+         manifest,
+         args
+       ) do
+    case enqueue(runner, context, decision.run_id, args) do
       :ok ->
         notify(context, opts, :import_started, %{
-          run_id: run_id,
-          release_id: release_id,
+          run_id: decision.run_id,
+          release_id: decision.release_id,
           collection_key: manifest.collection,
           release_key: manifest.release
         })
 
-        {:ok, run_id}
+        {:ok, decision.run_id}
+
+      {:error, {certainty, reason}}
+      when certainty in [:not_enqueued, :outcome_unknown] ->
+        enqueue_failed(context, decision, runner, certainty, reason)
 
       {:error, reason} ->
-        {:error, reason}
+        enqueue_failed(context, decision, runner, :not_enqueued, reason)
+
+      other ->
+        enqueue_failed(
+          context,
+          decision,
+          runner,
+          :outcome_unknown,
+          {:invalid_enqueue_result, other}
+        )
     end
+  end
+
+  defp enqueue(runner, context, run_id, args) do
+    runner.enqueue(context, run_id, args)
+  rescue
+    exception -> {:error, {:outcome_unknown, exception}}
+  catch
+    kind, reason when kind in [:exit, :throw] ->
+      {:error, {:outcome_unknown, {kind, reason}}}
+  end
+
+  defp enqueue_failed(context, decision, runner, :not_enqueued, reason) do
+    enqueue_error(
+      decision,
+      runner,
+      :not_enqueued,
+      reason,
+      terminalize_enqueue_failure(context, decision, runner, reason)
+    )
+  end
+
+  defp enqueue_failed(_context, decision, runner, certainty, reason) do
+    enqueue_error(decision, runner, certainty, reason, :not_applicable)
+  end
+
+  defp enqueue_error(decision, runner, certainty, reason, terminalization) do
+    {:error,
+     EnqueueError.exception(
+       run_id: decision.run_id,
+       runner_backend: runner.name(),
+       certainty: certainty,
+       lifecycle: decision.reason,
+       reason: reason,
+       terminalization: terminalization
+     )}
+  end
+
+  defp terminalize_enqueue_failure(context, decision, runner, reason)
+       when decision.reason in [:registered, :retried] do
+    executor_id = Ecto.UUID.generate()
+
+    detail = %{
+      "reason" => "runner_enqueue_failed",
+      "runner_backend" => runner.name(),
+      "detail" => inspect(reason)
+    }
+
+    with {:error, first} <- record_enqueue_failure(context, decision.run_id, executor_id, detail),
+         {:error, second} <- record_enqueue_failure(context, decision.run_id, executor_id, detail) do
+      {:not_recorded, {first, second}}
+    else
+      :ok -> :recorded_failed
+    end
+  end
+
+  defp terminalize_enqueue_failure(_context, _decision, _runner, _reason), do: :not_applicable
+
+  defp record_enqueue_failure(context, run_id, executor_id, detail) do
+    Catalog.fail_import(context, run_id, executor_id, detail)
+    :ok
+  rescue
+    exception -> {:error, exception}
+  catch
+    kind, caught_reason -> {:error, {kind, caught_reason}}
   end
 
   # `timeout()` permits `:infinity`, the natural call from a mix task or a
@@ -467,16 +602,65 @@ defmodule GeoGenius do
     Catalog.publish_release(context, release_id, timeout: publish_timeout(opts))
     :ok
   rescue
-    error in [CatalogError] -> {:error, error}
+    error in [CatalogError] -> recover_publish(context, release_id, error)
+  end
+
+  defp recover_publish(context, release_id, error) do
+    confirm_published(
+      context,
+      Catalog.release_collection_key(context, release_id),
+      release_id,
+      error
+    )
+  rescue
+    _exception -> {:error, {:outcome_unknown, error}}
+  end
+
+  defp confirm_published(_context, nil, _release_id, error), do: {:error, error}
+
+  defp confirm_published(context, collection_key, release_id, error) do
+    case Catalog.published_release(context, collection_key) do
+      ^release_id -> :ok
+      _other -> {:error, error}
+    end
   end
 
   defp publish_timeout(opts), do: Keyword.get(opts, :timeout, @default_publish_timeout)
 
   # The rollback's own guard, held to the one call that moves the publication.
   defp rollback_publication(context, collection_key) do
+    expected = snapshot_published(context, collection_key)
+
+    case do_rollback_publication(context, collection_key) do
+      {:ok, collection_id} ->
+        {:ok, collection_id}
+
+      {:error, exception} ->
+        recover_rollback(context, collection_key, expected, exception)
+    end
+  end
+
+  defp snapshot_published(context, collection_key) do
+    {:ok, Catalog.published_release(context, collection_key)}
+  rescue
+    _exception -> :unread
+  end
+
+  defp do_rollback_publication(context, collection_key) do
     {:ok, Catalog.rollback_publication(context, collection_key)}
   rescue
     error in [CatalogError] -> {:error, error}
+  end
+
+  defp recover_rollback(_context, _collection_key, :unread, exception), do: {:error, exception}
+
+  defp recover_rollback(context, collection_key, {:ok, expected}, exception) do
+    case Catalog.published_release(context, collection_key) do
+      ^expected -> {:error, exception}
+      _other -> {:error, {:outcome_unknown, exception}}
+    end
+  rescue
+    _read_error -> {:error, {:outcome_unknown, exception}}
   end
 
   # By the time this reads, the publication has moved in PostgreSQL. The read

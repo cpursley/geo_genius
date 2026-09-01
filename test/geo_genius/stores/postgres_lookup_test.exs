@@ -8,17 +8,29 @@ defmodule GeoGenius.Stores.PostgresLookupTest do
   setup do
     TestRepo.query!("SELECT geo_genius_test.demo_fixture_build()", [])
 
-    TestRepo.query!("SELECT geo_genius.put_area_code($1, $2, $3)", [
-      "demo_auth:outer:A",
-      "slug",
-      "alpha"
-    ])
+    TestRepo.query!(
+      """
+      SELECT geo_genius.put_area_code(
+        geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), $1, $2, $3)
+      """,
+      [
+        "demo_auth:outer:A",
+        "slug",
+        "alpha"
+      ]
+    )
 
-    TestRepo.query!("SELECT geo_genius.put_area_code($1, $2, $3)", [
-      "demo_auth:inner:B",
-      "slug",
-      "alpha"
-    ])
+    TestRepo.query!(
+      """
+      SELECT geo_genius.put_area_code(
+        geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), $1, $2, $3)
+      """,
+      [
+        "demo_auth:inner:B",
+        "slug",
+        "alpha"
+      ]
+    )
 
     # A third, metadata-only area (no boundary, so it never enters the
     # spatial tests) whose name also starts with "a" -- the only way to give
@@ -32,23 +44,29 @@ defmodule GeoGenius.Stores.PostgresLookupTest do
       "C"
     ])
 
-    TestRepo.query!("SELECT geo_genius.put_area_name($1, $2, $3, $4)", [
-      "demo_auth:outer:C",
-      "Acme",
-      "official",
-      nil
-    ])
+    TestRepo.query!(
+      "SELECT geo_genius.put_area_in_release(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), $1, ST_GeogFromText('POINT(50 50)'), '{}'::jsonb)",
+      ["demo_auth:outer:C"]
+    )
 
     TestRepo.query!(
-      "SELECT geo_genius.put_area_in_release((SELECT id FROM geo_genius.release WHERE release_key = 'r1'), $1, ST_GeogFromText('POINT(50 50)'), '{}'::jsonb)",
-      ["demo_auth:outer:C"]
+      """
+      SELECT geo_genius.put_area_name(
+        geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), $1, $2, $3, $4)
+      """,
+      ["demo_auth:outer:C", "Acme", "official", nil]
     )
 
     # Parent scoping walks relations, and the fixture attaches boundaries
     # without measuring them. B sits inside A, so one rebuild gives the
     # containment relation the scoped lookup traverses.
     TestRepo.query!(
-      "SELECT geo_genius.rebuild_relations((SELECT id FROM geo_genius.release WHERE release_key = 'r1'))",
+      "SELECT geo_genius.advance_import(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'relating', '{}'::jsonb)",
+      []
+    )
+
+    TestRepo.query!(
+      "SELECT geo_genius.rebuild_relations(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id())",
       []
     )
 

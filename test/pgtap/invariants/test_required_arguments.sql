@@ -2,7 +2,7 @@ BEGIN;
 
 -- Every function in this schema that validates a required argument raises
 -- SQLSTATE 22004 naming what was missing. Thirty-seven functions carry such a
--- guard, covering eighty-three arguments between them, and before this file
+-- guard, covering ninety-six arguments between them, and before this file
 -- three of the thirty-seven had a test.
 --
 -- The table below is written out rather than discovered from the catalog. A
@@ -23,7 +23,7 @@ BEGIN;
 -- guard, analyze_release reaches format('%I', NULL), which raises "null values
 -- cannot be formatted as an SQL identifier", also 22004. A code-only assertion
 -- cannot tell the contract from the accident.
-SELECT plan(84);
+SELECT plan(97);
 
 CREATE TEMP TABLE guarded_arg (
   fname text,
@@ -33,8 +33,9 @@ CREATE TEMP TABLE guarded_arg (
 );
 
 INSERT INTO guarded_arg (fname, identity_args, argname, message) VALUES
-  ('advance_import', NULL, 'target_run_id', 'run id and next status are required'),
-  ('advance_import', NULL, 'next_status', 'run id and next status are required'),
+  ('advance_import', NULL, 'target_run_id', 'run id, executor id, and next status are required'),
+  ('advance_import', NULL, 'target_executor_id', 'run id, executor id, and next status are required'),
+  ('advance_import', NULL, 'next_status', 'run id, executor id, and next status are required'),
   ('analyze_release', NULL, 'target_release_id', 'release id is required'),
   ('ancestors_of', NULL, 'child_area_key', 'child area key is required'),
   ('areas_by_code', NULL, 'target_code_type', 'code type and code value are required'),
@@ -47,43 +48,55 @@ INSERT INTO guarded_arg (fname, identity_args, argname, message) VALUES
   ('areas_near', NULL, 'radius_m', 'longitude, latitude, and radius are required'),
   ('attach_source_release', NULL, 'target_release_id', 'release id and source release id are required'),
   ('attach_source_release', NULL, 'target_source_release_id', 'release id and source release id are required'),
-  ('begin_or_resume_import', NULL, 'target_release_id', 'release id, owner, and runner backend are required'),
-  ('begin_or_resume_import', NULL, 'owner', 'release id, owner, and runner backend are required'),
-  ('begin_or_resume_import', NULL, 'runner_backend', 'release id, owner, and runner backend are required'),
+  ('retry_failed', NULL, 'failed_run_id', 'failed run id, manifest, and claim are required'),
+  ('retry_failed', NULL, 'manifest', 'failed run id, manifest, and claim are required'),
+  ('retry_failed', NULL, 'claim', 'failed run id, manifest, and claim are required'),
   ('children_of', NULL, 'parent_area_key', 'parent area key is required'),
   ('create_release_partitions', NULL, 'target_release_id', 'release id is required'),
   ('drop_release_partitions', NULL, 'target_release_id', 'release id is required'),
-  ('fail_import', NULL, 'target_run_id', 'run id is required'),
-  ('heartbeat_import', NULL, 'target_run_id', 'run id is required'),
+  ('fail_import', NULL, 'target_run_id', 'run id and executor id are required'),
+  ('fail_import', NULL, 'target_executor_id', 'run id and executor id are required'),
+  ('heartbeat_import', NULL, 'target_run_id', 'run id and executor id are required'),
+  ('heartbeat_import', NULL, 'target_executor_id', 'run id and executor id are required'),
   ('open_release', NULL, 'collection_key', 'collection, release key, and manifest are required'),
   ('open_release', NULL, 'release_key', 'collection, release key, and manifest are required'),
   ('open_release', NULL, 'manifest', 'collection, release key, and manifest are required'),
   ('published_release', NULL, 'collection_key', 'collection key is required'),
-  ('put_area_code', NULL, 'target_area_key', 'area key, code type, and code value are required'),
-  ('put_area_code', NULL, 'code_type', 'area key, code type, and code value are required'),
-  ('put_area_code', NULL, 'code_value', 'area key, code type, and code value are required'),
-  ('put_area_in_release', NULL, 'target_release_id', 'release id and area key are required'),
-  ('put_area_in_release', NULL, 'target_area_key', 'release id and area key are required'),
-  ('put_area_name', NULL, 'target_area_key', 'area key, name, and kind are required'),
-  ('put_area_name', NULL, 'name', 'area key, name, and kind are required'),
-  ('put_area_name', NULL, 'kind', 'area key, name, and kind are required'),
+  ('put_area_code', NULL, 'target_run_id', 'run id, executor id, area key, code type, and code value are required'),
+  ('put_area_code', NULL, 'target_executor_id', 'run id, executor id, area key, code type, and code value are required'),
+  ('put_area_code', NULL, 'target_area_key', 'run id, executor id, area key, code type, and code value are required'),
+  ('put_area_code', NULL, 'code_type', 'run id, executor id, area key, code type, and code value are required'),
+  ('put_area_code', NULL, 'code_value', 'run id, executor id, area key, code type, and code value are required'),
+  ('put_area_in_release', NULL, 'target_run_id', 'run id, executor id, and area key are required'),
+  ('put_area_in_release', NULL, 'target_executor_id', 'run id, executor id, and area key are required'),
+  ('put_area_in_release', NULL, 'target_area_key', 'run id, executor id, and area key are required'),
+  ('put_area_name', NULL, 'target_run_id', 'run id, executor id, area key, name, and kind are required'),
+  ('put_area_name', NULL, 'target_executor_id', 'run id, executor id, area key, name, and kind are required'),
+  ('put_area_name', NULL, 'target_area_key', 'run id, executor id, area key, name, and kind are required'),
+  ('put_area_name', NULL, 'name', 'run id, executor id, area key, name, and kind are required'),
+  ('put_area_name', NULL, 'kind', 'run id, executor id, area key, name, and kind are required'),
   ('put_artifact', NULL, 'target_source_release_id', 'source release, logical name, format, expected sha256, and expected bytes are required'),
   ('put_artifact', NULL, 'logical_name', 'source release, logical name, format, expected sha256, and expected bytes are required'),
   ('put_artifact', NULL, 'format', 'source release, logical name, format, expected sha256, and expected bytes are required'),
   ('put_artifact', NULL, 'expected_sha256', 'source release, logical name, format, expected sha256, and expected bytes are required'),
   ('put_artifact', NULL, 'expected_bytes', 'source release, logical name, format, expected sha256, and expected bytes are required'),
-  ('put_boundary', NULL, 'target_release_id', 'release, area key, source release, and geometry are required'),
-  ('put_boundary', NULL, 'target_area_key', 'release, area key, source release, and geometry are required'),
-  ('put_boundary', NULL, 'target_source_release_id', 'release, area key, source release, and geometry are required'),
-  ('put_boundary', NULL, 'input_geom', 'release, area key, source release, and geometry are required'),
-  ('put_relation', NULL, 'target_release_id', 'release, parent area key, child area key, and relation type are required'),
-  ('put_relation', NULL, 'parent_area_key', 'release, parent area key, child area key, and relation type are required'),
-  ('put_relation', NULL, 'child_area_key', 'release, parent area key, child area key, and relation type are required'),
-  ('put_relation', NULL, 'relation_type', 'release, parent area key, child area key, and relation type are required'),
-  ('rebuild_relations', NULL, 'target_release_id', 'release id is required'),
-  ('record_artifact_observation', NULL, 'target_artifact_id', 'artifact id, observed sha256, and observed bytes are required'),
-  ('record_artifact_observation', NULL, 'observed_sha256', 'artifact id, observed sha256, and observed bytes are required'),
-  ('record_artifact_observation', NULL, 'observed_bytes', 'artifact id, observed sha256, and observed bytes are required'),
+  ('put_boundary', NULL, 'target_run_id', 'run, area key, source release, and geometry are required'),
+  ('put_boundary', NULL, 'target_executor_id', 'run, area key, source release, and geometry are required'),
+  ('put_boundary', NULL, 'target_area_key', 'run, area key, source release, and geometry are required'),
+  ('put_boundary', NULL, 'target_source_release_id', 'run, area key, source release, and geometry are required'),
+  ('put_boundary', NULL, 'input_geom', 'run, area key, source release, and geometry are required'),
+  ('put_relation', NULL, 'target_run_id', 'run, parent area key, child area key, and relation type are required'),
+  ('put_relation', NULL, 'target_executor_id', 'run, parent area key, child area key, and relation type are required'),
+  ('put_relation', NULL, 'parent_area_key', 'run, parent area key, child area key, and relation type are required'),
+  ('put_relation', NULL, 'child_area_key', 'run, parent area key, child area key, and relation type are required'),
+  ('put_relation', NULL, 'relation_type', 'run, parent area key, child area key, and relation type are required'),
+  ('rebuild_relations', NULL, 'target_run_id', 'run id, executor id, and permitted statuses are required'),
+  ('rebuild_relations', NULL, 'target_executor_id', 'run id, executor id, and permitted statuses are required'),
+  ('record_artifact_observation', NULL, 'target_run_id', 'run id, artifact id, observed sha256, and observed bytes are required'),
+  ('record_artifact_observation', NULL, 'target_executor_id', 'run id, artifact id, observed sha256, and observed bytes are required'),
+  ('record_artifact_observation', NULL, 'target_artifact_id', 'run id, artifact id, observed sha256, and observed bytes are required'),
+  ('record_artifact_observation', NULL, 'observed_sha256', 'run id, artifact id, observed sha256, and observed bytes are required'),
+  ('record_artifact_observation', NULL, 'observed_bytes', 'run id, artifact id, observed sha256, and observed bytes are required'),
   ('related_areas', NULL, 'target_area_key', 'area key is required'),
   ('release_at', NULL, 'collection_key', 'collection key and as_of are required'),
   ('release_at', NULL, 'as_of', 'collection key and as_of are required'),
@@ -168,7 +181,7 @@ SELECT target.fname,
 -- would mean an argument type with no valid value above.
 SELECT is(
   (SELECT count(*)::int FROM arg_call WHERE statement IS NOT NULL),
-  83,
+  96,
   'every guarded argument named above resolves to a callable signature'
 );
 

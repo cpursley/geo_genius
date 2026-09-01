@@ -12,7 +12,7 @@ defmodule GeoGenius.StubProvider do
   # A provider whose whole behaviour is driven by the manifest's `options`,
   # so one module covers every shape the pipeline has to survive:
   #
-  #   "mode"           -- "default", "raise", "exit", "bad_kind",
+  #   "mode"           -- "default", "raise", "exit", "block", "bad_kind",
   #                       "bad_code_type", "stage_error", "command_probe",
   #                       or "bad_relation"
   #   "rows"           -- the row specs `stage/5` emits, each with "code",
@@ -41,6 +41,7 @@ defmodule GeoGenius.StubProvider do
     case mode(manifest) do
       "command_probe" -> probe_command(opts)
       "stage_error" -> {:error, "stub provider refuses to stage #{artifact.logical_name}"}
+      "block" -> block_stage(manifest, artifact, emit, opts)
       _other -> emit_rows(manifest, artifact, emit)
     end
   end
@@ -65,7 +66,7 @@ defmodule GeoGenius.StubProvider do
   end
 
   # "bad_relation" names a child area no row -- this one or any other in the
-  # run -- ever produces, so `Catalog.put_relation/3` raises rather than
+  # run -- ever produces, so `Catalog.put_relation/4` raises rather than
   # writing anything: the fixture for a phase whose failure comes from the
   # database, not from the provider's own validation.
   @impl Provider
@@ -82,6 +83,14 @@ defmodule GeoGenius.StubProvider do
     case ImpliedAreas.parse(options, @code_option_key) do
       {:ok, entries} -> ImpliedAreas.with_implied(area, row.payload, entries, area.authority_key)
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp block_stage(manifest, artifact, emit, opts) do
+    send(Keyword.fetch!(opts, :test_pid), {:stub_provider_blocked, self()})
+
+    receive do
+      :continue -> emit_rows(manifest, artifact, emit)
     end
   end
 

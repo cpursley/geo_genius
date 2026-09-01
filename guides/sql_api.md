@@ -34,8 +34,9 @@ Every function is `SECURITY INVOKER` with a pinned `search_path`; read functions
 `release_at`, `staging_table_name`, and the three internal guards
 `assert_extensions`, `assert_release_mutable`, and `assert_area_in_collection`. Every function returning rows
 (all of Resolution and Traversal below) returns `SETOF area_match`, except the four
-[set-keyed reads](#set-keyed-reads), which return `SETOF seeded_area_match`; Lifecycle and
-Import functions return a scalar (`uuid`, `jsonb`, `integer`) or `void`.
+[set-keyed reads](#set-keyed-reads), which return `SETOF seeded_area_match`. Most Lifecycle
+and Import functions return a scalar or `void`; `prepare_import` and `retry_failed` return one
+candidate-decision row, and `claim_import_execution` returns a closed text result.
 
 Across Resolution and Traversal, four parameters repeat with the same meaning and the
 same defaults everywhere they appear: `collections` and `types` (`text[] DEFAULT NULL`,
@@ -163,25 +164,26 @@ Load catalog identity, then release membership and geometry.
 | `upsert_authority(collection_key, key, name)`                                                                | Create or update a naming authority                                                                |
 | `upsert_area_type(collection_key, key, rank)`                                                                | Create or update a ranked area type                                                                |
 | `upsert_area(collection_key, authority_key, area_type_key, code)`                                            | Create or update an area's identity                                                                |
-| `upsert_area_many(collection_key, authority_keys, area_type_keys, codes)`                                    | Create or update a batch of areas, returning their ids in the caller's order                       |
-| `put_area_name(target_area_key, name, kind, locale)`                                                         | Attach a name (official, alias, mailing, abbreviation)                                             |
-| `put_area_name_many(target_area_keys, names, kinds, locales)`                                                | Attach a batch of names, returning their ids in the caller's order                                 |
-| `put_area_code(target_area_key, code_type, code_value)`                                                      | Attach an external code                                                                            |
-| `put_area_code_many(target_area_keys, code_types, code_values)`                                              | Attach a batch of external codes, returning their ids in the caller's order                        |
+| `upsert_area_many(collection_key, authority_keys, area_type_keys, codes)`                                    | Catalog/bootstrap overload: create or update a batch of area identities                            |
+| `upsert_area_many(target_run_id, target_executor_id, authority_keys, area_type_keys, codes)`                                     | Import overload: create or update a batch through the current normalizing attempt                  |
+| `put_area_name(target_run_id, target_executor_id, target_area_key, name, kind, locale)`                                          | Attach a name through the current normalizing attempt                                              |
+| `put_area_name_many(target_run_id, target_executor_id, target_area_keys, names, kinds, locales)`                                 | Attach a batch of names through the current normalizing attempt                                    |
+| `put_area_code(target_run_id, target_executor_id, target_area_key, code_type, code_value)`                                       | Attach an external code through the current normalizing attempt                                    |
+| `put_area_code_many(target_run_id, target_executor_id, target_area_keys, code_types, code_values)`                               | Attach a batch of external codes through the current normalizing attempt                           |
 | `upsert_source(collection_key, source_key, provider, license)`                                               | Create or update a source: a provider feed within a collection                                     |
 | `upsert_source_release(collection_key, source_key, release_key, source_date, metadata)`                      | Create or update a vintage of a source's data                                                       |
 | `put_artifact(target_source_release_id, logical_name, url, operator_supplied, format, expected_sha256, expected_bytes, metadata)` | Record an artifact a source release expects to have fetched                          |
-| `record_artifact_observation(target_artifact_id, observed_sha256, observed_bytes)`                           | Record what was actually fetched for an artifact, or raise on a mismatch                            |
+| `record_artifact_observation(target_run_id, target_executor_id, target_artifact_id, observed_sha256, observed_bytes)`            | Record one attempt's immutable artifact observation, or raise on a mismatch                        |
 | `open_release(collection_key, release_key, manifest, source_date)`                                           | Create or reopen a release for writing, and create its partitions                                   |
 | `create_release_partitions(target_release_id)`                                                               | Create the per-release partitions writes below require, for a release row created some other way   |
 | `attach_source_release(target_release_id, target_source_release_id)`                                         | Declare that a release draws on a source release's data                                             |
-| `put_area_in_release(target_release_id, target_area_key, centroid, data)`                                    | Record release membership; geometry optional                                                       |
-| `put_area_in_release_many(target_release_id, target_area_keys, centroids, data)`                             | Record a batch of release memberships                                                              |
-| `put_boundary(target_release_id, target_area_key, target_source_release_id, input_geom, simplify_tolerance)` | Attach a polygon; also ensures release membership                                                  |
-| `put_boundaries(target_release_id, target_area_keys, target_source_release_ids, input_geometries, display_tiers, source_properties)` | Attach a batch of polygons; also ensures release membership                         |
-| `put_relation(target_release_id, parent_area_key, child_area_key, relation_type)`                            | Assert an unmeasured relation from source data                                                     |
-| `put_relation_many(target_release_id, parent_area_keys, child_area_keys, relation_types)`                    | Assert a batch of unmeasured relations                                                             |
-| `rebuild_relations(target_release_id)`                                                                       | Derive measured relations from boundary overlap                                                    |
+| `put_area_in_release(target_run_id, target_executor_id, target_area_key, centroid, data)`                                        | Record release membership through the current normalizing attempt                                  |
+| `put_area_in_release_many(target_run_id, target_executor_id, target_area_keys, centroids, data)`                                 | Record a batch of memberships through the current normalizing attempt                              |
+| `put_boundary(target_run_id, target_executor_id, target_area_key, target_source_release_id, input_geom, simplify_tolerance)`     | Attach a polygon through the current normalizing attempt; also ensures membership                  |
+| `put_boundaries(target_run_id, target_executor_id, target_area_keys, target_source_release_ids, input_geometries, display_tiers, source_properties)` | Attach a batch of polygons through the current normalizing attempt                  |
+| `put_relation(target_run_id, target_executor_id, parent_area_key, child_area_key, relation_type)`                                | Assert an unmeasured relation through the current relating attempt                                 |
+| `put_relation_many(target_run_id, target_executor_id, parent_area_keys, child_area_keys, relation_types)`                        | Assert a batch of relations through the current relating attempt                                   |
+| `rebuild_relations(target_run_id, target_executor_id)`                                                                           | Derive measured relations through the current relating attempt                                     |
 
 ### Set writes
 
@@ -199,7 +201,7 @@ area per column spends a round trip on every repeat. Measured on the US SimpleMa
 written one area at a time.
 `put_boundaries` validates and repairs the accepted geometries, replaces each area's
 boundary and subdivided parts, and recomputes its centroid from what it stored. The
-Elixir `put_boundary/4` API is a one-element plural call when its
+Elixir `put_boundary/5` API is a one-element plural call when its
 `simplify_tolerance` is zero or omitted. A nonzero tolerance retains the original
 singular SQL path and its display-geometry simplification behavior. The plural SQL
 takes an explicit `display_tier` and `source_properties` per boundary instead.
@@ -322,14 +324,17 @@ to such a release fails with a `no partition of relation ... found for row` erro
 silent no-op. Both boundary write forms ensure release membership, so a polygon-first
 caller never needs to call both.
 
-A published release is immutable. `put_area_in_release`, `put_boundary`, `put_boundaries`, `put_relation`,
-`rebuild_relations`, and `attach_source_release` all call `assert_release_mutable` first
-and raise SQLSTATE `55000` when the target release has status `completed` (the status
-`publish_release` sets) or has a non-null `retired_at`. `attach_source_release` is in that
-list because provenance is part of what a release publishes: `release_artifacts` joins
-through `release_source`, so attaching a source release after publication would change
-what readers of a published release see. Build a new release and publish it to change what
-hosts see; there is no way to edit a published release in place.
+A direct catalog/bootstrap caller may use `open_release` and
+`create_release_partitions`, but ingestion does not write by release id. `prepare_import`
+creates the release and partitions and returns the `run_id` every ingestion mutation above
+accepts. Each mutation proves that the run is the latest attempt, still owns the release lease,
+and is in its permitted phase (`normalizing` or `relating`) before deriving the release id.
+
+A published release is immutable. The run-fenced writers and `attach_source_release` call
+`assert_release_mutable` and raise SQLSTATE `55000` when the derived or explicit release has
+status `completed` or a non-null `retired_at`. `attach_source_release` is in that list because
+provenance is part of what a release publishes. Build a new release and publish it to change
+what clients see; there is no way to edit a published release in place.
 
 Every write that targets an area also calls `assert_area_in_collection`, which raises
 SQLSTATE `23503` when the area's `collection_id` does not match the release's. The boundary writes
@@ -341,18 +346,21 @@ latitude beyond ±90) with SQLSTATE `22023`.
 
 ### Declaring provenance
 
-The boundary writes' source release ids are not free-form: the release must
-declare it first by calling `attach_source_release`, which links a `release` to a
-`source_release` it draws data from. `attach_source_release` raises SQLSTATE `23503` if
+The boundary writes' source release ids are not free-form: the release must declare them.
+`prepare_import` records the source composition from the exact manifest; a direct catalog
+caller can use `attach_source_release`, which links a `release` to a `source_release` it draws
+data from. `attach_source_release` raises SQLSTATE `23503` if
 either id does not exist, or if the source release belongs to a different collection than
 the release. `verify_release` also fails a release that declares no source releases at
 all, so attaching at least one is mandatory before publishing, even for a release with no
 boundaries. The `source` and `source_release` rows themselves come from `upsert_source`
 and `upsert_source_release`. `put_artifact` records what a source release's manifest
 declares: the logical name, format, expected sha256, and expected byte count, all of them
-required. `record_artifact_observation` records what the import actually fetched and is
-the call that compares the two, raising SQLSTATE `23514` when the observed digest or byte
-count differs from the declared one.
+required. `record_artifact_observation` records what one run actually fetched and is the
+call that compares the two, raising SQLSTATE `23514` when the observed digest or byte count
+differs from the declared one. A second identical observation is idempotent; a different
+observation for the same run and artifact raises SQLSTATE `55000`. A retry gets a new run
+and new observation rows rather than rewriting the failed attempt's evidence.
 
 Both boundary calls also follow each accepted source release through `source_release` to
 `source` and independently check its collection. This is intentionally redundant with
@@ -366,7 +374,10 @@ Move a release from staged to published, or roll one back.
 | Function                                | Answers                                                             |
 |-----------------------------------------|---------------------------------------------------------------------|
 | `verify_release(target_release_id)`     | Check whether a release is ready to publish; returns a jsonb report |
-| `publish_release(target_release_id)`    | Lock, verify, then atomically publish a release; returns the collection's id |
+| `verify_import(target_run_id, target_executor_id)`          | Verify the candidate owned by the current verifying attempt         |
+| `complete_import(target_run_id, target_executor_id, metrics_patch)` | Verify and complete without publishing; merge final metrics |
+| `publish_release(target_release_id)`    | Operator path: verify and publish a release with no active import   |
+| `publish_import(target_run_id, target_executor_id)`         | Complete the current publishing attempt and publish atomically      |
 | `rollback_publication(collection_key)`  | Swap the publication pointer to the previous release                |
 | `published_release(collection_key)`     | The release a collection publishes right now, or `NULL`             |
 | `retire_releases(collection_key, keep)` | Drop older completed releases' partitions beyond a retention count  |
@@ -382,6 +393,21 @@ Publishing the release that is already published is a no-op: it appends no
 `publication_event` row and leaves `previous_release_id` untouched, so
 `rollback_publication` still reaches the last release that was actually swapped away
 from, not the release that is currently published.
+
+`publish_import` is the ingestion completion path. The run must be the latest leased
+attempt in `publishing`; the function marks it completed, removes its lease, calls the
+same verified pointer swap, and commits those effects atomically. A lost reply can therefore
+be resolved by re-reading the run without risking a published release paired with a failed run.
+
+`complete_import` is the corresponding non-publishing path. The run must be the latest leased
+attempt in `verifying`; it re-checks required artifact observations and release invariants,
+merges the verifying phase's final metrics, marks the release and run completed, and removes the
+lease in one transaction without creating or changing a publication pointer. A later operator publication still goes through
+`publish_release` and re-verifies the completed release.
+
+`publish_release` remains available for deliberate operator work. It refuses a release with
+an active import and refuses one whose latest import is not completed. It never substitutes for
+`publish_import` midway through a run.
 
 Publication and boundary writes serialize on the collection's publication advisory lock.
 `publish_release` takes that lock before `verify_release`; each boundary writer takes it
@@ -399,33 +425,48 @@ release.
 
 ## Import
 
-A durable state machine for a long-running import, with a heartbeat lease so a crashed
-or replaced worker can resume rather than double-run.
+A durable, exact-attempt state machine for a long-running import. Preparation, retry, executor
+claim, every mutation, and publication serialize on the candidate's release key.
 
-| Function                                                                        | Answers                                         |
-|---------------------------------------------------------------------------------|-------------------------------------------------|
-| `begin_or_resume_import(target_release_id, owner, runner_backend, stale_after)` | Claim or resume a durable import run            |
-| `heartbeat_import(target_run_id, progress_patch)`                               | Extend an import run's lease and merge progress |
-| `advance_import(target_run_id, next_status, metrics_patch)`                     | Move an import run to its next state            |
-| `fail_import(target_run_id, error_detail)`                                      | Mark an import run failed and release its lease; refuses a completed run |
+| Function                                                      | Answers                                                        |
+|---------------------------------------------------------------|----------------------------------------------------------------|
+| `prepare_import(manifest, claim)`                             | Register an exact candidate and claim or diagnose its attempt  |
+| `retry_failed(failed_run_id, manifest, claim)`                | Replace one failed latest attempt with a newly claimed attempt |
+| `claim_import_execution(target_run_id, target_executor_id)`   | Latch the one executor allowed to run a pending attempt        |
+| `heartbeat_import(target_run_id, target_executor_id, progress_patch)` | Extend the current attempt's lease and merge progress |
+| `advance_import(target_run_id, target_executor_id, next_status, metrics_patch)`   | Move the current attempt and merge stage metrics               |
+| `fail_import(target_run_id, target_executor_id, error_detail)`                    | Mark an attempt failed and release its lease                   |
 
-`stale_after` defaults to `interval '15 minutes'` and must be non-negative; a negative
-interval raises SQLSTATE `22023` rather than being accepted and making every existing
-lease look retroactively stale. `begin_or_resume_import` called again by the same
-`owner` for a still-live run returns the existing run id and extends its lease rather
-than starting a second attempt; called by a different owner while the lease is live, it
-raises; called after the lease has gone stale, it marks the abandoned run failed and
-starts a new attempt.
+`manifest` and `claim` are JSON objects. The claim requires `owner` and `runner_backend` and
+accepts `stale_after_seconds`, a finite positive number defaulting to 900. Both preparation
+functions return `(decision, reason, release_id, run_id, attempt)`. `prepare_import` returns
+`enqueue/registered` for a new candidate, `enqueue/same_owner` for a safe redelivery,
+`existing/completed` for a completed unpublished candidate, or `error` with a closed reason such
+as `live_import`, `stale_import`, `failed`, `manifest_changed`, or `protected`. An identical
+failed candidate returns `error/failed` with its failed run id; a changed failed candidate returns
+`error/manifest_changed`. It never reclaims a stale lease, rewrites a terminal attempt, or creates
+a replacement for a failed attempt.
 
-`advance_import` refuses to move a run out of a terminal status: once a run is
-`completed` or `failed`, advancing it to any other status raises SQLSTATE `55000`.
-Start a new attempt with `begin_or_resume_import` instead of trying to resurrect one.
+`retry_failed` is the only replacement path. It accepts only the latest failed attempt for the
+same unprotected candidate, transactionally resets the candidate to the supplied exact manifest,
+and creates a new run id and attempt number. The failed row, its manifest snapshot, artifact
+selection and observations, metrics, and error remain immutable. Candidate mismatch, an older
+attempt, a non-failed run, and a published or retired release return an `error` decision without
+changing the catalog.
 
-`fail_import` carries the same guard on the one transition that would lose data:
-failing a `completed` run raises SQLSTATE `55000`. Failing a run that already
-failed is idempotent, so a caller recording the same failure twice does not
-raise. Nothing else is refused -- a run stuck in any working phase can always be
-failed, which is what an operator reclaiming one needs.
+`claim_import_execution` returns one of `claimed`, `occupied`, `completed`, `failed`, `missing`,
+or `superseded`. Only a pending latest attempt with an unclaimed lease can return `claimed`; the
+first executor id is latched with its start time. A duplicate delivery receives `occupied` and
+does no work. A stale heartbeat is evidence for an operator to fail and retry the attempt, not
+permission to replace the executor in place.
+
+Every phase and ingestion writer calls the same attempt fence: the run must be latest, leased,
+mutable, and in the operation's permitted status. `advance_import` accepts only the next edge in
+the fixed sequence from `pending` through `publishing`; it cannot skip a phase or create either
+terminal status. `fail_import` is the sole path to `failed`, while `publish_import` is the sole
+publishing path to `completed`; `complete_import` is the explicit non-publishing completion
+path. `fail_import` refuses a completed run and is idempotent for an
+already failed run, preserving the original error object rather than overwriting failure evidence.
 
 ### Staging and analysis
 
@@ -437,26 +478,27 @@ phase at all.
 | Function                              | Answers                                                        |
 |---------------------------------------|-----------------------------------------------------------------|
 | `staging_table_name(target_run_id)`   | The table name a run's staged rows live under                   |
-| `create_staging(target_run_id)`       | Create that table if it is not there, returning its name        |
-| `drop_staging(target_run_id)`         | Drop it, whether or not the run ever staged anything            |
-| `analyze_release(target_release_id)`  | `ANALYZE` the release's own partitions after its rows are in    |
+| `create_staging(target_run_id, target_executor_id)` | Create the active executor's table if absent, returning its name |
+| `insert_staging_many(target_run_id, target_executor_id, artifacts, payloads, geometries)` | Insert a run-fenced staging batch    |
+| `drop_staging(target_run_id, target_executor_id)` | Drop the current executor's active staging table       |
+| `drop_staging(target_run_id)`         | Drop a terminal run's or orphaned staging table                 |
+| `analyze_release(target_release_id)`  | Operator path: `ANALYZE` a release's partitions                 |
+| `analyze_import(target_run_id, target_executor_id)`       | Analyze the release owned by the current indexing attempt       |
 
 The name is derived from the run's uuid rather than supplied, so it is `[0-9a-f_]+` by
 construction and no caller-supplied text ever reaches an identifier. The staged table
-carries `artifact`, `payload` (jsonb), and `geom`; `create_staging` and `drop_staging`
-are both safe to call twice, which is what lets a caller drop and recreate the table
-without first asking whether the run ever got that far.
+carries `artifact`, `payload` (jsonb), and `geom`. Both drop forms are idempotent, but
+their authority differs: a live executor supplies its identity, while the one-argument
+operator form refuses an active run and is reserved for terminal or orphaned tables.
 
 `create_staging` keeps whatever rows are already in the table -- it is `CREATE TABLE IF
-NOT EXISTS` and nothing more. A caller staging a run that may already have been staged
-once calls `drop_staging` first, so the pass starts from an empty table rather than
-appending to an interrupted attempt's rows. `GeoGenius.Staging.reset/2` is that pair, and
-what `GeoGenius.Pipeline` calls.
+NOT EXISTS` and nothing more. A live executor calls its fenced `drop_staging` form first,
+so the pass starts from an empty table rather than appending to an interrupted attempt's
+rows. `GeoGenius.Staging.reset/3` is that pair, and what `GeoGenius.Pipeline` calls.
 
-`analyze_release` runs against the release's own partitions rather than the whole table,
-so a freshly loaded release has statistics before the first read plans against it.
-`GeoGenius.Pipeline` calls it as the `"indexing"` phase, between rebuilding relations and
-verifying.
+`analyze_release` runs against the release's own partitions rather than the whole table.
+The pipeline uses `analyze_import`, which applies the indexing-phase attempt fence before
+delegating to that operator primitive.
 
 ## Views
 
@@ -464,27 +506,32 @@ Every view here is an ordinary view a host can `SELECT` from and join against; n
 an argument. Two of them assemble a join the import side would otherwise repeat at every
 call site, and are read through `GeoGenius.Catalog`.
 
-| View                 | One row per                                                  |
-|----------------------|---------------------------------------------------------------|
-| `import_run_status`  | Import run, with its collection, release, lease, and metrics |
-| `release_artifacts`  | Artifact a release composes, with the source release it came from |
+| View                 | One row per                                                         |
+|----------------------|----------------------------------------------------------------------|
+| `import_run_status`  | Import run, with its exact manifest, executor, lease, and metrics     |
+| `run_artifacts`      | Artifact selected by one exact attempt, with that attempt's observation |
+| `release_artifacts`  | Artifact a release composes, observed by its latest completed attempt   |
 
 `import_run_status` joins `import_run` to `release` and `collection` and left-joins the
 lease, projecting `run_id`, `release_id`, `collection_key`, `release_key`, `attempt`,
 `status`, `owner`, `runner_backend`, `started_at`, `heartbeat_at`, `completed_at`,
-`error`, `stage_metrics`, and `progress`. A terminal run has no lease row, so
+`error`, `stage_metrics`, `progress`, `executor_id`, `execution_started_at`, and `manifest`.
+A terminal run has no lease row, so
 `heartbeat_at` falls back to the run's own column and `progress` reads as `{}` rather
 than `NULL`. This is what `GeoGenius.status/2` reads, and what
 `%GeoGenius.ImportRun{}`'s fields are named for.
 
-`release_artifacts` joins `release_source` through `source_release` and `source` to
-`artifact`, projecting `release_id`, `source_release_id`, `source_key`,
+`run_artifacts` joins one run's immutable artifact selection to its observations. It is the
+forensic view for failed and successful attempts alike and projects `run_id` before the same
+source, artifact, expectation, observation, and metadata columns described below.
+
+`release_artifacts` joins the release's current composition through `source_release` and
+`source` to `artifact`, projecting `release_id`, `source_release_id`, `source_key`,
 `source_release_key`, `collection_key`, `artifact_id`, `logical_name`, `url`,
 `operator_supplied`, `format`, `expected_sha256`, `expected_bytes`, `observed_sha256`,
-`observed_bytes`, `validated_at`, and `metadata`. Every join is an inner one, so an
-artifact belonging to a source release the release has not declared through
-`attach_source_release` does not appear here at all: declaring provenance is what makes
-an artifact part of a release.
+`observed_bytes`, `validated_at`, and `metadata`. Its observation comes only from the latest
+completed attempt; it never reaches backward into a failed run to make a release appear
+validated. Before any attempt completes, the observation columns are null.
 
 ### Published read views
 
@@ -634,8 +681,8 @@ attached, and becomes valid on the last `ATTACH`.
 A write that must reference a row reports a missing row in one of three ways, and which
 one depends on how the function looks the row up. Most raise SQLSTATE `23503`, whether the
 row is absent or present but belonging to a different collection; those two shapes read
-differently and mean different things, so they are listed apart. The two exceptions,
-`rebuild_relations` and the `SELECT ... INTO STRICT` lookups, follow the `23503` tables.
+differently and mean different things, so they are listed apart. `SELECT ... INTO STRICT`
+lookups use the separate `P0002` contract documented below.
 
 A row the call names does not exist:
 
@@ -648,7 +695,7 @@ A row the call names does not exist:
 | `retire_releases`              | `collection % does not exist`                   |
 | `upsert_source_release`        | `source % does not exist in collection %`       |
 | `put_artifact`                 | `source release % does not exist`               |
-| `record_artifact_observation`  | `artifact % does not exist`                     |
+| `record_artifact_observation`  | `artifact % is not attached to import run %`    |
 | `create_release_partitions`    | `release % does not exist`                      |
 | `verify_release`               | `release % does not exist`                      |
 | `attach_source_release`        | `release % does not exist`, `source release % does not exist` |
@@ -656,7 +703,8 @@ A row the call names does not exist:
 | `advance_import`               | `import run % does not exist`                   |
 | `fail_import`                  | `import run % does not exist`                   |
 | `create_staging`               | `import run % does not exist`                   |
-| `heartbeat_import`             | `import run % has no active lease`              |
+| `insert_staging_many`          | `import run % does not exist`                   |
+| `heartbeat_import`             | `executor % does not own import run %`          |
 
 The row exists but belongs somewhere else:
 
@@ -665,11 +713,6 @@ The row exists but belongs somewhere else:
 | `put_area_in_release`, `put_boundary`, `put_boundaries` (via `assert_area_in_collection`) | `area % belongs to collection %, but release % belongs to collection %` |
 | `attach_source_release`                           | `source release % belongs to collection %, but release % belongs to collection %` |
 | `put_boundary`, `put_boundaries`                  | `source release % is not declared by release %`                  |
-
-Two families depart from `23503`, and a caller matching on SQLSTATE has to expect them.
-
-`rebuild_relations` raises `22023` for `release % does not exist`, where every sibling
-carrying that same message raises `23503`. It is the one outlier in the catalogue.
 
 An unresolved key raises PL/pgSQL's own `P0002` (`no_data_found`), from one of two places.
 A lookup written as `SELECT ... INTO STRICT` raises the bare message `query returned no
@@ -688,7 +731,6 @@ makes it fire:
 | `put_relation`, `put_relation_many`               | an unknown `parent_area_key` or `child_area_key`      | named   |
 | `put_boundary`                                    | an unknown `target_area_key`                          | bare    |
 | `put_boundaries`                                  | an unknown `target_area_key`                          | named   |
-| `assert_release_mutable`                          | an unknown `target_release_id`, which is how `put_boundary`, `put_boundaries`, `put_area_in_release`, `put_relation`, and `rebuild_relations` report one | bare |
 | `assert_area_in_collection`                       | a release or area row deleted between the caller's lookup and this guard | bare |
 
 `verify_release` and `publish_release` each hold one `INTO STRICT` lookup as well, but
@@ -704,9 +746,11 @@ schema can say "these two must agree"; the write API says it instead, and
 `verify_release` re-checks the membership rule at publication time rather than trusting
 the writer.
 
-`23503` is not the only code these functions raise. `55000` is a release that can no
-longer be written to or a run that has already reached a terminal status, and `55006` is a
-release whose import is already claimed by another owner.
+`23503` is not the only code these functions raise. `55000` covers an immutable release,
+an illegal run phase, a superseded or unleased attempt, an attempt-level artifact observation
+that another value already fixed, and a terminal status a caller tried to leave. Candidate
+contention is returned as an `error` decision from `prepare_import` rather than raised as
+`55006`; executor contention is the `occupied` result from `claim_import_execution`.
 
 `23514` has four producers, and the two most reachable are not the artifact check:
 `publish_release` raises it for a release that fails verification, `rollback_publication`
@@ -717,17 +761,16 @@ release of that collection.
 
 `22004` is a required argument left null, asserted for every guarded argument of every
 guarded function in `test/pgtap/invariants/test_required_arguments.sql`.
-`create_staging` and `drop_staging` are outside that set, because neither guards its own
-argument: `create_staging(NULL)` reaches its existence check first and raises `23503`
-naming a run that does not exist, and `drop_staging(NULL)` reaches `staging_table_name`,
-which raises the `22004` on its behalf.
+The one-argument `drop_staging(NULL)` reaches `staging_table_name`, which raises `22004`
+on its behalf. Its two-argument sibling and `create_staging` use the shared attempt fence,
+including its required-argument checks.
 
 `22023` is an argument outside its domain. It covers a geometry that is not SRID
 4326, not a polygon type, or empty; a `manifest` or a `resolve` input that is not a JSON
-object; an unknown relation type; an unknown import phase; a negative `stale_after`; a
+object; an unknown relation type; an unknown import phase; a non-positive or non-finite
+`stale_after_seconds`; a
 `keep` below one; a `max_depth` below one; a longitude or latitude out of range; a
-non-positive radius; `lon` supplied without `lat`; and the `rebuild_relations` outlier
-above.
+non-positive radius; and `lon` supplied without `lat`.
 
 See [`installation.md`](installation.md) for prefixes, upgrades, and the four notes on
 retired areas, measured versus asserted relations, traversal depth, and reacting to

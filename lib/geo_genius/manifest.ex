@@ -293,6 +293,7 @@ defmodule GeoGenius.Manifest do
          {:ok, provider} <- resolve_provider(provider_name),
          {:ok, source_maps} <- require_nonempty_list(map, "sources"),
          {:ok, sources} <- build_all(source_maps, &build_source(&1, provider_name)),
+         :ok <- unique_logical_names(sources),
          {:ok, source_date} <- parse_date(Map.get(map, "source_date"), "source_date"),
          {:ok, authority_maps} <- require_nonempty_list(map, "authorities"),
          {:ok, authorities} <- build_all(authority_maps, &validate_authority/1),
@@ -308,7 +309,11 @@ defmodule GeoGenius.Manifest do
         sources: sources
       }
 
-      {:ok, assemble(map, fields)}
+      manifest = assemble(map, fields)
+
+      with :ok <- validate_provider_manifests(provider, sources, manifest) do
+        {:ok, manifest}
+      end
     end
   end
 
@@ -428,6 +433,22 @@ defmodule GeoGenius.Manifest do
 
   defp reverse_ok({:ok, acc}), do: {:ok, Enum.reverse(acc)}
   defp reverse_ok({:error, _} = error), do: error
+
+  defp unique_logical_names(sources) do
+    names =
+      for source <- sources,
+          artifact <- source.artifacts,
+          do: artifact.logical_name
+
+    case names -- Enum.uniq(names) do
+      [] ->
+        :ok
+
+      duplicates ->
+        {:error,
+         "logical_name #{inspect(hd(duplicates))} is used by more than one artifact in this release"}
+    end
+  end
 
   defp required_name(map, field) do
     with {:ok, value} <- require_string(map, field),
@@ -599,6 +620,29 @@ defmodule GeoGenius.Manifest do
   defp validate_provider_options(provider, options) do
     if function_exported?(provider, :validate_options, 1) do
       provider.validate_options(options)
+    else
+      :ok
+    end
+  end
+
+  # Cross-field policy belongs to the provider that understands it, but the
+  # manifest parser owns when it runs: only after every generic field has been
+  # decoded into its final shape. As with option validation, each provider a
+  # composed release names gets the same check, not only the release default.
+  defp validate_provider_manifests(provider, sources, manifest) do
+    check_all(provider_modules(provider, sources), &provider_manifest_error(&1, manifest))
+  end
+
+  defp provider_manifest_error(provider, manifest) do
+    case validate_provider_manifest(provider, manifest) do
+      :ok -> nil
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_provider_manifest(provider, manifest) do
+    if function_exported?(provider, :validate_manifest, 1) do
+      provider.validate_manifest(manifest)
     else
       :ok
     end

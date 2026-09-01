@@ -43,11 +43,7 @@ defmodule GeoGenius.RunnerTest do
   end
 
   test "falls back to an available backend and always terminates" do
-    assert Runner.configured([]) in [
-             Runners.PgFlow,
-             Runners.Task,
-             Runners.Inline
-           ]
+    assert Runner.configured([]) in [Runners.Task, Runners.Inline]
   end
 
   test "configured/1 resolves to Runners.Task with no configuration at all" do
@@ -60,6 +56,20 @@ defmodule GeoGenius.RunnerTest do
     # happens to be set, rather than resolving the name and probing it live
     # with GenServer.whereis/1, would pass the membership check by
     # coincidence while failing this one.
+    assert Runner.configured([]) == Runners.Task
+  end
+
+  test "does not auto-select PgFlow merely because its engine is present" do
+    refute Process.whereis(PgFlow.Supervisor)
+
+    {:ok, pgflow_supervisor} =
+      Agent.start_link(fn -> :engine_present end, name: PgFlow.Supervisor)
+
+    on_exit(fn ->
+      if Process.alive?(pgflow_supervisor), do: Agent.stop(pgflow_supervisor)
+    end)
+
+    assert Runners.PgFlow.available?()
     assert Runner.configured([]) == Runners.Task
   end
 
@@ -101,7 +111,7 @@ defmodule GeoGenius.RunnerTest do
     # supervisor the host never asked for. Configured but not running names
     # the gap instead.
     refute Runners.Task.available?()
-    assert {:error, not_running} = Runners.Task.enqueue(context, run_id, %{})
+    assert {:error, {:not_enqueued, not_running}} = Runners.Task.enqueue(context, run_id, %{})
     assert not_running =~ "GeoGenius.NoSuchSupervisor"
   end
 
@@ -170,6 +180,18 @@ defmodule GeoGenius.RunnerTest do
       assert Runner.stale_after_seconds(%{stale_after_seconds: -1}) == nil
       assert Runner.stale_after_seconds(%{stale_after_seconds: "120"}) == nil
       assert Runner.stale_after_seconds(%{"stale_after_seconds" => "120"}) == nil
+    end
+  end
+
+  describe "pipeline_opts/1" do
+    test "normalizes atom- or string-keyed durable job arguments once for every backend" do
+      assert Runner.pipeline_opts(%{publish: true, stale_after_seconds: 120}) ==
+               [publish: true, stale_after_seconds: 120]
+
+      assert Runner.pipeline_opts(%{"publish" => true, "stale_after_seconds" => 120}) ==
+               [publish: true, stale_after_seconds: 120]
+
+      assert Runner.pipeline_opts(%{}) == [publish: false, stale_after_seconds: nil]
     end
   end
 

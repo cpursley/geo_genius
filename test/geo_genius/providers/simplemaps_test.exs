@@ -4,6 +4,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
   alias GeoGenius.Manifest
   alias GeoGenius.Provider.Area
   alias GeoGenius.Providers.SimpleMaps
+  alias GeoGenius.Providers.SimpleMaps.Rows
   alias GeoGenius.Staging
 
   @cities Path.expand("../../support/fixtures/simplemaps/uscities_sample.csv", __DIR__)
@@ -19,7 +20,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     %{key: "zip", rank: 40}
   ]
 
-  defp manifest_fixture do
+  defp manifest_fixture(options \\ %{}) do
     %Manifest{
       collection: "simplemaps",
       release: "r1",
@@ -27,7 +28,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
       authorities: [%{key: "simplemaps", name: "SimpleMaps"}],
       area_types: @fixed_hierarchy,
       sources: [],
-      options: %{}
+      options: options
     }
   end
 
@@ -49,6 +50,184 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
 
   test "requires no manifest options" do
     assert SimpleMaps.required_options() == []
+  end
+
+  test "the public one-argument row helpers retain their typespecs" do
+    {:ok, specs} = Code.Typespec.fetch_specs(Rows)
+    arities = Enum.map(specs, fn {{name, arity}, _spec} -> {name, arity} end)
+
+    assert {:areas, 1} in arities
+    assert {:areas, 2} in arities
+    assert {:edges, 1} in arities
+    assert {:edges, 2} in arities
+  end
+
+  test "a directly constructed manifest without options keeps the default state type" do
+    manifest = %{manifest_fixture() | options: nil}
+    row = row("uszips", zip_payload("09001"))
+
+    assert {:ok, areas} = SimpleMaps.normalize(manifest, row)
+    assert area_of_type(areas, "state").code == "AE"
+
+    assert SimpleMaps.asserted_relations(manifest, row) == [
+             {"usps:state:AE", "usps:zip:09001", "contains"}
+           ]
+  end
+
+  test "validates and round-trips an optional non-Census state area type" do
+    options = %{"non_census_state_area_type" => "postal_region"}
+
+    assert SimpleMaps.validate_options(options) == :ok
+
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+      |> Map.update!("area_types", fn area_types ->
+        [
+          %{
+            "key" => "postal_region",
+            "rank" => 15,
+            "requires_geometry" => false
+          }
+          | area_types
+        ]
+      end)
+      |> Map.put("options", options)
+
+    assert {:ok, manifest} = Manifest.from_map(map)
+    assert manifest.options == options
+    assert Manifest.to_map(manifest)["options"] == options
+  end
+
+  test "rejects a configured non-Census state area type the manifest does not declare" do
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+      |> Map.put("options", %{"non_census_state_area_type" => "postal_region"})
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ ~s(non_census_state_area_type "postal_region")
+    assert reason =~ "area_types"
+  end
+
+  test "rejects a configured non-Census state area type that requires geometry" do
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+      |> Map.update!("area_types", fn area_types ->
+        [
+          %{
+            "key" => "postal_region",
+            "rank" => 15,
+            "requires_geometry" => true
+          }
+          | area_types
+        ]
+      end)
+      |> Map.put("options", %{"non_census_state_area_type" => "postal_region"})
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ ~s(non_census_state_area_type "postal_region")
+    assert reason =~ "requires_geometry"
+    assert reason =~ "false"
+  end
+
+  test "accepts the configured type when omitted requires_geometry takes its false default" do
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+      |> Map.update!("area_types", fn area_types ->
+        [%{"key" => "postal_region", "rank" => 15} | area_types]
+      end)
+      |> Map.put("options", %{"non_census_state_area_type" => "postal_region"})
+
+    assert {:ok, manifest} = Manifest.from_map(map)
+    assert %{key: "postal_region", rank: 15} in manifest.area_types
+  end
+
+  test "the omitted option still requires the effective default state type to be declared" do
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+      |> Map.update!("area_types", fn area_types ->
+        Enum.reject(area_types, &(&1["key"] == "state"))
+      end)
+      |> Map.delete("options")
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ ~s(non_census_state_area_type "state")
+    assert reason =~ "area_types"
+  end
+
+  test "the omitted option rejects an effective default state type that requires geometry" do
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+      |> Map.update!("area_types", fn area_types ->
+        Enum.map(area_types, fn
+          %{"key" => "state"} = area_type -> Map.put(area_type, "requires_geometry", true)
+          area_type -> area_type
+        end)
+      end)
+      |> Map.delete("options")
+
+    assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(map)
+    assert reason =~ ~s(non_census_state_area_type "state")
+    assert reason =~ "requires_geometry"
+    assert reason =~ "false"
+  end
+
+  test "a directly constructed manifest with nil options validates the effective default type" do
+    manifest = %{manifest_fixture() | options: nil, area_types: []}
+
+    assert {:error, reason} = SimpleMaps.validate_manifest(manifest)
+    assert reason =~ ~s(non_census_state_area_type "state")
+    assert reason =~ "area_types"
+  end
+
+  test "rejects a malformed non-Census state area type at manifest load" do
+    map =
+      "us_simplemaps"
+      |> Manifest.load!("2026-01")
+      |> Manifest.to_map()
+
+    for value <- [nil, "", "   ", 42, ["postal_region"]] do
+      invalid = Map.put(map, "options", %{"non_census_state_area_type" => value})
+
+      assert {:error, %GeoGenius.ManifestError{reason: reason}} = Manifest.from_map(invalid)
+      assert reason =~ "non_census_state_area_type"
+      assert reason =~ "non-blank string"
+    end
+  end
+
+  test "rejects a malformed option on a directly constructed manifest during normalization" do
+    manifest = manifest_fixture(%{"non_census_state_area_type" => 42})
+    row = row("uszips", zip_payload("09001"))
+
+    assert {:error, reason} = SimpleMaps.normalize(manifest, row)
+    assert reason =~ "non_census_state_area_type"
+    assert reason =~ "non-blank string"
+  end
+
+  test "validate_options and direct normalization reject non-map options except nil" do
+    assert SimpleMaps.validate_options(nil) == :ok
+
+    for value <- [42, "postal_region", ["postal_region"]] do
+      assert {:error, reason} = SimpleMaps.validate_options(value)
+      assert reason =~ "options must be a map"
+
+      manifest = %{manifest_fixture() | options: value}
+      row = row("uszips", zip_payload("09001"))
+
+      assert {:error, normalize_reason} = SimpleMaps.normalize(manifest, row)
+      assert normalize_reason == reason
+    end
   end
 
   test "stages one row per data line, carrying the artifact's logical name" do
@@ -305,7 +484,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     assert is_nil(area_of_type(areas, "state").centroid)
   end
 
-  # `put_area_in_release/4` is last-write-wins for both attributes and
+  # `put_area_in_release/5` is last-write-wins for both attributes and
   # centroid, so a county carrying the row it was derived from would take
   # whichever of its cities or ZIPs happened to import last. Deriving the
   # same county from a city row and from a ZIP row and comparing the whole
@@ -407,7 +586,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     assert Enum.all?(zip_edges, fn {_parent, _child, type} -> type == "overlaps" end)
   end
 
-  # `GeoGenius.Catalog.put_relation/3` takes the parent first, and a swapped
+  # `GeoGenius.Catalog.put_relation/4` takes the parent first, and a swapped
   # pair writes successfully while silently inverting `children_of` and
   # `ancestors_of`. Every edge is checked against the declared ranks rather
   # than against pairs named here, so an inversion fails whichever pair it is
@@ -512,6 +691,41 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
            ]
   end
 
+  test "an opted-in area type applies only to the six non-Census USPS state codes" do
+    options = %{"non_census_state_area_type" => "postal_region"}
+
+    for code <- ["AA", "AE", "AP", "FM", "MH", "PW"] do
+      payload = "09001" |> zip_payload() |> Map.put("state_id", code)
+      state = "uszips" |> normalize_row!(payload, options) |> area_of_type("postal_region")
+
+      assert state.authority_key == "usps"
+      assert state.area_type_key == "postal_region"
+      assert state.code == code
+      assert %Area.Code{code_type: "usps_state", code_value: code} in state.codes
+    end
+
+    ordinary =
+      "uscities"
+      |> normalize_row!(city_payload("Fernbridge"), options)
+      |> area_of_type("state")
+
+    assert ordinary.authority_key == "census"
+    assert ordinary.area_type_key == "state"
+    assert ordinary.code == "VT"
+  end
+
+  test "asserted relations use the opted-in non-Census state area key" do
+    options = %{"non_census_state_area_type" => "postal_region"}
+
+    assert asserted_edges("uszips", zip_payload("09001"), options) == [
+             {"usps:postal_region:AE", "usps:zip:09001", "contains"}
+           ]
+
+    assert asserted_edges("uszips", zip_payload("70099"), options) == [
+             {"usps:postal_region:FM", "usps:zip:70099", "contains"}
+           ]
+  end
+
   test "an ordinary state still keys under census with its ansi code" do
     state = "uscities" |> normalize_row!(city_payload("Fernbridge")) |> area_of_type("state")
 
@@ -557,7 +771,7 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     refute {"census:state:DC", "census:county:51107", "contains"} in edges
   end
 
-  # `GeoGenius.Catalog.put_relation/3` requires both areas to be members of
+  # `GeoGenius.Catalog.put_relation/4` requires both areas to be members of
   # the release, so a state a row hangs a county under has to be a state that
   # row produced. Reading it off another row's Virginia would work until an
   # import whose only Virginia row is this one.
@@ -709,13 +923,13 @@ defmodule GeoGenius.Providers.SimpleMapsTest do
     SimpleMaps.normalize(manifest_fixture(), row(artifact, Map.put(payload, column, "")))
   end
 
-  defp normalize_row!(artifact, payload) do
-    {:ok, areas} = SimpleMaps.normalize(manifest_fixture(), row(artifact, payload))
+  defp normalize_row!(artifact, payload, options \\ %{}) do
+    {:ok, areas} = SimpleMaps.normalize(manifest_fixture(options), row(artifact, payload))
     areas
   end
 
-  defp asserted_edges(artifact, payload) do
-    SimpleMaps.asserted_relations(manifest_fixture(), row(artifact, payload))
+  defp asserted_edges(artifact, payload, options \\ %{}) do
+    SimpleMaps.asserted_relations(manifest_fixture(options), row(artifact, payload))
   end
 
   defp row(artifact, payload) do

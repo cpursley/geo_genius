@@ -8,13 +8,13 @@ SELECT plan(19);
 
 SELECT geo_genius_test.demo_fixture_build();
 
--- `rebuild_relations` is the one documented outlier: every sibling raising
--- 'release % does not exist' raises 23503, and this one raises 22023.
 SELECT throws_ok(
-  $$SELECT geo_genius.rebuild_relations('00000000-0000-0000-0000-000000000001'::uuid)$$,
-  '22023',
+  $$SELECT geo_genius.rebuild_relations(
+      '00000000-0000-0000-0000-000000000001'::uuid,
+      geo_genius_test.demo_executor_id())$$,
+  '23503',
   NULL,
-  'rebuild_relations raises 22023 for a release that does not exist'
+  'rebuild_relations raises 23503 for an import run that does not exist'
 );
 
 SELECT throws_ok(
@@ -50,14 +50,20 @@ SELECT throws_ok(
 );
 
 SELECT throws_ok(
-  $$SELECT geo_genius.put_area_name('nope:nope:nope', 'Zed', 'official', NULL)$$,
+  $$SELECT geo_genius.put_area_name(
+      geo_genius_test.demo_run_id(),
+      geo_genius_test.demo_executor_id(),
+      'nope:nope:nope', 'Zed', 'official', NULL)$$,
   'P0002',
   NULL,
   'put_area_name raises P0002 for an unknown area key'
 );
 
 SELECT throws_ok(
-  $$SELECT geo_genius.put_area_code('nope:nope:nope', 'fips', '99')$$,
+  $$SELECT geo_genius.put_area_code(
+      geo_genius_test.demo_run_id(),
+      geo_genius_test.demo_executor_id(),
+      'nope:nope:nope', 'fips', '99')$$,
   'P0002',
   NULL,
   'put_area_code raises P0002 for an unknown area key'
@@ -65,7 +71,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_area_in_release(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      geo_genius_test.demo_run_id(),
+      geo_genius_test.demo_executor_id(),
       'nope:nope:nope', NULL, NULL)$$,
   'P0002',
   NULL,
@@ -73,32 +80,43 @@ SELECT throws_ok(
 );
 
 SELECT throws_ok(
+  $$SELECT geo_genius.put_area_in_release(
+      '00000000-0000-0000-0000-000000000001'::uuid,
+      geo_genius_test.demo_executor_id(),
+      'demo_auth:outer:A', NULL, NULL)$$,
+  '23503',
+  NULL,
+  'an import run id naming nothing raises 23503 before an ingestion write'
+);
+
+-- Finish every normalizing write before testing the relating contract.
+SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'C');
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:inner:C', NULL, NULL
+);
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(),
+  'relating');
+
+SELECT throws_ok(
   $$SELECT geo_genius.put_relation(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      geo_genius_test.demo_run_id(),
+      geo_genius_test.demo_executor_id(),
       'nope:nope:nope', 'demo_auth:inner:B', 'contains')$$,
   'P0002',
   NULL,
   'put_relation raises P0002 for an unknown parent area key'
 );
 
--- assert_release_mutable is how every release-scoped write reports a release
--- id that names nothing, so its P0002 reaches four functions.
+-- Both staging helpers reject a missing run identity before resolving a
+-- dynamic table name.
 SELECT throws_ok(
-  $$SELECT geo_genius.put_area_in_release(
-      '00000000-0000-0000-0000-000000000001'::uuid,
-      'demo_auth:outer:A', NULL, NULL)$$,
-  'P0002',
+  $$SELECT geo_genius.create_staging(NULL, geo_genius_test.demo_executor_id())$$,
+  '22004',
   NULL,
-  'a release id naming nothing reaches P0002 through assert_release_mutable'
-);
-
--- create_staging and drop_staging sit outside the 22004 required-argument
--- set: both funnel a null run id through the existence check instead.
-SELECT throws_ok(
-  $$SELECT geo_genius.create_staging(NULL)$$,
-  '23503',
-  NULL,
-  'create_staging(NULL) raises 23503 rather than the 22004 of a guarded argument'
+  'create_staging(NULL) raises 22004 for its required run id'
 );
 
 SELECT throws_ok(
@@ -131,15 +149,29 @@ SELECT geo_genius.upsert_authority('sourceless', 'sl_auth', 'Sourceless Authorit
 SELECT geo_genius.upsert_area_type('sourceless', 'unit', 10);
 SELECT geo_genius.upsert_area('sourceless', 'sl_auth', 'unit', 'A');
 
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'sl1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'sourceless';
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"sourceless",
+    "release":"sl1",
+    "collection_name":"Sourceless",
+    "requires_geometry":false,
+    "authorities":[{"key":"sl_auth","name":"Sourceless Authority"}],
+    "area_types":[{"key":"unit","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-error-contracts","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('sourceless', 'sl1'));
 
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'sl1')
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('sourceless', 'sl1'),
+  geo_genius_test.import_executor_id('sourceless', 'sl1'),
+  'normalizing'
 );
 
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'sl1'),
+  geo_genius_test.import_run_id('sourceless', 'sl1'),
+  geo_genius_test.import_executor_id('sourceless', 'sl1'),
   'sl_auth:unit:A', NULL, NULL
 );
 
@@ -157,24 +189,47 @@ SELECT ok(
   'the sourceless release is not also failing for want of areas'
 );
 
-SELECT throws_ok(
-  $$SELECT geo_genius.publish_release(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'sl1'))$$,
-  '23514',
-  NULL,
-  'publish_release raises 23514 for a release that fails verification'
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('sourceless', 'sl1'),
+  geo_genius_test.import_executor_id('sourceless', 'sl1'),
+  'publishing'
 );
 
--- Omitting create_release_partitions is a loud failure, not a silent no-op.
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'sl2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'sourceless';
+SELECT throws_ok(
+  $$SELECT geo_genius.publish_import(
+      geo_genius_test.import_run_id('sourceless', 'sl1'),
+      geo_genius_test.import_executor_id('sourceless', 'sl1'))$$,
+  '23514',
+  NULL,
+  'publish_import raises 23514 for a release that fails verification'
+);
 
-SELECT throws_matching(
-  $$SELECT geo_genius.put_area_in_release(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'sl2'),
-      'sl_auth:unit:A', NULL, NULL)$$,
-  'no partition of relation',
-  'writing to a release whose partitions were never created fails loudly'
+-- Removing partitions from a legitimately claimed candidate is a loud
+-- failure, not a silent no-op.
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"sourceless",
+    "release":"sl2",
+    "collection_name":"Sourceless",
+    "requires_geometry":false,
+    "authorities":[{"key":"sl_auth","name":"Sourceless Authority"}],
+    "area_types":[{"key":"unit","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-error-contracts","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('sourceless', 'sl2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('sourceless', 'sl2'),
+  geo_genius_test.import_executor_id('sourceless', 'sl2'),
+  'normalizing'
+);
+SELECT throws_ok(
+  $$SELECT geo_genius.drop_release_partitions(
+      (SELECT id FROM geo_genius.release WHERE release_key = 'sl2'))$$,
+  '55000',
+  NULL,
+  'drop_release_partitions refuses a claimed live import'
 );
 
 -- guides/ingestion.md names invalid boundary geometry as one of the four
@@ -183,13 +238,6 @@ SELECT throws_matching(
 -- stores anything, and boundary_geom_valid_chk refuses an invalid geometry
 -- written straight to the table. This pins the constraint that makes
 -- verify_release's own invalid-geometry branch unreachable.
-SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'C');
-
-SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
-  'demo_auth:inner:C', NULL, NULL
-);
-
 SELECT throws_ok(
   $$INSERT INTO geo_genius.boundary
       (release_id, area_id, source_release_id, geom, display_geom)

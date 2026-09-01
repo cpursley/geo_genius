@@ -253,7 +253,7 @@ defmodule GeoGenius.ImportEndToEndTest do
 
         {[_first, _second], []} ->
           # Both claims landed only because the first run finished before the
-          # second one reached `begin_or_resume_import`: a completed run holds
+          # second one reached atomic import preparation: a completed run holds
           # no lease, so the second claim is a legitimate new attempt rather
           # than a lost race. One retry, then this is a real failure.
           case race_imports(manifest) do
@@ -577,14 +577,11 @@ defmodule GeoGenius.ImportEndToEndTest do
     count
   end
 
-  # The publication lock is keyed by collection, so the holder needs the same
-  # collection id the statement under test will derive.
+  # The publication lock is keyed by the immutable collection key, so the
+  # holder uses the same value the statement under test derives.
   defp blocked_on_publication_lock!(collection, sql, params, label) do
-    %Postgrex.Result{rows: [[collection_id]]} =
-      TestRepo.query!("SELECT id::text FROM geo_genius.collection WHERE key = $1", [collection])
-
     blocked_until_lock_released!(sql, params, label,
-      key: "geo_genius.publication_lock_key('#{collection_id}'::uuid)",
+      key: "geo_genius.publication_lock_key('#{collection}')",
       relations: @publication_relations
     )
   end
@@ -595,42 +592,83 @@ defmodule GeoGenius.ImportEndToEndTest do
   defp publishable_release!(label) do
     {collection, release} = fresh_collection!(label)
     ctx = context()
+    release_id = seeded_release!(ctx, collection, release)
 
-    Catalog.upsert_collection(ctx, %{key: collection, name: collection})
-    Catalog.upsert_authority(ctx, collection, %{key: "auth", name: "Authority"})
-    Catalog.upsert_area_type(ctx, collection, %{key: "area", rank: 10})
-
-    Catalog.upsert_area(ctx, collection, %{
-      authority_key: "auth",
-      area_type_key: "area",
-      code: "a"
-    })
-
-    Catalog.put_area_name(ctx, "auth:area:a", %{name: "Area A", kind: "official"})
-
-    {collection, seeded_release!(ctx, collection, release)}
+    {collection, release_id}
   end
 
   defp second_release!(ctx, collection, release), do: seeded_release!(ctx, collection, release)
 
   defp seeded_release!(ctx, collection, release) do
-    Catalog.upsert_source(ctx, collection, %{
-      source_key: "src",
-      provider: "test",
-      license: "CC0-1.0"
-    })
+    body = ImportFixture.body()
 
-    source_release_id =
-      Catalog.upsert_source_release(ctx, collection, %{source_key: "src", release_key: release})
+    {:ok, manifest} =
+      Manifest.from_map(%{
+        "collection" => collection,
+        "collection_name" => collection,
+        "release" => release,
+        "provider" => "geojson",
+        "requires_geometry" => false,
+        "authorities" => [%{"key" => "auth", "name" => "Authority"}],
+        "area_types" => [%{"key" => "area", "rank" => 10, "requires_geometry" => false}],
+        "sources" => [
+          %{
+            "source_key" => "#{collection}:src",
+            "provider" => "geojson",
+            "license" => "CC0-1.0",
+            "release_key" => release,
+            "artifacts" => [
+              %{
+                "logical_name" => "fixture.geojson",
+                "operator_supplied" => true,
+                "format" => "geojson",
+                "required" => true,
+                "sha256" => Base.encode16(:crypto.hash(:sha256, body), case: :lower),
+                "bytes" => byte_size(body)
+              }
+            ]
+          }
+        ],
+        "options" => %{"area_type" => "area", "code_property" => "code"}
+      })
 
-    release_id = Catalog.open_release(ctx, collection, %{release_key: release, manifest: %{}})
-    Catalog.attach_source_release(ctx, release_id, source_release_id)
+    candidate =
+      ImportFixture.prepare!(ctx, manifest,
+        owner: "end-to-end-fixture",
+        runner_backend: "test"
+      )
 
-    Catalog.put_area_in_release(ctx, release_id, "auth:area:a", %{
+    executor_id = ImportFixture.claim_executor!(ctx, candidate.run_id)
+    ImportFixture.advance_to!(ctx, candidate.run_id, executor_id, "downloading")
+
+    ImportFixture.observe_selected_artifacts!(
+      ctx,
+      candidate.release_id,
+      candidate.run_id,
+      executor_id
+    )
+
+    ImportFixture.advance_to!(ctx, candidate.run_id, executor_id, "normalizing")
+
+    Catalog.upsert_area_many(ctx, candidate.run_id, executor_id, [
+      %{authority_key: "auth", area_type_key: "area", code: "a"}
+    ])
+
+    Catalog.put_area_in_release(ctx, candidate.run_id, executor_id, "auth:area:a", %{
       centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326}
     })
 
-    release_id
+    Catalog.put_area_name(ctx, candidate.run_id, executor_id, "auth:area:a", %{
+      name: "Area A",
+      kind: "official"
+    })
+
+    # These lock tests exercise the explicit operator publish API, so leave
+    # the release unpublished but close its import before handing it back.
+    ImportFixture.advance_to!(ctx, candidate.run_id, executor_id, "verifying")
+    Catalog.complete_import(ctx, candidate.run_id, executor_id, %{})
+
+    candidate.release_id
   end
 
   # A connection outside the Repo's pool, so a test can hold a transaction open
@@ -811,8 +849,19 @@ defmodule GeoGenius.ImportEndToEndTest do
   defp release_with_partitions!(label) do
     {collection, release} = fresh_collection!(label)
     ctx = context()
-    Catalog.upsert_collection(ctx, %{key: collection, name: collection})
-    Catalog.open_release(ctx, collection, %{release_key: release, manifest: %{}})
+    manifest = geojson_manifest(collection, release, :operator_supplied)
+
+    release_id =
+      ImportFixture.prepare!(ctx, manifest,
+        owner: "partition-lock-fixture",
+        runner_backend: "test"
+      ).release_id
+
+    TestRepo.query!("DELETE FROM geo_genius.import_run_lease WHERE release_id = $1", [
+      Ecto.UUID.dump!(release_id)
+    ])
+
+    release_id
   end
 
   defp race_imports(%Manifest{} = manifest) do

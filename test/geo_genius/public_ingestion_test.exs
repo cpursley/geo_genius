@@ -68,6 +68,100 @@ defmodule GeoGenius.PublicIngestionTest do
     def enqueue(_context, _run_id, _args), do: {:error, "refused to enqueue"}
   end
 
+  defmodule RaisingRunner do
+    @moduledoc "A runner backend that raises while accepting work."
+    @behaviour GeoGenius.Runner
+
+    @impl GeoGenius.Runner
+    def name, do: "raising"
+
+    @impl GeoGenius.Runner
+    def available?, do: true
+
+    @impl GeoGenius.Runner
+    def enqueue(_context, _run_id, _args), do: raise("raised while enqueueing")
+  end
+
+  defmodule ExitingRunner do
+    @moduledoc "A runner backend that exits while accepting work."
+    @behaviour GeoGenius.Runner
+
+    @impl GeoGenius.Runner
+    def name, do: "exiting"
+
+    @impl GeoGenius.Runner
+    def available?, do: true
+
+    @impl GeoGenius.Runner
+    def enqueue(_context, _run_id, _args), do: exit(:enqueue_exit)
+  end
+
+  defmodule ThrowingRunner do
+    @moduledoc "A runner backend that throws while accepting work."
+    @behaviour GeoGenius.Runner
+
+    @impl GeoGenius.Runner
+    def name, do: "throwing"
+
+    @impl GeoGenius.Runner
+    def available?, do: true
+
+    @impl GeoGenius.Runner
+    def enqueue(_context, _run_id, _args), do: throw(:enqueue_throw)
+  end
+
+  defmodule CommittedRunner do
+    @moduledoc "A runner that proves another database connection can see the run before enqueue."
+    @behaviour GeoGenius.Runner
+
+    @impl GeoGenius.Runner
+    def name, do: "committed"
+
+    @impl GeoGenius.Runner
+    def available?, do: true
+
+    @impl GeoGenius.Runner
+    def enqueue(context, run_id, _args) do
+      caller = self()
+
+      snapshot =
+        Task.async(fn ->
+          run = GeoGenius.Catalog.import_run(context, run_id)
+          snapshot(run, context)
+        end)
+        |> Task.await()
+
+      send(caller, {:catalog_visible_before_enqueue, snapshot})
+      :ok
+    end
+
+    defp snapshot(run, context) do
+      repo = context.repo
+      release_id = Ecto.UUID.dump!(run.release_id)
+
+      %{rows: [[has_policy, authority_count, area_type_count]]} =
+        repo.query!(
+          """
+          SELECT EXISTS (
+                   SELECT 1 FROM geo_genius.release_collection_policy
+                    WHERE release_id = $1
+                 ),
+                 (SELECT count(*) FROM geo_genius.release_authority WHERE release_id = $1),
+                 (SELECT count(*) FROM geo_genius.release_area_type WHERE release_id = $1)
+          """,
+          [release_id]
+        )
+
+      %{
+        run: run,
+        artifacts: GeoGenius.Catalog.release_artifacts(context, run.release_id),
+        has_policy: has_policy,
+        authority_count: authority_count,
+        area_type_count: area_type_count
+      }
+    end
+  end
+
   @repo_opts [repo: TestRepo, prefix: "geo_genius"]
 
   setup do
@@ -105,8 +199,12 @@ defmodule GeoGenius.PublicIngestionTest do
 
     %Postgrex.Result{rows: [[name, description, requires_geometry]]} =
       TestRepo.query!(
-        "SELECT name, description, requires_geometry FROM geo_genius.collection WHERE key = $1",
-        [collection]
+        """
+        SELECT policy.name, policy.description, policy.requires_geometry
+          FROM geo_genius.release_collection_policy policy
+         WHERE policy.release_id = $1
+        """,
+        [Ecto.UUID.dump!(release_id)]
       )
 
     assert name == manifest.collection_name
@@ -116,11 +214,14 @@ defmodule GeoGenius.PublicIngestionTest do
     %Postgrex.Result{rows: [[authority_name]]} =
       TestRepo.query!(
         """
-        SELECT authority.name FROM geo_genius.authority
+        SELECT declaration.name FROM geo_genius.authority
         JOIN geo_genius.collection ON collection.id = authority.collection_id
-        WHERE collection.key = $1 AND authority.key = $2
+        JOIN geo_genius.release_authority declaration
+          ON declaration.authority_id = authority.id
+         AND declaration.release_id = $1
+        WHERE collection.key = $2 AND authority.key = $3
         """,
-        [collection, hd(manifest.authorities).key]
+        [Ecto.UUID.dump!(release_id), collection, hd(manifest.authorities).key]
       )
 
     assert authority_name == hd(manifest.authorities).name
@@ -128,11 +229,14 @@ defmodule GeoGenius.PublicIngestionTest do
     %Postgrex.Result{rows: [[rank]]} =
       TestRepo.query!(
         """
-        SELECT area_type.rank FROM geo_genius.area_type
+        SELECT declaration.rank FROM geo_genius.area_type
         JOIN geo_genius.collection ON collection.id = area_type.collection_id
-        WHERE collection.key = $1 AND area_type.key = $2
+        JOIN geo_genius.release_area_type declaration
+          ON declaration.area_type_id = area_type.id
+         AND declaration.release_id = $1
+        WHERE collection.key = $2 AND area_type.key = $3
         """,
-        [collection, "territory"]
+        [Ecto.UUID.dump!(release_id), collection, "territory"]
       )
 
     assert rank == 100
@@ -211,6 +315,199 @@ defmodule GeoGenius.PublicIngestionTest do
     assert count_2 == 1
   end
 
+  test "a same-owner replay re-enqueues the existing run without creating an attempt" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    opts =
+      Keyword.merge(@repo_opts, manifest: manifest, runner: RecordingRunner, owner: "owner-a")
+
+    assert {:ok, run_id} = GeoGenius.import(opts)
+    assert_received {:enqueued, ^run_id, _args}
+
+    assert {:ok, ^run_id} = GeoGenius.import(opts)
+    assert_received {:enqueued, ^run_id, _args}
+
+    assert [%GeoGenius.ImportRun{run_id: ^run_id, attempt: 1}] =
+             Catalog.import_runs(context(), collection)
+  end
+
+  test "a live candidate refusal does not enqueue" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    assert {:ok, run_id} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 manifest: manifest,
+                 runner: NoopRunner,
+                 owner: "owner-a"
+               )
+             )
+
+    assert {:error,
+            %GeoGenius.CandidateError{
+              reason: :live_import,
+              run_id: ^run_id
+            }} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 manifest: manifest,
+                 runner: RecordingRunner,
+                 owner: "owner-b"
+               )
+             )
+
+    refute_received {:enqueued, _, _}
+  end
+
+  test "a changed failed candidate requires explicit retry and refuses ordinary import" do
+    {collection, release} = fresh_collection!()
+    original = build_manifest(collection, release)
+
+    {:ok, corrected} =
+      original
+      |> Manifest.to_map()
+      |> Map.put("description", "Corrected release policy")
+      |> Manifest.from_map()
+
+    assert {:ok, failed_run_id} =
+             GeoGenius.import(Keyword.merge(@repo_opts, manifest: original, runner: NoopRunner))
+
+    executor_id = claim!(failed_run_id)
+
+    :ok =
+      Catalog.fail_import(context(), failed_run_id, executor_id, %{
+        "reason" => "bad reviewed bytes"
+      })
+
+    assert {:error,
+            %GeoGenius.CandidateError{
+              reason: :manifest_changed,
+              run_id: ^failed_run_id
+            }} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts, manifest: corrected, runner: RecordingRunner)
+             )
+
+    refute_received {:enqueued, _, _}
+
+    assert {:ok, retry_run_id} =
+             GeoGenius.retry_failed(
+               failed_run_id,
+               Keyword.merge(@repo_opts, manifest: corrected, runner: RecordingRunner)
+             )
+
+    assert retry_run_id != failed_run_id
+    assert_received {:enqueued, ^retry_run_id, _args}
+  end
+
+  test "an identical failed candidate is refused until explicitly retried" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    assert {:ok, failed_run_id} =
+             GeoGenius.import(Keyword.merge(@repo_opts, manifest: manifest, runner: NoopRunner))
+
+    executor_id = claim!(failed_run_id)
+
+    :ok =
+      Catalog.fail_import(context(), failed_run_id, executor_id, %{
+        "reason" => "fixture failure"
+      })
+
+    assert {:error,
+            %GeoGenius.CandidateError{
+              reason: :failed,
+              run_id: ^failed_run_id,
+              message: message
+            }} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts, manifest: manifest, runner: RecordingRunner)
+             )
+
+    assert message =~ "GeoGenius.retry_failed/2"
+    refute_received {:enqueued, _, _}
+
+    assert [%GeoGenius.ImportRun{run_id: ^failed_run_id, attempt: 1, status: "failed"}] =
+             Catalog.import_runs(context(), collection)
+
+    assert {:ok, retry_run_id} =
+             GeoGenius.retry_failed(
+               failed_run_id,
+               Keyword.merge(@repo_opts, manifest: manifest, runner: RecordingRunner)
+             )
+
+    assert retry_run_id != failed_run_id
+    assert_received {:enqueued, ^retry_run_id, _args}
+
+    assert %GeoGenius.ImportRun{attempt: 2, status: "pending"} =
+             GeoGenius.status(retry_run_id, @repo_opts)
+  end
+
+  test "a completed candidate returns its existing run without enqueue" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    assert {:ok, run_id} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 manifest: manifest,
+                 runner: NoopRunner,
+                 owner: "owner-a"
+               )
+             )
+
+    executor_id = claim!(run_id)
+
+    # Preserve coverage for catalogs created under the earlier contract,
+    # where a completed run could still belong to a candidate release.
+    TestRepo.query!(
+      "UPDATE geo_genius.import_run SET status = 'completed', completed_at = now() WHERE id = $1",
+      [Ecto.UUID.dump!(run_id)]
+    )
+
+    TestRepo.query!("DELETE FROM geo_genius.import_run_lease WHERE run_id = $1", [
+      Ecto.UUID.dump!(run_id)
+    ])
+
+    assert is_binary(executor_id)
+
+    assert {:ok, ^run_id} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 manifest: manifest,
+                 runner: RecordingRunner,
+                 owner: "owner-b"
+               )
+             )
+
+    refute_received {:enqueued, _, _}
+  end
+
+  test "the registration transaction is committed before the runner is enqueued" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    assert {:ok, run_id} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts, manifest: manifest, runner: CommittedRunner)
+             )
+
+    assert_received {:catalog_visible_before_enqueue,
+                     %{
+                       run: %GeoGenius.ImportRun{
+                         run_id: ^run_id,
+                         status: "pending",
+                         manifest: %{"collection" => ^collection}
+                       },
+                       artifacts: [_artifact],
+                       has_policy: true,
+                       authority_count: 1,
+                       area_type_count: 1
+                     }}
+  end
+
   test "an unknown collection or release returns a ManifestError rather than raising" do
     collection = "public_ingestion_nope_#{System.unique_integer([:positive])}"
 
@@ -237,7 +534,7 @@ defmodule GeoGenius.PublicIngestionTest do
                Keyword.merge(@repo_opts, manifest: manifest, runner: Runners.Inline)
              )
 
-    assert %GeoGenius.CatalogError{} = exception
+    assert %GeoGenius.CandidateError{reason: :protected} = exception
     assert exception.message =~ "new release key"
   end
 
@@ -333,6 +630,21 @@ defmodule GeoGenius.PublicIngestionTest do
              GeoGenius.import(Keyword.merge(@repo_opts, manifest: manifest, runner: NoopRunner))
 
     release_id = GeoGenius.status(run_id, @repo_opts).release_id
+    executor_id = claim!(run_id)
+    ImportFixture.advance_to!(context(), run_id, executor_id, "downloading")
+    ImportFixture.observe_selected_artifacts!(context(), release_id, run_id, executor_id)
+
+    # Model catalog corruption that left an invalid release attached to a
+    # completed run. The supported completion function verifies first, so this
+    # state cannot be created through the public lifecycle API.
+    TestRepo.query!(
+      "UPDATE geo_genius.import_run SET status = 'completed', completed_at = now() WHERE id = $1",
+      [Ecto.UUID.dump!(run_id)]
+    )
+
+    TestRepo.query!("DELETE FROM geo_genius.import_run_lease WHERE run_id = $1", [
+      Ecto.UUID.dump!(run_id)
+    ])
 
     # NoopRunner never runs the pipeline, so the release carries no areas --
     # verify_release fails it with "release contains no areas" before
@@ -561,17 +873,225 @@ defmodule GeoGenius.PublicIngestionTest do
     assert args.publish == true
   end
 
-  test "import/1 surfaces a runner's enqueue failure rather than {:ok, run_id}" do
+  test "a legacy runner refusal terminalizes the new attempt and returns actionable certainty" do
     {collection, release} = fresh_collection!()
     manifest = build_manifest(collection, release)
 
-    assert {:error, "refused to enqueue"} =
+    assert {:error,
+            %GeoGenius.EnqueueError{
+              run_id: run_id,
+              runner_backend: "failing",
+              certainty: :not_enqueued,
+              acceptance: :rejected,
+              reason: "refused to enqueue",
+              guidance: guidance
+            }} =
              GeoGenius.import(
                Keyword.merge(@repo_opts, manifest: manifest, runner: FailingRunner)
              )
+
+    assert guidance =~ "status/2"
+    assert guidance =~ "retry_failed/2"
+
+    assert [%GeoGenius.ImportRun{run_id: ^run_id, status: "failed", attempt: 1} = failed] =
+             Catalog.import_runs(context(), collection)
+
+    assert failed.error["reason"] == "runner_enqueue_failed"
+
+    assert {:ok, retry_run_id} =
+             GeoGenius.retry_failed(
+               failed.run_id,
+               Keyword.merge(@repo_opts, manifest: manifest, runner: RecordingRunner)
+             )
+
+    assert retry_run_id != failed.run_id
+    assert_received {:enqueued, ^retry_run_id, _args}
+
+    assert %GeoGenius.ImportRun{status: "pending", attempt: 2} =
+             GeoGenius.status(retry_run_id, @repo_opts)
   end
 
-  test "await/3 polls: observes a run that transitions to completed after the first read" do
+  test "a refusal keeps its typed enqueue error when failure recording is unavailable" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+    RecordingRepo.fail_on("fail_import")
+
+    assert {:error,
+            %GeoGenius.EnqueueError{
+              certainty: :not_enqueued,
+              acceptance: :rejected,
+              terminalization: {:not_recorded, {first, second}},
+              guidance: guidance
+            }} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 repo: RecordingRepo,
+                 manifest: manifest,
+                 runner: FailingRunner
+               )
+             )
+
+    assert %GeoGenius.CatalogError{reason: %DBConnection.ConnectionError{}} = first
+    assert %GeoGenius.CatalogError{reason: %DBConnection.ConnectionError{}} = second
+    assert guidance =~ "could not record"
+    assert guidance =~ "status/2"
+    refute guidance =~ "marked this attempt failed"
+  end
+
+  test "a refused same-owner re-enqueue leaves the live attempt pending with replay guidance" do
+    {collection, release} = fresh_collection!()
+    manifest = build_manifest(collection, release)
+
+    assert {:ok, run_id} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 manifest: manifest,
+                 runner: NoopRunner,
+                 owner: "same-owner"
+               )
+             )
+
+    assert {:error,
+            %GeoGenius.EnqueueError{
+              run_id: ^run_id,
+              certainty: :not_enqueued,
+              acceptance: :rejected,
+              guidance: guidance
+            }} =
+             GeoGenius.import(
+               Keyword.merge(@repo_opts,
+                 manifest: manifest,
+                 runner: FailingRunner,
+                 owner: "same-owner"
+               )
+             )
+
+    assert guidance =~ "same :owner"
+    assert guidance =~ "status/2"
+
+    assert %GeoGenius.ImportRun{status: "pending", attempt: 1} =
+             GeoGenius.status(run_id, @repo_opts)
+  end
+
+  test "a runner raise, exit, or throw has unknown acceptance and leaves a new attempt pending" do
+    Enum.each(
+      [
+        {RaisingRunner, %RuntimeError{message: "raised while enqueueing"}},
+        {ExitingRunner, {:exit, :enqueue_exit}},
+        {ThrowingRunner, {:throw, :enqueue_throw}}
+      ],
+      fn {runner, expected_error} ->
+        {collection, release} = fresh_collection!()
+        manifest = build_manifest(collection, release)
+
+        assert {:error,
+                %GeoGenius.EnqueueError{
+                  run_id: run_id,
+                  runner_backend: runner_backend,
+                  certainty: :outcome_unknown,
+                  acceptance: :unknown,
+                  reason: ^expected_error,
+                  guidance: guidance
+                }} =
+                 GeoGenius.import(Keyword.merge(@repo_opts, manifest: manifest, runner: runner))
+
+        assert runner_backend == runner.name()
+        assert guidance =~ "status/2"
+        assert guidance =~ "same :owner"
+
+        assert [%GeoGenius.ImportRun{run_id: ^run_id, status: "pending", attempt: 1}] =
+                 Catalog.import_runs(context(), collection)
+      end
+    )
+  end
+
+  test "a definite refusal terminalizes a retried attempt but uncertain failures leave it pending" do
+    Enum.each(
+      [
+        {FailingRunner, :not_enqueued, "failed", "refused to enqueue"},
+        {RaisingRunner, :outcome_unknown, "pending",
+         %RuntimeError{message: "raised while enqueueing"}},
+        {ExitingRunner, :outcome_unknown, "pending", {:exit, :enqueue_exit}},
+        {ThrowingRunner, :outcome_unknown, "pending", {:throw, :enqueue_throw}}
+      ],
+      fn {runner, certainty, expected_status, expected_reason} ->
+        {collection, release} = fresh_collection!()
+        manifest = build_manifest(collection, release)
+
+        assert {:ok, first_run_id} =
+                 GeoGenius.import(
+                   Keyword.merge(@repo_opts, manifest: manifest, runner: NoopRunner)
+                 )
+
+        executor_id = claim!(first_run_id)
+
+        :ok =
+          Catalog.fail_import(context(), first_run_id, executor_id, %{
+            "reason" => "fixture failure"
+          })
+
+        assert {:error,
+                %GeoGenius.EnqueueError{
+                  run_id: retry_run_id,
+                  certainty: ^certainty,
+                  reason: ^expected_reason
+                }} =
+                 GeoGenius.retry_failed(
+                   first_run_id,
+                   Keyword.merge(@repo_opts, manifest: manifest, runner: runner)
+                 )
+
+        assert %GeoGenius.ImportRun{
+                 run_id: ^retry_run_id,
+                 status: ^expected_status,
+                 attempt: 2
+               } =
+                 Enum.find(Catalog.import_runs(context(), collection), &(&1.attempt == 2))
+      end
+    )
+  end
+
+  test "a runner raise, exit, or throw does not terminalize a same-owner attempt" do
+    Enum.each(
+      [
+        {RaisingRunner, %RuntimeError{message: "raised while enqueueing"}},
+        {ExitingRunner, {:exit, :enqueue_exit}},
+        {ThrowingRunner, {:throw, :enqueue_throw}}
+      ],
+      fn {runner, expected_error} ->
+        {collection, release} = fresh_collection!()
+        manifest = build_manifest(collection, release)
+
+        assert {:ok, run_id} =
+                 GeoGenius.import(
+                   Keyword.merge(@repo_opts,
+                     manifest: manifest,
+                     runner: NoopRunner,
+                     owner: "same-owner"
+                   )
+                 )
+
+        assert {:error,
+                %GeoGenius.EnqueueError{
+                  run_id: ^run_id,
+                  certainty: :outcome_unknown,
+                  reason: ^expected_error
+                }} =
+                 GeoGenius.import(
+                   Keyword.merge(@repo_opts,
+                     manifest: manifest,
+                     runner: runner,
+                     owner: "same-owner"
+                   )
+                 )
+
+        assert %GeoGenius.ImportRun{status: "pending", attempt: 1} =
+                 GeoGenius.status(run_id, @repo_opts)
+      end
+    )
+  end
+
+  test "await/3 polls: observes a run that becomes terminal after the first read" do
     {collection, release} = fresh_collection!()
     manifest = build_manifest(collection, release)
 
@@ -579,10 +1099,11 @@ defmodule GeoGenius.PublicIngestionTest do
              GeoGenius.import(Keyword.merge(@repo_opts, manifest: manifest, runner: NoopRunner))
 
     ctx = context()
+    executor_id = claim!(run_id)
 
     Task.start(fn ->
       Process.sleep(150)
-      Catalog.advance_import(ctx, run_id, "completed", %{})
+      Catalog.fail_import(ctx, run_id, executor_id, %{"reason" => "test transition"})
     end)
 
     # A read-once implementation -- check the run once, and return
@@ -590,7 +1111,7 @@ defmodule GeoGenius.PublicIngestionTest do
     # "pending" at t=0 and never look again. Only genuine polling catches a
     # transition forced after the first read, comfortably inside this 2s
     # timeout.
-    assert {:ok, %GeoGenius.ImportRun{status: "completed"}} =
+    assert {:error, %GeoGenius.ImportRun{status: "failed"}} =
              GeoGenius.await(run_id, 2_000, @repo_opts)
   end
 
@@ -613,16 +1134,17 @@ defmodule GeoGenius.PublicIngestionTest do
              GeoGenius.import(Keyword.merge(@repo_opts, manifest: manifest, runner: NoopRunner))
 
     ctx = context()
+    executor_id = claim!(run_id)
 
     Task.start(fn ->
       Process.sleep(400)
-      Catalog.advance_import(ctx, run_id, "completed", %{})
+      Catalog.fail_import(ctx, run_id, executor_id, %{"reason" => "test transition"})
     end)
 
     # `timeout()` permits `:infinity`; `System.monotonic_time(:millisecond) +
     # :infinity` raises `ArithmeticError`, so a naive deadline computation
     # would crash this call instead of waiting.
-    assert {:ok, %GeoGenius.ImportRun{status: "completed"}} =
+    assert {:error, %GeoGenius.ImportRun{status: "failed"}} =
              GeoGenius.await(run_id, :infinity, @repo_opts)
   end
 
@@ -704,6 +1226,12 @@ defmodule GeoGenius.PublicIngestionTest do
   end
 
   defp context, do: Context.new(@repo_opts)
+
+  defp claim!(run_id) do
+    executor_id = Ecto.UUID.generate()
+    assert :claimed = Catalog.claim_import_execution(context(), run_id, executor_id)
+    executor_id
+  end
 
   defp fresh_collection! do
     unique = System.unique_integer([:positive])

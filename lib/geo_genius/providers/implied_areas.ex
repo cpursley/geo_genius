@@ -153,7 +153,7 @@ defmodule GeoGenius.Providers.ImpliedAreas do
   The parent end is composed through `GeoGenius.Provider.Area.key/1` rather
   than by joining strings, and `child_area_key` must have been composed the
   same way by the caller: an edge composed a second way can name a key
-  `normalize/2` never produced, and `GeoGenius.Catalog.put_relation_many/3`,
+  `normalize/2` never produced, and `GeoGenius.Catalog.put_relation_many/4`,
   which is what the relating phase calls, refuses an area the release does not
   carry.
 

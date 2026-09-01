@@ -18,15 +18,16 @@ defmodule GeoGenius.InstallIntegrationTest do
     publication_lock_key
     upsert_collection upsert_authority upsert_area_type upsert_area put_area_name put_area_code
     put_boundary put_boundaries put_area_in_release put_relation rebuild_relations verify_release
-    publish_release rollback_publication retire_releases begin_or_resume_import
+    publish_release publish_import rollback_publication retire_releases prepare_import retry_failed
+    claim_import_execution assert_import_write verify_import
     heartbeat_import advance_import fail_import areas_for_point areas_for_geometry
     areas_near areas_by_code search_areas children_of ancestors_of related_areas
     areas_by_code_many children_of_many ancestors_of_many related_areas_many
     resolve assert_release_mutable assert_area_in_collection area_codes_json release_at
     assert_seed_keys
     upsert_source upsert_source_release put_artifact record_artifact_observation
-    open_release attach_source_release staging_table_name create_staging drop_staging
-    analyze_release published_release
+    open_release attach_source_release attach_artifact staging_table_name create_staging
+    insert_staging_many drop_staging analyze_release analyze_import published_release
   )
 
   setup do
@@ -215,7 +216,7 @@ defmodule GeoGenius.InstallIntegrationTest do
 
     failures = Enum.filter(lines, &String.starts_with?(&1, "not ok"))
     assert failures == [], "pgTAP install contract failures:\n#{Enum.join(failures, "\n")}"
-    assert Enum.count(lines, &String.starts_with?(&1, "ok ")) == 21
+    assert Enum.count(lines, &String.starts_with?(&1, "ok ")) == 40
   end
 
   defp rendered_install_contract(prefix) do
@@ -225,18 +226,7 @@ defmodule GeoGenius.InstallIntegrationTest do
 
     Path.expand("../pgtap/schema/test_install.sql", __DIR__)
     |> File.read!()
-    |> String.replace(
-      "geo_genius.geo_genius_contract",
-      "#{escaped_prefix}.geo_genius_contract"
-    )
-    |> String.replace(
-      "'geo_genius.published_areas'::regclass",
-      "#{Postgres.escape_string("#{escaped_prefix}.published_areas")}::regclass"
-    )
-    |> String.replace(
-      "'geo_genius.release_areas'::regclass",
-      "#{Postgres.escape_string("#{escaped_prefix}.release_areas")}::regclass"
-    )
+    |> String.replace("geo_genius.", "#{escaped_prefix}.")
     |> String.replace("'geo_genius'::regnamespace", "#{escaped_prefix_literal}::regnamespace")
     |> String.replace("'geo_genius'", prefix_literal)
     |> String.replace_prefix("BEGIN;\n\n", "")
@@ -298,6 +288,50 @@ defmodule GeoGenius.InstallIntegrationTest do
     assert "host_owned" in table_names("custom_geo"), "rollback destroyed a host-owned table"
     refute "area" in table_names("custom_geo"), "rollback left GeoGenius tables behind"
     assert GeoGenius.Migration.installed_version(TestRepo, "custom_geo") == 0
+
+    TestRepo.query!(~s(DROP SCHEMA "custom_geo" CASCADE))
+  end
+
+  test "rolling back drops only staging tables owned by recorded import runs" do
+    run_id = Ecto.UUID.generate()
+    staging_table = "staging_" <> String.replace(run_id, "-", "")
+
+    TestRepo.query!(~s(CREATE SCHEMA IF NOT EXISTS "custom_geo"))
+    TestRepo.query!(~s|CREATE TABLE "custom_geo"."host_owned" (id integer PRIMARY KEY)|)
+    TestRepo.query!(~s|CREATE TABLE "custom_geo"."staging_host_owned" (id integer PRIMARY KEY)|)
+
+    :ok = install("custom_geo")
+
+    TestRepo.query!(
+      """
+      WITH inserted_collection AS (
+        INSERT INTO "custom_geo".collection (key)
+        VALUES ('rollback_fixture')
+        RETURNING id
+      ), inserted_release AS (
+        INSERT INTO "custom_geo".release (collection_id, release_key, manifest)
+        SELECT id, 'v1', '{}'::jsonb
+          FROM inserted_collection
+        RETURNING id
+      )
+      INSERT INTO "custom_geo".import_run
+        (id, release_id, status, owner, runner_backend, manifest)
+      SELECT $1, id, 'staging', 'rollback-fixture', 'test', '{}'::jsonb
+        FROM inserted_release
+      """,
+      [Ecto.UUID.dump!(run_id)]
+    )
+
+    TestRepo.query!(~s|CREATE UNLOGGED TABLE "custom_geo"."#{staging_table}" (row_number bigint)|)
+
+    :ok = uninstall("custom_geo")
+
+    assert schema_exists?("custom_geo")
+    assert "host_owned" in table_names("custom_geo")
+    assert "staging_host_owned" in table_names("custom_geo")
+
+    refute staging_table in table_names("custom_geo"),
+           "rollback left a staging table belonging to recorded import history"
 
     TestRepo.query!(~s(DROP SCHEMA "custom_geo" CASCADE))
   end
@@ -404,8 +438,8 @@ defmodule GeoGenius.InstallIntegrationTest do
     refute schema_exists?(prefix), "rendered rollback left the quoted-prefix schema behind"
   end
 
-  test "rendered SQL installs and uninstalls the consolidated reviewed v01" do
-    prefix = "gg-v01-#{System.unique_integer([:positive])}"
+  test "rendered SQL installs and uninstalls the current schema" do
+    prefix = "gg-install-#{System.unique_integer([:positive])}"
     escaped_prefix = Postgres.escape_identifier(prefix)
 
     on_exit(fn ->
@@ -436,7 +470,7 @@ defmodule GeoGenius.InstallIntegrationTest do
 
     TestSimpleSQL.query!(TestRepo, Migration.render_sql(prefix: prefix, from: 1, to: 0))
 
-    refute schema_exists?(prefix), "consolidated v01 rollback left its schema behind"
+    refute schema_exists?(prefix), "current schema rollback left its schema behind"
   end
 
   test "uninstall removes every relation, function, type, and the schema itself" do

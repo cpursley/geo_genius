@@ -13,13 +13,26 @@ SELECT geo_genius.upsert_authority('demo', 'demo_auth', 'Demo Authority');
 SELECT geo_genius.upsert_area_type('demo', 'outer', 10);
 SELECT geo_genius.upsert_area_type('demo', 'inner', 20);
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'A');
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Alpha', 'official', NULL);
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'postal', '30309');
-
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'));
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r1",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-published-views","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'normalizing');
 INSERT INTO geo_genius.source (collection_id, source_key, provider, license)
 SELECT id, 'demo:src', 'demo', 'test' FROM geo_genius.collection WHERE key = 'demo';
 INSERT INTO geo_genius.source_release (source_id, release_key)
@@ -28,20 +41,59 @@ INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT r.id, sr.id FROM geo_genius.release r, geo_genius.source_release sr
 WHERE r.release_key = 'r1';
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
   'demo_auth:outer:A',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326),
   0.0
 );
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'demo_auth:outer:A', 'Alpha', 'official', NULL);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'demo_auth:outer:A', 'postal', '30309');
 
 -- Area B is never given a boundary in any release. It exists (with a name
 -- and a code) purely to prove that published_area_codes/published_area_names
 -- cannot leak an area that publication never made visible -- they build on
 -- published_areas, so they inherit its scoping instead of re-deriving it.
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'B');
-SELECT geo_genius.put_area_name('demo_auth:outer:B', 'Bravo', 'official', NULL);
-SELECT geo_genius.put_area_code('demo_auth:outer:B', 'postal', '30310');
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"hidden",
+    "collection_name":"Hidden Candidate",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-published-views","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'hidden'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'hidden'),
+  geo_genius_test.import_executor_id('demo', 'hidden'),
+  'normalizing');
+SELECT geo_genius.put_area_in_release(
+  geo_genius_test.import_run_id('demo', 'hidden'),
+  geo_genius_test.import_executor_id('demo', 'hidden'),
+  'demo_auth:outer:B', NULL, '{}'::jsonb);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('demo', 'hidden'),
+  geo_genius_test.import_executor_id('demo', 'hidden'),
+  'demo_auth:outer:B', 'Bravo', 'official', NULL);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.import_run_id('demo', 'hidden'),
+  geo_genius_test.import_executor_id('demo', 'hidden'),
+  'demo_auth:outer:B', 'postal', '30310');
 
 -- Area C is a smaller area, fully inside A, boundaried in r1 to exercise
 -- published_area_relations. It is written before publication because a
@@ -49,26 +101,33 @@ SELECT geo_genius.put_area_code('demo_auth:outer:B', 'postal', '30310');
 -- release visible at once, with no refresh step of any kind.
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'C');
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
   'demo_auth:inner:C',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((0.1 0.1, 0.6 0.1, 0.6 0.6, 0.1 0.6, 0.1 0.1))', 4326),
   0.0
 );
-SELECT geo_genius.rebuild_relations(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'));
-
 -- A second official name for A, with a non-null locale that alphabetically
 -- precedes the existing NULL-locale name. If the view's name subquery just
 -- ordered by name it would flip to this one; the locale NULLS FIRST rule
 -- must keep 'Alpha' the winner regardless.
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Aaa', 'official', 'aa');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'demo_auth:outer:A', 'Aaa', 'official', 'aa');
 
 -- C never gets a NULL-locale name, only two locale-bearing ones, to prove
 -- the "then name" tie-break actually runs when NULLS FIRST does not decide
 -- the winner outright.
-SELECT geo_genius.put_area_name('demo_auth:inner:C', 'Charlie', 'official', 'en');
-SELECT geo_genius.put_area_name('demo_auth:inner:C', 'AlphaC', 'official', 'aa');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'demo_auth:inner:C', 'Charlie', 'official', 'en');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'demo_auth:inner:C', 'AlphaC', 'official', 'aa');
 
 -- A second, coarser display_tier for A within the same release, modeling a
 -- later zoom tier. published_areas must still surface A exactly once.
@@ -82,14 +141,27 @@ SELECT
   ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326),
   1;
 
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'relating');
+SELECT geo_genius.rebuild_relations(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'));
+
 SELECT is(
   (SELECT count(*)::int FROM geo_genius.published_areas),
   0,
   'nothing is visible before publication'
 );
 
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'),
+  'publishing');
+SELECT geo_genius.publish_import(
+  geo_genius_test.import_run_id('demo', 'r1'),
+  geo_genius_test.import_executor_id('demo', 'r1'));
 
 SELECT is(
   (SELECT count(*)::int FROM geo_genius.published_areas
@@ -158,10 +230,23 @@ SELECT geo_genius.upsert_collection('demo2', 'Demo Two', NULL);
 SELECT geo_genius.upsert_authority('demo2', 'demo2_auth', 'Demo Two Authority');
 SELECT geo_genius.upsert_area_type('demo2', 'outer', 10);
 SELECT geo_genius.upsert_area('demo2', 'demo2_auth', 'outer', 'E');
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'demo2-r1', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo2';
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'demo2-r1'));
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo2",
+    "release":"demo2-r1",
+    "collection_name":"Demo Two",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo2_auth","name":"Demo Two Authority"}],
+    "area_types":[{"key":"outer","rank":10,"requires_geometry":false}]
+  }'::jsonb,
+  '{"owner":"pgtap-published-views","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo2', 'demo2-r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo2', 'demo2-r1'),
+  geo_genius_test.import_executor_id('demo2', 'demo2-r1'),
+  'normalizing');
 INSERT INTO geo_genius.source (collection_id, source_key, provider, license)
 SELECT id, 'demo2:src', 'demo', 'test' FROM geo_genius.collection WHERE key = 'demo2';
 INSERT INTO geo_genius.source_release (source_id, release_key)
@@ -170,15 +255,21 @@ INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT r.id, sr.id FROM geo_genius.release r, geo_genius.source_release sr
 WHERE r.release_key = 'demo2-r1';
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'demo2-r1'),
+  geo_genius_test.import_run_id('demo2', 'demo2-r1'),
+  geo_genius_test.import_executor_id('demo2', 'demo2-r1'),
   'demo2_auth:outer:E',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'
     AND source_id = (SELECT id FROM geo_genius.source WHERE source_key = 'demo2:src')),
   ST_GeomFromText('POLYGON((10 10, 11 10, 11 11, 10 11, 10 10))', 4326),
   0.0
 );
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'demo2-r1'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo2', 'demo2-r1'),
+  geo_genius_test.import_executor_id('demo2', 'demo2-r1'),
+  'publishing');
+SELECT geo_genius.publish_import(
+  geo_genius_test.import_run_id('demo2', 'demo2-r1'),
+  geo_genius_test.import_executor_id('demo2', 'demo2-r1'));
 
 SELECT is(
   (SELECT count(DISTINCT collection_key)::int FROM geo_genius.published_areas),
@@ -186,21 +277,38 @@ SELECT is(
   'a query spanning collections sees areas from every published collection'
 );
 
--- A release with a boundary, left at status 'pending' and never passed to
--- publish_release: it must stay invisible, proving no view exposes an
+-- A release with a boundary, left in an active phase and never passed to
+-- publish_import: it must stay invisible, proving no view exposes an
 -- unpublished release.
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'F');
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r3', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r3'));
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r3",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-published-views","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'r3'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r3'),
+  geo_genius_test.import_executor_id('demo', 'r3'),
+  'normalizing');
 INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT r.id, sr.id FROM geo_genius.release r, geo_genius.source_release sr
 WHERE r.release_key = 'r3'
   AND sr.release_key = 'v1'
   AND sr.source_id = (SELECT id FROM geo_genius.source WHERE source_key = 'demo:src');
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r3'),
+  geo_genius_test.import_run_id('demo', 'r3'),
+  geo_genius_test.import_executor_id('demo', 'r3'),
   'demo_auth:outer:F',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'
     AND source_id = (SELECT id FROM geo_genius.source WHERE source_key = 'demo:src')),
@@ -219,25 +327,47 @@ SELECT is(
 -- collection with a different area (G), and confirm every view flips from
 -- r1's areas to r2's areas together, with no refresh step of any kind.
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'G');
-INSERT INTO geo_genius.release (collection_id, release_key, manifest)
-SELECT id, 'r2', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
-SELECT geo_genius.create_release_partitions(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r2",
+    "collection_name":"Demo",
+    "requires_geometry":false,
+    "authorities":[{"key":"demo_auth","name":"Demo Authority"}],
+    "area_types":[
+      {"key":"outer","rank":10,"requires_geometry":false},
+      {"key":"inner","rank":20,"requires_geometry":false}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-published-views","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'normalizing');
 INSERT INTO geo_genius.release_source (release_id, source_release_id)
 SELECT r.id, sr.id FROM geo_genius.release r, geo_genius.source_release sr
 WHERE r.release_key = 'r2'
   AND sr.release_key = 'v1'
   AND sr.source_id = (SELECT id FROM geo_genius.source WHERE source_key = 'demo:src');
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
   'demo_auth:outer:G',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'
     AND source_id = (SELECT id FROM geo_genius.source WHERE source_key = 'demo:src')),
   ST_GeomFromText('POLYGON((30 30, 31 30, 31 31, 30 31, 30 30))', 4326),
   0.0
 );
-SELECT geo_genius.publish_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'publishing');
+SELECT geo_genius.publish_import(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'));
 
 SELECT is(
   (SELECT area_key FROM geo_genius.published_areas WHERE collection_key = 'demo'),

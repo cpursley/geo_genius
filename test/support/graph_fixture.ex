@@ -20,11 +20,12 @@ defmodule GeoGenius.GraphFixture do
 
   alias GeoGenius.TestRepo
 
-  @release "SELECT id FROM geo_genius.release WHERE release_key = 'r1'"
+  @run "SELECT geo_genius_test.demo_run_id()"
+  @executor "SELECT geo_genius_test.demo_executor_id()"
 
   @doc "Builds the graph into the unpublished `r1` release. Does not publish."
-  @spec build!() :: :ok
-  def build! do
+  @spec build!(keyword()) :: :ok
+  def build!(opts \\ []) do
     TestRepo.query!("SELECT geo_genius_test.demo_fixture_build()", [])
 
     run!("SELECT geo_genius.upsert_area_type('demo', 'city', 50)")
@@ -34,13 +35,19 @@ defmodule GeoGenius.GraphFixture do
     area!("district", "D", "Delta", "POINT(0.25 0.25)")
     area!("city", "E", "Echo", "POINT(20 20)")
 
-    relation!("demo_auth:outer:A", "demo_auth:inner:B", "contains")
-    relation!("demo_auth:inner:B", "demo_auth:city:C", "contains")
-    relation!("demo_auth:outer:A", "demo_auth:district:D", "overlaps")
-
     code!("demo_auth:inner:B", "shared")
     code!("demo_auth:city:E", "shared")
     code!("demo_auth:city:C", "deep")
+
+    Enum.each(Keyword.get(opts, :extra_names, []), fn {area_key, name, kind, locale} ->
+      name!(area_key, name, kind, locale)
+    end)
+
+    run!("SELECT geo_genius.advance_import((#{@run}), (#{@executor}), 'relating', '{}'::jsonb)")
+
+    relation!("demo_auth:outer:A", "demo_auth:inner:B", "contains")
+    relation!("demo_auth:inner:B", "demo_auth:city:C", "contains")
+    relation!("demo_auth:outer:A", "demo_auth:district:D", "overlaps")
 
     :ok
   end
@@ -77,25 +84,34 @@ defmodule GeoGenius.GraphFixture do
   defp area!(type, code, name, centroid_wkt) do
     run!("SELECT geo_genius.upsert_area('demo', 'demo_auth', '#{type}', '#{code}')")
 
-    run!(
-      "SELECT geo_genius.put_area_name('demo_auth:#{type}:#{code}', '#{name}', 'official', NULL)"
-    )
-
     run!("""
     SELECT geo_genius.put_area_in_release(
-      (#{@release}), 'demo_auth:#{type}:#{code}',
+      (#{@run}), (#{@executor}), 'demo_auth:#{type}:#{code}',
       ST_GeogFromText('#{centroid_wkt}'), '{}'::jsonb)
     """)
+
+    run!(
+      "SELECT geo_genius.put_area_name((#{@run}), (#{@executor}), 'demo_auth:#{type}:#{code}', '#{name}', 'official', NULL)"
+    )
   end
 
   defp relation!(parent, child, classification) do
     run!(
-      "SELECT geo_genius.put_relation((#{@release}), '#{parent}', '#{child}', '#{classification}')"
+      "SELECT geo_genius.put_relation((#{@run}), (#{@executor}), '#{parent}', '#{child}', '#{classification}')"
     )
   end
 
   defp code!(area_key, value) do
-    run!("SELECT geo_genius.put_area_code('#{area_key}', 'slug', '#{value}')")
+    run!(
+      "SELECT geo_genius.put_area_code((#{@run}), (#{@executor}), '#{area_key}', 'slug', '#{value}')"
+    )
+  end
+
+  defp name!(area_key, name, kind, locale) do
+    TestRepo.query!(
+      "SELECT geo_genius.put_area_name((#{@run}), (#{@executor}), $1, $2, $3, $4)",
+      [area_key, name, kind, locale]
+    )
   end
 
   defp run!(sql), do: TestRepo.query!(sql, [])

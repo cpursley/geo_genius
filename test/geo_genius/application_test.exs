@@ -27,17 +27,24 @@ defmodule GeoGenius.ApplicationTest do
   end
 
   test "starts GeoGenius.TaskSupervisor when nothing is configured" do
-    assert GeoGenius.Application.children() == [{Task.Supervisor, name: GeoGenius.TaskSupervisor}]
+    assert GeoGenius.Application.children() == [
+             {DynamicSupervisor,
+              strategy: :one_for_one, name: GeoGenius.ExecutionGuardianSupervisor},
+             {Task.Supervisor, name: GeoGenius.TaskSupervisor}
+           ]
   end
 
-  test "starts no child when a host has already configured :task_supervisor" do
+  test "keeps the execution guardian when a host configures its own task supervisor" do
     # A host that names its own supervisor has committed to starting and
     # placing it itself -- an unconfigured second one sitting idle in this
     # tree would be a process the host neither asked for nor can remove
     # short of disabling the runner outright.
     Application.put_env(:geo_genius, :task_supervisor, GeoGenius.ApplicationTest.SomeSupervisor)
 
-    assert GeoGenius.Application.children() == []
+    assert GeoGenius.Application.children() == [
+             {DynamicSupervisor,
+              strategy: :one_for_one, name: GeoGenius.ExecutionGuardianSupervisor}
+           ]
   end
 
   test "start/2 itself honors the opt-out, not just children/0" do
@@ -45,14 +52,16 @@ defmodule GeoGenius.ApplicationTest do
 
     try do
       {:ok, unconfigured_pid} = GeoGenius.Application.start(:normal, [])
-      assert length(Supervisor.which_children(unconfigured_pid)) == 1
+      assert length(Supervisor.which_children(unconfigured_pid)) == 2
       assert GenServer.whereis(GeoGenius.TaskSupervisor)
+      assert GenServer.whereis(GeoGenius.ExecutionGuardianSupervisor)
       :ok = Supervisor.stop(unconfigured_pid)
 
       Application.put_env(:geo_genius, :task_supervisor, GeoGenius.ApplicationTest.BootSupervisor)
       {:ok, configured_pid} = GeoGenius.Application.start(:normal, [])
-      assert Supervisor.which_children(configured_pid) == []
+      assert length(Supervisor.which_children(configured_pid)) == 1
       refute GenServer.whereis(GeoGenius.TaskSupervisor)
+      assert GenServer.whereis(GeoGenius.ExecutionGuardianSupervisor)
       :ok = Supervisor.stop(configured_pid)
     after
       case Process.whereis(GeoGenius.Supervisor) do

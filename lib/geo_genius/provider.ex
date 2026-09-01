@@ -10,7 +10,7 @@ defmodule GeoGenius.Provider.Area.Name do
   against `@type t`'s field types on every construction -- which is why
   every provider's `normalize/2` carries an explicit `@spec`.
 
-  `GeoGenius.Catalog.put_area_name/3` binds `attrs.kind` straight into a SQL
+  `GeoGenius.Catalog.put_area_name/5` binds `attrs.kind` straight into a SQL
   parameter. That bind expects a string, not an atom, so the normalization
   phase that turns a `%GeoGenius.Provider.Area{}` into `Catalog` writes
   stringifies `kind` on the way through: `GeoGenius.Pipeline.Normalize` is that
@@ -55,7 +55,7 @@ defmodule GeoGenius.Provider.Area do
 
   `centroid` is a `%Geo.Point{}` or `nil`. When it is `nil` and `geometry` is
   present, the pipeline leaves it `nil` rather than asking PostGIS to derive
-  one, because `put_area_in_release/4` accepts a null centroid.
+  one, because `put_area_in_release/5` accepts a null centroid.
   """
 
   alias GeoGenius.Provider.Area.{Code, Name}
@@ -121,7 +121,7 @@ defmodule GeoGenius.Provider do
 
   `emit`, passed to `stage/5`, is called with a list of rows rather than a
   single row so a provider can batch; the pipeline supplies a function that
-  writes through `GeoGenius.Staging.insert/3` and heartbeats the run. A
+  writes through `GeoGenius.Staging.insert/4` and heartbeats the run. A
   provider stages a large artifact in chunks rather than one `emit` call for
   the whole file, both to bound the size of a single insert and because each
   `emit` call is also where the run's lease gets renewed.
@@ -187,8 +187,10 @@ defmodule GeoGenius.Provider do
 
   `GeoGenius.Providers.Shapefile` reads the GeoJSON vocabulary, since it
   converts its archive before parsing it. `GeoGenius.Providers.SimpleMaps` is
-  outside this table entirely: it parses two fixed files, reads their columns
-  by name, and takes no options at all.
+  outside this table: it parses two fixed files and reads their columns by
+  name. It requires no options, but accepts `"non_census_state_area_type"` so
+  the six USPS-only state codes can use a separately declared non-geometric
+  type while ordinary Census states keep `state`.
 
   Every string value this vocabulary reads out of a payload -- a code, a
   name, an attribute, an external code -- is trimmed before use, and a
@@ -243,7 +245,18 @@ defmodule GeoGenius.Provider do
   """
   @callback validate_options(options :: map()) :: :ok | {:error, reason()}
 
-  @optional_callbacks validate_options: 1
+  @doc """
+  Validates relationships between fields of a fully decoded manifest.
+
+  Optional. `GeoGenius.Manifest` calls this after its own structural checks and
+  `c:validate_options/1`, so a provider can enforce a policy spanning options,
+  area types, authorities, or sources without putting source-specific rules in
+  the manifest parser. Every provider named by the release or one of its
+  sources receives the same complete manifest.
+  """
+  @callback validate_manifest(manifest :: Manifest.t()) :: :ok | {:error, reason()}
+
+  @optional_callbacks validate_options: 1, validate_manifest: 1
 
   @doc """
   The artifacts, across a manifest's sources, this provider will stage.
@@ -311,7 +324,7 @@ defmodule GeoGenius.Provider do
   Both keys are the strings `GeoGenius.Provider.Area.key/1` composes. Build
   the `%GeoGenius.Provider.Area{}` an edge names and take its key from there,
   rather than joining the three parts by hand: an edge composed a second way
-  can name a key `normalize/2` never produced, and `GeoGenius.Catalog.put_relation/3`
+  can name a key `normalize/2` never produced, and `GeoGenius.Catalog.put_relation/4`
   refuses an area the release does not carry.
 
   Composes with `relations/1` rather than replacing it: a provider whose
@@ -320,7 +333,7 @@ defmodule GeoGenius.Provider do
   an edge may reference an area any row emitted, not only its own.
 
   Asserting an edge for a pair `relations/1` also rebuilds from geometry
-  overwrites that measurement: `GeoGenius.Catalog.put_relation/3` upserts on
+  overwrites that measurement: `GeoGenius.Catalog.put_relation/4` upserts on
   the same `(parent_area_id, child_area_id)` pair, nulling
   `intersection_area_m2`, `parent_coverage`, and `child_coverage` and
   replacing the geometry-classified `relation_type` with the asserted one,

@@ -132,7 +132,8 @@ defmodule GeoGenius.MixProject do
         GeoGenius.Manifest,
         GeoGenius.Manifest.Artifact,
         GeoGenius.Manifest.Source,
-        GeoGenius.Pipeline
+        GeoGenius.Pipeline,
+        GeoGenius.Registration
       ],
       Catalog: [
         GeoGenius.Catalog,
@@ -172,6 +173,8 @@ defmodule GeoGenius.MixProject do
       Exceptions: [
         GeoGenius.ArtifactError,
         GeoGenius.CatalogError,
+        GeoGenius.CandidateError,
+        GeoGenius.EnqueueError,
         GeoGenius.ImportError,
         GeoGenius.ManifestError,
         GeoGenius.PreflightError,
@@ -183,6 +186,7 @@ defmodule GeoGenius.MixProject do
         GeoGenius.Application,
         GeoGenius.Bootstrap,
         GeoGenius.Config,
+        GeoGenius.ExecutionGuardian,
         GeoGenius.Files,
         GeoGenius.MixHelpers,
         GeoGenius.Pipeline.Artifacts,
@@ -202,7 +206,7 @@ defmodule GeoGenius.MixProject do
   defp package do
     [
       files:
-        ~w(lib priv guides docs/design test/pgtap test/pgtap_support docker-compose.yml database
+        ~w(lib priv/geo_genius guides docs/design test/pgtap test/pgtap_support docker-compose.yml database
            .formatter.exs mix.exs README.md CHANGELOG.md LICENSE),
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url}

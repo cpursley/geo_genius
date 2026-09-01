@@ -21,7 +21,7 @@ SELECT has_index('geo_genius', 'release_area', 'release_area_area_idx',
   ARRAY['area_id', 'release_id'],
   'members are indexed from the area side, leading with area_id');
 
-INSERT INTO geo_genius.collection (key, name) VALUES ('demo', 'Demo');
+INSERT INTO geo_genius.collection (key) VALUES ('demo');
 INSERT INTO geo_genius.release (collection_id, release_key, manifest)
 SELECT id, 'demo-2026', '{}'::jsonb FROM geo_genius.collection WHERE key = 'demo';
 

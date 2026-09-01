@@ -32,21 +32,6 @@ defmodule GeoGenius.Migration do
   @spec contract_status(module(), String.t()) :: map()
   def contract_status(repo, prefix), do: GeoGenius.SchemaContract.status(repo, prefix)
 
-  @doc "Renders one explicit, pinned v01 contract reconciliation edge as deterministic SQL."
-  @spec render_reconciliation_sql(keyword()) :: String.t()
-  def render_reconciliation_sql(opts), do: GeoGenius.ReconciliationSQL.render!(opts)
-
-  @doc """
-  Executes one explicit, pinned reconciliation edge inside a host-owned transactional Ecto
-  migration.
-
-  Reconciliation refuses calls outside an active Ecto migration transaction, including migrations
-  that set `@disable_ddl_transaction true`, because every verification, DDL statement, and the
-  prefix-scoped advisory transaction lock must share one database transaction.
-  """
-  @spec reconcile(keyword()) :: :ok
-  def reconcile(opts), do: GeoGenius.Reconciliation.run(opts)
-
   @doc """
   Returns the installed GeoGenius schema version for `prefix`, read directly
   through `repo`.

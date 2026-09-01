@@ -15,24 +15,30 @@ defmodule GeoGenius.Runner do
   `import_run.runner_backend` exists to prevent by recording which backend a
   run was claimed under.
 
-  **A runner must not call `GeoGenius.Catalog.fail_import/3`.** The pipeline
+  **A runner must not call `GeoGenius.Catalog.fail_import/4`.** The pipeline
   owns the failure path end to end, including the case where its own cleanup
   or confirmation read fails after a phase already recorded an outcome.
   A runner calling it after the pipeline already finished raises 55000 rather
-  than recording anything, because `fail_import/3` refuses a completed run --
+  than recording anything, because `fail_import/4` refuses a completed run --
   so the call is not a way to report a late failure, only a way to crash the
-  backend. A backend that wants to record a failure of its own -- it could not
-  start the work at all, say -- returns `{:error, reason}` from `enqueue/3`
-  instead and leaves the run exactly where the pipeline left it.
+  backend. A backend that definitely refuses the work before acceptance
+  returns `{:error, {:not_enqueued, reason}}`. Once acceptance may have
+  happened, it returns `{:error, {:outcome_unknown, reason}}` instead. The
+  import lifecycle caller terminalizes only a definite rejection of a newly
+  registered or retried attempt.
   """
 
   alias GeoGenius.Context
 
   @backends [GeoGenius.Runners.PgFlow, GeoGenius.Runners.Task, GeoGenius.Runners.Inline]
+  @automatic_backends [GeoGenius.Runners.Task, GeoGenius.Runners.Inline]
   @callbacks [name: 0, available?: 0, enqueue: 3]
 
   @typedoc "The reason a backend could not start a run, or could not be resolved."
   @type reason :: term()
+
+  @typedoc "The certainty with which a failed enqueue reports durable acceptance."
+  @type enqueue_error :: {:not_enqueued, reason()} | {:outcome_unknown, reason()}
 
   @typedoc """
   Job arguments, JSON-serializable so a durable backend can round-trip them
@@ -58,13 +64,20 @@ defmodule GeoGenius.Runner do
 
   Returns `:ok` when the run's outcome is, or will be, recorded in the
   catalog -- including a run that has already failed and recorded that
-  failure. Returns `{:error, reason}` only when nothing was recorded and
-  nothing ever will be: the caller can read no run state back for this call
-  and must not poll. Never return an error for a failure the pipeline itself
-  recorded -- `Pipeline.execute/3` already wrote it, and the catalog is the
-  only place a caller should look for it.
+  failure. A definite pre-acceptance refusal returns
+  `{:error, {:not_enqueued, reason}}`; an error after durable acceptance may
+  have happened returns `{:error, {:outcome_unknown, reason}}`. Never return
+  an error for a failure the pipeline itself recorded -- `Pipeline.execute/3`
+  already wrote it, and the catalog is the only place a caller should look for
+  it.
+
+  For compatibility, `GeoGenius.import/1` still interprets the callback's
+  historical plain `{:error, reason}` shape as `:not_enqueued`. That contract
+  documented a plain error as a definite refusal; new runners should always
+  return an explicit certainty tuple.
   """
-  @callback enqueue(Context.t(), run_id :: Ecto.UUID.t(), args()) :: :ok | {:error, reason()}
+  @callback enqueue(Context.t(), run_id :: Ecto.UUID.t(), args()) ::
+              :ok | {:error, enqueue_error()}
 
   @doc """
   Reads `:publish` out of `args`, defaulting to `false`.
@@ -97,16 +110,28 @@ defmodule GeoGenius.Runner do
 
   def stale_after_seconds(_args), do: nil
 
+  @doc false
+  @spec pipeline_opts(args() | map()) :: keyword()
+  def pipeline_opts(args) when is_map(args) do
+    [publish: publish?(args), stale_after_seconds: stale_after_seconds(args)]
+  end
+
   @doc """
   Resolves the runner backend for one call.
 
   Resolution order: `opts[:runner]`, then `config :geo_genius, :runner`, then
-  the first of `Runners.PgFlow`, `Runners.Task`, `Runners.Inline` whose
-  `available?/0` is true -- with one exception. `Runners.Task` is selected
+  the first of `Runners.Task` and `Runners.Inline` whose `available?/0` is
+  true. PgFlow is intentionally explicit: its finite job deadline is a host
+  policy for bounded work, not a safe inference merely because a PgFlow
+  engine happens to be running for unrelated workflows. Pin
+  `GeoGenius.Runners.PgFlow` per call or in application configuration after
+  choosing a deadline suitable for the imported data.
+
+  `Runners.Task` is selected
   whenever `config :geo_genius, :task_supervisor` names anything at all,
   even a name that is not currently a live process. Setting that key is a
   host committing to `Runners.Task`, and `enqueue/3` already turns a dead
-  supervisor into a named `{:error, reason}` rather than an exit (see
+  supervisor into a named `{:error, {:not_enqueued, reason}}` rather than an exit (see
   `Runners.Task`'s moduledoc), so selecting it regardless of the configured
   name's current liveness surfaces a typo'd or not-yet-started supervisor as
   that named error instead of silently falling through to `Runners.Inline`
@@ -130,7 +155,7 @@ defmodule GeoGenius.Runner do
   @spec configured(keyword()) :: module()
   def configured(opts \\ []) do
     case Keyword.get(opts, :runner) || Application.get_env(:geo_genius, :runner) do
-      nil -> first_available(@backends)
+      nil -> first_available(@automatic_backends)
       module -> validate!(module)
     end
   end

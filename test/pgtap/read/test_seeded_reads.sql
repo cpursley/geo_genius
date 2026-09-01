@@ -10,30 +10,49 @@ SELECT geo_genius_test.demo_fixture_build();
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'P');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'Q');
 SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'Z');
-SELECT geo_genius.put_area_name('demo_auth:outer:P', 'Papa', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:inner:Q', 'Quebec', 'official', NULL);
-SELECT geo_genius.put_area_name('demo_auth:outer:Z', 'Zulu', 'official', NULL);
 
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:P',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((10 10, 11 10, 11 11, 10 11, 10 10))', 4326), 0.0);
 
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:inner:Q',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((10 10, 10.5 10, 10.5 10.5, 10 10.5, 10 10))', 4326), 0.0);
 
 SELECT geo_genius.put_boundary(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:Z',
   (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
   ST_GeomFromText('POLYGON((20 20, 21 20, 21 21, 20 21, 20 20))', 4326), 0.0);
 
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'fips', '01');
-SELECT geo_genius.put_area_code('demo_auth:outer:P', 'fips', '02');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:P', 'Papa', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:inner:Q', 'Quebec', 'official', NULL);
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:Z', 'Zulu', 'official', NULL);
+
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:A', 'fips', '01');
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:P', 'fips', '02');
 
 -- B is the row the whole-projection comparison below reads, so it is given a
 -- code and attributes of its own. Left as the bare fixture builds it, its
@@ -41,16 +60,26 @@ SELECT geo_genius.put_area_code('demo_auth:outer:P', 'fips', '02');
 -- comparison, and a column dropped from the plural projection would match a
 -- column dropped from nothing. Its centroid is restated because
 -- put_area_in_release overwrites that column with whatever it is handed.
-SELECT geo_genius.put_area_code('demo_auth:inner:B', 'fips', '01001');
-SELECT geo_genius.put_area_code('demo_auth:inner:B', 'postal', '30309');
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:inner:B',
   ST_GeogFromText('POINT(0.25 0.25)'),
   '{"population": 4200, "lsad": "town"}'::jsonb);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:inner:B', 'fips', '01001');
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:inner:B', 'postal', '30309');
 
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(),
+  'relating');
 SELECT geo_genius.rebuild_relations(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'));
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id());
 
 SELECT geo_genius_test.demo_publish();
 

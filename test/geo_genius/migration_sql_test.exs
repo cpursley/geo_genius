@@ -19,7 +19,11 @@ defmodule GeoGenius.MigrationSQLTest do
     assert sql = Migration.render_sql(prefix: "geo_genius", from: 1, to: 0)
 
     assert sql =~
-             "DROP FUNCTION IF EXISTS geo_genius.put_boundaries(uuid, text[], uuid[], geometry[], integer[], jsonb[])"
+             "DROP FUNCTION IF EXISTS geo_genius.put_boundaries(uuid, uuid, text[], uuid[], geometry[], integer[], jsonb[])"
+
+    assert sql =~ "DROP FUNCTION IF EXISTS geo_genius.fail_import(uuid, uuid, jsonb)"
+    assert sql =~ "DROP FUNCTION IF EXISTS geo_genius.publish_import(uuid, uuid)"
+    assert sql =~ "DROP FUNCTION IF EXISTS geo_genius.create_staging(uuid, uuid)"
 
     assert sql =~ "DROP VIEW IF EXISTS geo_genius.geo_genius_version"
     refute sql =~ "COMMENT ON VIEW geo_genius.geo_genius_version IS 'GeoGenius version=1'"

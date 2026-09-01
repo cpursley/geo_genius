@@ -11,8 +11,8 @@ defmodule Mix.Tasks.GeoGenius.SweepStaging do
   The pipeline drops a run's staging table in an `after` clause, and that drop
   is deliberately rescued so a database failure during cleanup cannot destroy
   the run's own failure record. A host whose database dies mid-cleanup
-  therefore leaks a table, nothing else reclaims it, and `v01_down.sql`'s
-  teardown refuses to drop a non-empty schema -- so a leak eventually blocks an
+  therefore leaks a table, nothing else reclaims it, and the schema down
+  migration's teardown refuses to drop a non-empty schema -- so a leak eventually blocks an
   uninstall. This reclaims them.
 
   A table whose `import_run` row is gone entirely is reclaimed too. That is

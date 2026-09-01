@@ -19,8 +19,8 @@ defmodule GeoGenius.Providers.Shapefile do
        system would otherwise stage coordinates in metres that PostGIS
        accepts as degrees -- geometry that is silently, plausibly wrong
        rather than obviously broken.
-    4. Delegates the parse of the converted sequence to
-       `GeoGenius.Providers.GeoJSONSequence.stage/5`.
+    4. Delegates the parse of the converted sequence to the GeoJSON Sequence
+       provider's staging implementation.
 
   `normalize/2`, `required_options/0`, `artifacts/1`,
   `relations/1`, and `asserted_relations/2` all delegate to
@@ -66,9 +66,9 @@ defmodule GeoGenius.Providers.Shapefile do
   this is a limit to know about, not a defect to route around silently.
 
   **Streaming conversion.** `-f GeoJSONSeq -lco RS=NO` writes one Feature per
-  newline. `GeoGenius.Providers.GeoJSONSequence.stage/5` reads and emits the
-  resulting sequence in bounded batches, so this provider never retains the
-  converted dataset as a whole document.
+  newline. The GeoJSON Sequence provider reads and emits the resulting
+  sequence in bounded batches, so this provider never retains the converted
+  dataset as a whole document.
   """
 
   @behaviour GeoGenius.Provider
@@ -101,7 +101,7 @@ defmodule GeoGenius.Providers.Shapefile do
   @doc """
   Unzips `path` into a private subdirectory of `opts[:work_dir]`, converts
   its single `.shp` member to GeoJSON Sequence with `ogr2ogr`, and delegates
-  the parse to `GeoGenius.Providers.GeoJSONSequence.stage/5`.
+  the parse to the GeoJSON Sequence provider's staging implementation.
 
   The subdirectory this call creates is removed once the call returns,
   whether it succeeds or fails; `opts[:work_dir]` itself, and anything else
@@ -179,9 +179,53 @@ defmodule GeoGenius.Providers.Shapefile do
   end
 
   defp unzip(path, extract_dir) do
-    case :zip.unzip(String.to_charlist(path), cwd: String.to_charlist(extract_dir)) do
-      {:ok, members} -> {:ok, Enum.map(members, &List.to_string/1)}
+    with {:ok, zip} <- :zip.zip_open(String.to_charlist(path), [:memory]),
+         {:ok, members} <- contained_zip_members(zip, extract_dir),
+         :ok <- :zip.zip_close(zip),
+         {:ok, extracted} <-
+           :zip.unzip(String.to_charlist(path),
+             cwd: String.to_charlist(extract_dir),
+             file_list: Enum.map(members, &String.to_charlist/1)
+           ) do
+      {:ok, Enum.map(extracted, &List.to_string/1)}
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
       {:error, reason} -> {:error, "could not unzip #{path}: #{inspect(reason)}"}
+    end
+  end
+
+  defp contained_zip_members(zip, extract_dir) do
+    with {:ok, entries} <- :zip.zip_list_dir(zip),
+         names = zip_member_names(entries),
+         :ok <- reject_oversized_archive(names) do
+      validate_zip_members(names, extract_dir)
+    end
+  end
+
+  defp zip_member_names(entries) do
+    for {:zip_file, name, _info, _, _, _} <- entries, do: List.to_string(name)
+  end
+
+  defp reject_oversized_archive(names) do
+    if Enum.count_until(names, 10_001) > 10_000 do
+      {:error, "shapefile archive contains more than 10_000 members"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_zip_members(names, extract_dir) do
+    extract_root = Path.expand(extract_dir) <> "/"
+
+    invalid =
+      Enum.find(names, fn name ->
+        dest = Path.expand(Path.join(extract_dir, name))
+        not String.starts_with?(dest <> "/", extract_root)
+      end)
+
+    case invalid do
+      nil -> {:ok, names}
+      name -> {:error, "shapefile archive member #{inspect(name)} escapes the extract directory"}
     end
   end
 

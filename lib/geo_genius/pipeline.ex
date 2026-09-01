@@ -3,12 +3,13 @@ defmodule GeoGenius.Pipeline do
   Turns a claimed import run into a verified release.
 
   `execute/3` receives a run id `GeoGenius.import/1` already obtained from
-  `begin_or_resume_import`, reads what it needs out of PostgreSQL, and walks
+  the atomic candidate-registration statement, reads what it needs out of PostgreSQL, and walks
   the run through its phases: download every artifact, check each required one
   arrived, stage them through the manifest's provider, normalize the staged
   rows into the catalog, rebuild relations and write every edge the provider
-  asserts, analyze, and verify. It never claims a run and never opens a
-  release; both belong to the caller that registered the manifest.
+  asserts, analyze, and verify. It atomically claims the run's sole executor
+  before doing that work. It never registers the attempt or opens the release;
+  both belong to the caller that prepared the manifest.
 
   The phases themselves live next door where they have room:
   `GeoGenius.Pipeline.Artifacts` owns everything that touches the cache, the
@@ -26,26 +27,22 @@ defmodule GeoGenius.Pipeline do
   wants both in one call.
 
   **It does not open a transaction.** Every catalog function is atomic as a
-  single statement, and the state machine is deliberately resumable: wrapping
-  the run would roll back the very progress `begin_or_resume_import` resumes
-  from, and would hold one connection for the length of the slowest phase.
+  single statement, and durable phase progress must survive each commit.
+  Wrapping the run would roll all of that evidence back and hold one
+  connection for the length of the slowest phase. Recovery creates an
+  explicit new attempt rather than resuming execution in place.
 
   ## Staging is emptied before it is written and dropped after
 
-  Every phase runs on every attempt, a resumed run included, so the staging
-  phase re-parses the artifact it staged before rather than reading what is
-  already there. It therefore starts from an empty table for the run --
-  `GeoGenius.Staging.reset/2` -- so an attempt that died where the cleanup
-  below could not run does not leave its rows to be staged a second time
-  beside the new ones, or to be normalized from a source that has since
-  changed.
+  Every attempt stages from its own immutable artifact snapshot. The staging
+  phase starts from an empty table for that run -- `GeoGenius.Staging.reset/3`
+  -- so a leaked or manually pre-created table can never contribute rows the
+  owning executor did not stage.
 
   The staging table is dropped in an `after`, on success and on failure alike.
-  Keeping it would only help a retry that reuses the same `run_id`, which
-  happens solely when the same owner resumes inside the lease's staleness
-  window; every other retry is a new attempt with a new run and a new table
-  name, so a kept table is a leak that `v01_down.sql`'s teardown check would
-  later refuse to drop through. What actually makes a retry cheap is the
+  No retry reuses a `run_id`; a corrected retry is a new attempt with a new
+  table name. A kept table is therefore a leak that the schema down
+  migration's teardown check would later refuse to drop through. What makes a retry cheap is the
   artifact cache, which skips the network -- the expensive part. Re-parsing a
   local file is not worth leaking a table per failure. A drop that fails is
   logged at warning and the table left behind, because the alternative --
@@ -54,13 +51,15 @@ defmodule GeoGenius.Pipeline do
   ## The failure path survives its own failures
 
   A phase that returns `{:error, reason}`, raises, exits, or throws all reach
-  `fail_import/3` the same way, and the stored `error` column is the durable
+  `fail_import/4` the same way, and the stored `error` column is the durable
   record of what happened. Everything after that point is written so it cannot
   destroy that record: cleanup cannot replace the return value, and the re-read
   that turns a recorded failure into a `%GeoGenius.ImportRun{}` cannot either.
-  A caller that gets `{:error, {:unrecorded, reason}}` is being told the run's
-  own row could not be read or written -- that, and only that, is when the
-  reason arrives as a string instead of a run.
+  A caller that gets `{:error, {:unrecorded, certainty, reason}}` is being
+  told the run's own row could not be read or written. `:not_started` means
+  execution never claimed the run; `:outcome_unknown` means work started but
+  its durable outcome could not be confirmed. That, and only that, is when
+  the reason arrives as a string instead of a run.
 
   ## A notifier cannot fail an import
 
@@ -89,15 +88,16 @@ defmodule GeoGenius.Pipeline do
     * `:work_dir` -- the directory the run's own working directory is created
       beneath. Defaults to the system temporary directory.
     * `:stale_after_seconds` -- the staleness window this run was claimed
-      under (`GeoGenius.Catalog.begin_or_resume_import/3`'s own
-      `:stale_after_seconds`, carried here through `GeoGenius.import/1` and a
-      runner's `args`). Defaults to 900, matching that function's own default.
-    * `:timeout` -- milliseconds allowed for each of the long single
-      statements: a staging insert, the relation rebuild, the analyze, the
-      verification, and the publication, which re-runs that same verification
-      inside itself. Defaults to `:stale_after_seconds` converted to
-      milliseconds, so an explicit `:timeout` here is only needed to diverge
-      from the window the run was actually claimed under.
+      under (the registration claim's `:stale_after_seconds`, carried here
+      through `GeoGenius.import/1` and a runner's `args`). Defaults to 900,
+      matching the public import default.
+    * `:timeout` -- milliseconds allowed for each ingestion batch or long
+      statement: staging and normalization batches, asserted relation batches,
+      the measured relation rebuild, analyze, verification, and publication,
+      which re-runs that same verification inside itself. Defaults to
+      `:stale_after_seconds` converted to milliseconds, so an explicit
+      `:timeout` here is only needed to diverge from the window the run was
+      actually claimed under.
 
   Every other option is passed through to the cache, downloader, command, and
   notifier adapters untouched.
@@ -108,18 +108,24 @@ defmodule GeoGenius.Pipeline do
   or the verification a publication re-runs exceeds by orders of magnitude; without an option here a host's only recourse
   is raising `:timeout` on its own Repo, for every query it runs. `:timeout`
   now derives from `:stale_after_seconds`, the same window
-  `begin_or_resume_import/3` claimed the run under, rather than a value that
+  candidate registration claimed the run under, rather than a value that
   merely resembled it: `GeoGenius.import/1` knows the window it claimed with
   and carries it through a runner's `args` to `execute/3`, so a caller that
   claims with a shorter window gets a shorter statement timeout to match,
   instead of a timeout longer than its own lease.
 
   The statement is narrow: a statement that runs past `:timeout` fails and is
-  recorded as a failure, rather than running on indefinitely while another
-  worker reclaims the lease and writes the same release. It is not a
+  recorded as a failure rather than running indefinitely. It is not a
   guarantee that the statement finishes inside the lease -- at the defaults,
   `advance_import` renews the lease immediately before the statement and the
-  statement times out at roughly the moment the lease becomes reclaimable.
+  statement times out at roughly the moment the lease becomes stale. A stale
+  lease is diagnostic only and never authorizes another executor.
+
+  Ingestion statements also set `checkout_retries: 0`. Once a mutating
+  statement disconnects, the caller cannot know whether PostgreSQL committed
+  any of its work, so DBConnection must surface that one failure instead of
+  checking out another connection and repeating the statement. A runner retry
+  or a newly claimed import attempt owns recovery at the pipeline boundary.
   """
 
   require Logger
@@ -127,6 +133,7 @@ defmodule GeoGenius.Pipeline do
   alias GeoGenius.Catalog
   alias GeoGenius.Config
   alias GeoGenius.Context
+  alias GeoGenius.ExecutionGuardian
   alias GeoGenius.ImportRun
   alias GeoGenius.Manifest
   alias GeoGenius.Pipeline.Artifacts
@@ -147,32 +154,168 @@ defmodule GeoGenius.Pipeline do
   Runs a claimed import to completion, returning the run as PostgreSQL
   recorded it.
 
-  Returns `{:error, run}` for a run that failed, with the run re-read so the
-  caller sees the stored error. Returns `{:error, {:unrecorded, reason}}` only
-  when there is no such record to return: a run id the catalog does not carry,
-  a `fail_import/3` that failed itself, or a re-read that could not be
-  completed.
+  Returns `{:noop, run}` when another executor already owns a nonterminal run,
+  and `{:error, run}` for a run that failed, with the run re-read so the caller
+  sees the stored state. Returns
+  `{:error, {:unrecorded, certainty, reason}}` only when there is no such
+  record to return. `:not_started` identifies an unknown run or a guardian
+  failure before executor claim; `:outcome_unknown` identifies a failure to
+  record or confirm an outcome after execution may have started.
   """
   @spec execute(Context.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, ImportRun.t()} | {:error, ImportRun.t()} | {:error, {:unrecorded, String.t()}}
+          {:ok, ImportRun.t()}
+          | {:noop, ImportRun.t()}
+          | {:error, ImportRun.t()}
+          | {:error, {:unrecorded, :not_started | :outcome_unknown, String.t()}}
   def execute(%Context{} = context, run_id, opts \\ []) do
     case Catalog.import_run(context, run_id) do
-      nil -> {:error, {:unrecorded, "GeoGenius import run #{run_id} does not exist"}}
-      %ImportRun{} = run -> run_import(context, run, opts)
+      nil ->
+        {:error, {:unrecorded, :not_started, "GeoGenius import run #{run_id} does not exist"}}
+
+      %ImportRun{status: "completed"} = run ->
+        {:ok, run}
+
+      %ImportRun{status: "failed"} = run ->
+        {:error, run}
+
+      %ImportRun{} = run ->
+        claim_and_run(context, run, opts)
     end
+  end
+
+  defp claim_and_run(context, run, opts) do
+    executor_id = Ecto.UUID.generate()
+
+    case ExecutionGuardian.start(context, run.run_id, executor_id, self()) do
+      {:ok, guardian} ->
+        {result, disarm?} = dispatch_owned_claim(context, run, executor_id, opts)
+        maybe_disarm(guardian, disarm?)
+        result
+
+      {:error, reason} ->
+        {:error,
+         {:unrecorded, :not_started,
+          "GeoGenius could not start the execution guardian for import run #{run.run_id}: " <>
+            inspect(reason)}}
+    end
+  end
+
+  defp dispatch_owned_claim(context, run, executor_id, opts) do
+    context
+    |> claim_execution(run.run_id, executor_id)
+    |> dispatch_claim(context, run, executor_id, opts)
+  end
+
+  defp dispatch_claim({:ok, :claimed}, context, run, executor_id, opts) do
+    {run_import(context, run, executor_id, opts), true}
+  end
+
+  defp dispatch_claim({:ok, _result}, context, run, _executor_id, _opts) do
+    {reread_claim(context, run.run_id), true}
+  end
+
+  defp dispatch_claim({:error, first_reason}, context, run, executor_id, opts) do
+    context
+    |> claim_execution(run.run_id, executor_id)
+    |> dispatch_reclaim(context, run, executor_id, opts, first_reason)
+  end
+
+  # A claim can commit even when its reply never reaches the caller. Retrying
+  # once with the same executor identity is a semantic resolution step, not a
+  # driver retry: the SQL contract treats that identity as the same owner and
+  # returns `claimed` without renewing its lease.
+  defp dispatch_reclaim({:ok, _} = result, context, run, executor_id, opts, _first_reason) do
+    dispatch_claim(result, context, run, executor_id, opts)
+  end
+
+  defp dispatch_reclaim({:error, second_reason}, context, run, executor_id, _opts, first_reason) do
+    message =
+      "GeoGenius could not resolve executor ownership for import run #{run.run_id}: " <>
+        inspect({first_reason, second_reason})
+
+    case record_unresolved_claim(context, run.run_id, executor_id, message) do
+      :recorded ->
+        {reread_claim(context, run.run_id), true}
+
+      :unrecorded ->
+        {{:error, {:unrecorded, :outcome_unknown, message}}, false}
+    end
+  end
+
+  defp maybe_disarm(guardian, true), do: ExecutionGuardian.disarm(guardian)
+  defp maybe_disarm(_guardian, false), do: :ok
+
+  defp record_unresolved_claim(context, run_id, executor_id, reason) do
+    write_unresolved_claim(context, run_id, executor_id, reason)
+  rescue
+    _exception -> retry_unresolved_claim(context, run_id, executor_id, reason)
+  catch
+    _kind, _caught -> retry_unresolved_claim(context, run_id, executor_id, reason)
+  end
+
+  defp retry_unresolved_claim(context, run_id, executor_id, reason) do
+    write_unresolved_claim(context, run_id, executor_id, reason)
+  rescue
+    _exception -> :unrecorded
+  catch
+    _kind, _caught -> :unrecorded
+  end
+
+  defp write_unresolved_claim(context, run_id, executor_id, reason) do
+    Catalog.fail_import(context, run_id, executor_id, %{
+      "phase" => "execution",
+      "reason" => "executor ownership could not be confirmed",
+      "detail" => reason
+    })
+
+    :recorded
+  end
+
+  defp claim_execution(context, run_id, executor_id) do
+    {:ok, Catalog.claim_import_execution(context, run_id, executor_id)}
+  rescue
+    exception -> {:error, exception}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp reread_claim(context, run_id) do
+    case Catalog.import_run(context, run_id) do
+      nil ->
+        {:error, {:unrecorded, :outcome_unknown, "GeoGenius import run #{run_id} does not exist"}}
+
+      %ImportRun{status: "completed"} = run ->
+        {:ok, run}
+
+      %ImportRun{status: "failed"} = run ->
+        {:error, run}
+
+      %ImportRun{} = run ->
+        {:noop, run}
+    end
+  rescue
+    exception ->
+      {:error,
+       {:unrecorded, :outcome_unknown,
+        "GeoGenius could not reread import run #{run_id}: #{Exception.message(exception)}"}}
+  catch
+    kind, reason ->
+      {:error,
+       {:unrecorded, :outcome_unknown,
+        "GeoGenius could not reread import run #{run_id}: #{inspect({kind, reason})}"}}
   end
 
   # The run's own directory is created beneath whatever `:work_dir` names,
   # never used directly, so a caller that points several runs at one directory
   # -- or at a directory holding something else -- keeps everything but this
   # run's own files when the run ends.
-  defp run_import(context, run, opts) do
+  defp run_import(context, run, executor_id, opts) do
     work_dir = Path.join(base_work_dir(opts), "run_" <> String.replace(run.run_id, "-", ""))
-    File.mkdir_p!(work_dir)
 
     state = %State{
       context: context,
       run: run,
+      executor_id: executor_id,
       opts: opts,
       work_dir: work_dir,
       publish?: Keyword.get(opts, :publish, false),
@@ -181,9 +324,16 @@ defmodule GeoGenius.Pipeline do
     }
 
     try do
+      File.mkdir_p!(work_dir)
       load_and_run(state)
+    rescue
+      exception ->
+        fail(state, state.run.status || "pending", {:exception, exception, __STACKTRACE__})
+    catch
+      kind, reason ->
+        fail(state, state.run.status || "pending", {:caught, kind, reason, __STACKTRACE__})
     after
-      cleanup(context, run.run_id, work_dir)
+      cleanup(context, run.run_id, executor_id, work_dir)
     end
   end
 
@@ -194,8 +344,8 @@ defmodule GeoGenius.Pipeline do
   # working in the case that matters. The table it could not drop is a leak,
   # logged at warning so an operator knows to remove it; losing the run's
   # outcome would be worse.
-  defp cleanup(context, run_id, work_dir) do
-    Staging.drop(context, run_id)
+  defp cleanup(context, run_id, executor_id, work_dir) do
+    drop_owned_or_terminal_staging(context, run_id, executor_id)
     :ok
   rescue
     exception -> leaked(run_id, Exception.message(exception))
@@ -203,6 +353,14 @@ defmodule GeoGenius.Pipeline do
     kind, reason -> leaked(run_id, "#{kind} #{inspect(reason)}")
   after
     File.rm_rf(work_dir)
+  end
+
+  defp drop_owned_or_terminal_staging(context, run_id, executor_id) do
+    Staging.drop(context, run_id, executor_id)
+  rescue
+    _exception -> Staging.drop(context, run_id)
+  catch
+    _kind, _reason -> Staging.drop(context, run_id)
   end
 
   # Swallowing the drop is the trade; swallowing it silently would not be. The
@@ -278,7 +436,13 @@ defmodule GeoGenius.Pipeline do
   # produced -- and none of them can leave the run sitting in a phase with an
   # empty `error` column.
   defp run_phase(state, phase, fun) do
-    Catalog.advance_import(state.context, state.run.run_id, phase, state.metrics)
+    Catalog.advance_import(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      phase,
+      state.metrics
+    )
 
     notify(state, :phase_advanced, %{
       run_id: state.run.run_id,
@@ -316,23 +480,90 @@ defmodule GeoGenius.Pipeline do
   defp phase_status({:error, _reason}), do: :error
 
   defp finish({:ok, state}), do: complete(state)
+
+  defp finish({:error, state, "publishing", reason}) do
+    case read_run(state) do
+      {:ok, %ImportRun{status: "completed"} = run} ->
+        notify_published(state)
+        notify(state, :import_completed, run_payload(state))
+        {:ok, run}
+
+      _other ->
+        fail(state, "publishing", reason)
+    end
+  end
+
   defp finish({:error, state, phase, reason}), do: fail(state, phase, reason)
 
   defp complete(state) do
-    case advance_to_completed(state) do
-      :ok ->
-        notify(state, :import_completed, run_payload(state))
-        completed(state)
+    case read_run(state) do
+      {:ok, %ImportRun{status: "completed"}} = result ->
+        complete_outcome(result, state, nil)
+
+      {:ok, %ImportRun{status: "failed"}} = result ->
+        complete_outcome(result, state, nil)
+
+      {:ok, %ImportRun{status: "verifying"}} when not state.publish? ->
+        complete_without_publication(state)
+
+      {:ok, %ImportRun{status: status}} ->
+        fail(state, status, "successful pipeline ended in unexpected status #{inspect(status)}")
+
+      {:ok, nil} ->
+        {:error,
+         {:unrecorded, :outcome_unknown,
+          "GeoGenius import run #{state.run.run_id} does not exist"}}
 
       {:error, reason} ->
         fail(state, "completed", reason)
     end
   end
 
-  # Only the advance is guarded, and deliberately only the advance: it is the
-  # call that decides whether the run completed.
-  defp advance_to_completed(state) do
-    Catalog.advance_import(state.context, state.run.run_id, "completed", state.metrics)
+  defp complete_without_publication(state) do
+    case complete_import(state) do
+      :ok ->
+        notify(state, :import_completed, run_payload(state))
+        completed(state)
+
+      {:error, reason} ->
+        recover_complete_without_publication(state, reason)
+    end
+  end
+
+  defp recover_complete_without_publication(state, reason) do
+    complete_outcome(read_run(state), state, reason)
+  end
+
+  defp complete_outcome({:ok, %ImportRun{status: "completed"} = run}, state, _reason) do
+    notify(state, :import_completed, run_payload(state))
+    {:ok, run}
+  end
+
+  defp complete_outcome({:ok, %ImportRun{status: "failed"} = run}, _state, _reason),
+    do: {:error, run}
+
+  defp complete_outcome(_other, state, reason), do: fail(state, "completed", reason)
+
+  defp read_run(state) do
+    {:ok, Catalog.import_run(state.context, state.run.run_id)}
+  rescue
+    exception -> {:error, {:exception, exception, __STACKTRACE__}}
+  catch
+    kind, reason -> {:error, {:caught, kind, reason, __STACKTRACE__}}
+  end
+
+  # Only the terminal call is guarded here. It verifies the release again and
+  # records completion atomically; a failure still belongs to this attempt and
+  # is routed through the ordinary failure path by the caller above.
+  defp complete_import(state) do
+    Catalog.complete_import(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      state.metrics,
+      timeout: state.timeout
+    )
+
     :ok
   rescue
     exception -> {:error, {:exception, exception, __STACKTRACE__}}
@@ -342,18 +573,24 @@ defmodule GeoGenius.Pipeline do
 
   # By the time this reads, the run is `completed` in PostgreSQL. A read that
   # fails here costs the caller its snapshot, never the outcome, so it must not
-  # route to `fail/3`: `fail_import/3` refuses a completed run, so the call
+  # route to `fail/3`: `fail_import/4` refuses a completed run, so the call
   # would raise 55000 and bury the read error that actually happened behind a
   # failure to record it.
   defp completed(state) do
     case Catalog.import_run(state.context, state.run.run_id) do
-      %ImportRun{} = run -> {:ok, run}
-      nil -> {:error, {:unrecorded, unread(state, "the run is no longer in the catalog")}}
+      %ImportRun{} = run ->
+        {:ok, run}
+
+      nil ->
+        {:error,
+         {:unrecorded, :outcome_unknown, unread(state, "the run is no longer in the catalog")}}
     end
   rescue
-    exception -> {:error, {:unrecorded, unread(state, Exception.message(exception))}}
+    exception ->
+      {:error, {:unrecorded, :outcome_unknown, unread(state, Exception.message(exception))}}
   catch
-    kind, reason -> {:error, {:unrecorded, unread(state, "#{kind} #{inspect(reason)}")}}
+    kind, reason ->
+      {:error, {:unrecorded, :outcome_unknown, unread(state, "#{kind} #{inspect(reason)}")}}
   end
 
   defp unread(state, reason) do
@@ -361,7 +598,7 @@ defmodule GeoGenius.Pipeline do
   end
 
   # The stored error is the durable record, so recording it must not be able to
-  # hide what actually went wrong: a `fail_import/3` that fails itself leaves
+  # hide what actually went wrong: a `fail_import/4` that fails itself leaves
   # the original reason as this function's return value.
   defp fail(state, phase, reason) do
     detail = error_detail(phase, reason)
@@ -373,13 +610,16 @@ defmodule GeoGenius.Pipeline do
     })
 
     case record_failure(state, detail) do
-      :ok -> recorded(state, detail)
-      {:error, _unrecorded} -> {:error, {:unrecorded, detail["reason"]}}
+      :ok ->
+        recorded(state, detail)
+
+      {:error, _unrecorded} ->
+        {:error, {:unrecorded, :outcome_unknown, detail["reason"]}}
     end
   end
 
   defp record_failure(state, detail) do
-    Catalog.fail_import(state.context, state.run.run_id, detail)
+    Catalog.fail_import(state.context, state.run.run_id, state.executor_id, detail)
   rescue
     error -> {:error, error}
   catch
@@ -393,12 +633,12 @@ defmodule GeoGenius.Pipeline do
   defp recorded(state, detail) do
     case Catalog.import_run(state.context, state.run.run_id) do
       %ImportRun{} = run -> {:error, run}
-      nil -> {:error, {:unrecorded, detail["reason"]}}
+      nil -> {:error, {:unrecorded, :outcome_unknown, detail["reason"]}}
     end
   rescue
-    _exception -> {:error, {:unrecorded, detail["reason"]}}
+    _exception -> {:error, {:unrecorded, :outcome_unknown, detail["reason"]}}
   catch
-    _kind, _reason -> {:error, {:unrecorded, detail["reason"]}}
+    _kind, _reason -> {:error, {:unrecorded, :outcome_unknown, detail["reason"]}}
   end
 
   defp error_detail(phase, {:exception, exception, stacktrace}) do
@@ -435,15 +675,14 @@ defmodule GeoGenius.Pipeline do
     Enum.map(Enum.take(stacktrace, @stacktrace_frames), &Exception.format_stacktrace_entry/1)
   end
 
-  # The manifest comes from the release row rather than the file it was loaded
-  # from, so a resumed or retried run uses the document the release was opened
-  # with even if the file on disk has since changed.
-  defp load_manifest(%State{} = state) do
-    case Catalog.release_manifest(state.context, state.run.release_id) do
-      nil -> {:error, "release #{state.run.release_id} carries no manifest"}
-      document -> build_manifest(state, document)
-    end
+  # The claimed run owns its immutable manifest snapshot. A release can be
+  # corrected after a failed attempt, but resuming an older run must still
+  # execute the exact document that attempt claimed.
+  defp load_manifest(%State{run: %ImportRun{manifest: nil}} = state) do
+    {:error, "import run #{state.run.run_id} carries no manifest snapshot"}
   end
+
+  defp load_manifest(%State{} = state), do: build_manifest(state, state.run.manifest)
 
   defp build_manifest(state, document) do
     case Manifest.from_map(document) do
@@ -483,7 +722,7 @@ defmodule GeoGenius.Pipeline do
   end
 
   defp stage(%State{} = state) do
-    Staging.reset(state.context, state.run.run_id)
+    Staging.reset(state.context, state.run.run_id, state.executor_id)
     counter = :counters.new(1, [])
 
     state.resolved
@@ -518,9 +757,20 @@ defmodule GeoGenius.Pipeline do
   # Each `emit` call is both a bulk insert and a lease renewal, which is why a
   # provider stages a large artifact in chunks rather than in one call.
   defp emit_rows(state, counter, rows) do
-    inserted = Staging.insert(state.context, state.run.run_id, rows, timeout: state.timeout)
+    inserted =
+      Staging.insert(state.context, state.run.run_id, state.executor_id, rows,
+        timeout: state.timeout
+      )
+
     :counters.add(counter, @counter_index, inserted)
-    Catalog.heartbeat_import(state.context, state.run.run_id, %{"staged" => staged(counter)})
+
+    Catalog.heartbeat_import(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      %{"staged" => staged(counter)}
+    )
+
     :ok
   end
 
@@ -540,12 +790,18 @@ defmodule GeoGenius.Pipeline do
   defp relate(%State{} = state), do: Relate.relate(state)
 
   defp index(%State{} = state) do
-    Catalog.analyze_release(state.context, state.run.release_id, timeout: state.timeout)
+    Catalog.analyze_import(state.context, state.run.run_id, state.executor_id,
+      timeout: state.timeout
+    )
+
     {:ok, %{state | metrics: %{}}}
   end
 
   defp verify(%State{} = state) do
-    report = Catalog.verify_release(state.context, state.run.release_id, timeout: state.timeout)
+    report =
+      Catalog.verify_import(state.context, state.run.run_id, state.executor_id,
+        timeout: state.timeout
+      )
 
     metrics = %{
       "area_count" => report["area_count"],
@@ -560,14 +816,20 @@ defmodule GeoGenius.Pipeline do
   end
 
   defp publish(%State{} = state) do
-    Catalog.publish_release(state.context, state.run.release_id, timeout: state.timeout)
+    Catalog.publish_import(state.context, state.run.run_id, state.executor_id,
+      timeout: state.timeout
+    )
 
+    notify_published(state)
+
+    {:ok, %{state | metrics: %{}}}
+  end
+
+  defp notify_published(state) do
     notify(state, :release_published, %{
       release_id: state.run.release_id,
       collection_key: state.run.collection_key
     })
-
-    {:ok, %{state | metrics: %{}}}
   end
 
   defp run_payload(state) do

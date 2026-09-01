@@ -1,6 +1,11 @@
 # GeoGenius Design
 
-> Status: approved through brainstorming on 2026-08-24; implementation plan pending.
+> Status: historical design notes. The current schema is installed and the public
+> contract lives in `README.md`, `guides/sql_api.md`, `guides/ingestion.md`,
+> and the shipped schema SQL. Do not treat this document as an
+> operator manual: several Import/Provider/Storage sketches here predate the
+> executor-fenced SQL (for example `heartbeat_import/2` is now
+> `heartbeat_import/3`).
 >
 > Scope: a standalone Elixir and PostgreSQL/PostGIS library, distributed on Hex, installable into
 > any Ecto-backed application. No HTTP layer, no UI, no frontend.
@@ -46,8 +51,8 @@ records, tenants, roles, HTTP layer, or presentation.
 9. The catalog is tenant-free. Collections are the isolation unit.
 10. Schema migrations are raw SQL managed by EctoEvolver, installed under a host-selected prefix
     through a host-owned, version-pinned Ecto migration.
-11. Durable execution is adapter-based. PgFlow is the default; Oban, a supervised task, and a test
-    adapter are supplied.
+11. Execution is adapter-based. A supervised task is the safe zero-configuration default; durable
+    PgFlow execution is explicit because its finite job deadline is host policy for bounded work.
 12. GDAL is not a package requirement. Only providers that read shapefiles need it.
 13. Automatic bootstrap and artifact download are disabled by default. Starting a host application
     never downloads or imports geographic data.
@@ -290,15 +295,33 @@ relating -> indexing -> verifying -> publishing -> completed | failed
 
 | Function | Role |
 |---|---|
-| `begin_or_resume_import(collection, release_key, owner, stale_after)` | Claim or reclaim through `FOR UPDATE SKIP LOCKED` and a lease |
-| `heartbeat(run_id)` | Liveness for long stages |
-| `advance_import(run_id, phase, metrics)` | Resumable progress |
-| `fail_import(run_id, error)` | Terminal, inspectable, retryable |
+| `prepare_import(manifest, claim)` | Reuse the exact current candidate or create its first immutable attempt |
+| `retry_failed(run_id, manifest, claim)` | Create an explicitly corrected attempt after a durable failure |
+| `claim_import_execution(run_id, executor_id)` | Atomically select the sole executor for a pending attempt |
+| `heartbeat_import(run_id, progress)` | Renew liveness and record progress for the owning attempt |
+| `advance_import(run_id, executor_id, phase, metrics)` | Advance exactly one nonterminal phase and record progress |
+| `fail_import(run_id, executor_id, error)` | Terminal, inspectable, retryable |
 | `verify_release(release_id)` | Invariants before publication |
-| `publish_release(release_id)` | Verify, swap the publication pointer in a short transaction, emit the event |
+| `complete_import(run_id, executor_id, metrics)` | Verify and complete an import without publishing |
+| `publish_import(run_id, executor_id)` | Verify, complete the import, release its lease, publish, and emit the event atomically |
+| `publish_release(release_id)` | Publish a release that has no import history, for deliberate catalog administration |
 | `rollback_publication(collection)` | Revert to the retained previous release |
 | `retire_releases(collection, keep)` | Drop partitions, mark the release retired, keep its row |
 | `release_at(collection, as_of)` | The release a collection had published at a moment |
+
+Candidate identity and retry are explicit. Calling `prepare_import` again for the same exact
+candidate returns its existing attempt; it does not overwrite the manifest, source declarations,
+artifact evidence, or failure. Once that attempt has failed, ordinary preparation returns a
+structured refusal for both identical and changed manifests. A retry starts only through
+`retry_failed`, receives a new attempt number, and retains the failed attempt as immutable evidence.
+
+Execution is also explicit. A pending attempt must win `claim_import_execution` before doing any
+work, and there is no executor takeover. Every import-owned write is fenced by the current run, so
+a duplicate, failed, or superseded worker cannot continue mutating the candidate release.
+An independently supervised execution guardian monitors the process that performs that claim.
+If the process dies while the Repo remains reachable, the guardian records failure with the exact
+executor identity. It cannot cover whole-node loss or dependency shutdown after the host Repo has
+already stopped; those remain operator-visible abandoned attempts, never automatic takeovers.
 
 Verification invariants include: required area types present, area counts within configured
 thresholds, all geometry valid, no orphan relations, every member area belonging to the release's
@@ -310,8 +333,13 @@ deleting it would cascade both away, tearing holes in the monotonic event sequen
 erasing import history the catalog keeps indefinitely.
 
 Publication is fail-safe. A failed candidate leaves the current release, its boundaries, and every
-host join untouched. A release becomes visible only after all required sources, relations, indexes,
-and validations complete.
+host join untouched. An imported release becomes visible only when `publish_import` completes the
+run, removes its lease, swaps the publication pointer, and records the event in one transaction,
+after every required selected artifact has a validated observation and all source, relation,
+index, and catalog validations complete. Phase changes follow the fixed sequence and cannot skip
+ahead or create a terminal state; `fail_import`, `complete_import`, and `publish_import` own the
+terminal transitions. The completion-only path performs the same validation without changing the
+publication pointer.
 
 Retention keeps the active release and one previous complete release. Source and import history are
 kept indefinitely; they are small.
@@ -341,7 +369,7 @@ environment. Optional dependencies are reached through `Code.ensure_loaded?/1` a
 
 | Behaviour | Default | Alternatives |
 |---|---|---|
-| `GeoGenius.Runner` | `Runners.PgFlow` | `Runners.Oban`, `Runners.Task`, `Runners.Test` |
+| `GeoGenius.Runner` | `Runners.Task` | `Runners.PgFlow`, `Runners.Inline`, host adapters |
 | `GeoGenius.Store` | `Stores.Postgres` | host repo seam |
 | `GeoGenius.Cache` | `Caches.FileSystem` | object storage |
 | `GeoGenius.Downloader` | `Downloaders.Req` | any HTTP client |
@@ -461,8 +489,11 @@ geometry-only probe and then loses its connection on the first real read.
 
 `GeoGenius.Preflight` wraps the same check as a supervisor child. The host places it in its own
 supervision tree immediately after its Repo, because dependency applications boot before the host
-application and `:geo_genius` cannot see a Repo that has not started yet. For that reason the library
-declares no `mod:` application callback and starts no supervision tree of its own.
+application and `:geo_genius` cannot see a Repo that has not started yet. The library's application
+callback therefore starts only process infrastructure that needs no host Repo at boot: the
+execution-guardian supervisor and, unless the host configured its own, a `Task.Supervisor` for the
+default asynchronous runner. `GeoGenius.Preflight` deliberately does not belong to that package
+tree.
 
 The child returns `:ignore` on success, so nothing lingers in the tree, and raises on failure, which
 aborts host startup. A host that prefers to decide for itself calls `GeoGenius.verify/2`, the
@@ -559,7 +590,7 @@ never download anything. Required coverage:
 - publication swap atomicity and rollback to the retained previous release;
 - retention by partition drop;
 - two concurrent claims yield exactly one winner;
-- phase transitions, terminal states, and heartbeat-based reclaim of a stale run;
+- phase transitions, terminal states, single-executor claims, and explicit handling of a stale run;
 - verification invariants fail closed;
 - SRID enforcement and longitude/latitude ordering;
 - boundary-inclusive containment;

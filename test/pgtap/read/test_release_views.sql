@@ -1,6 +1,6 @@
 BEGIN;
 
-SELECT plan(19);
+SELECT plan(27);
 
 -- The release-scoped bases every published_* view builds on. published_areas
 -- has had release_areas under it since the catalog was first installed; these
@@ -53,22 +53,83 @@ SELECT is(
 -- afterwards over the same two areas, deliberately never published: it is the
 -- release a host wants to verify or project ahead of go-live.
 SELECT geo_genius_test.demo_fixture_build();
-SELECT geo_genius.put_area_code('demo_auth:outer:A', 'postal', '30309');
-SELECT geo_genius.put_area_name('demo_auth:outer:A', 'Alfa', 'alias', NULL);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:A', 'postal', '30309');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
+  'demo_auth:outer:A', 'Alfa', 'alias', NULL);
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(),
+  'relating');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+  geo_genius_test.demo_run_id(),
+  geo_genius_test.demo_executor_id(),
   'demo_auth:outer:A', 'demo_auth:inner:B', 'contains');
 SELECT geo_genius_test.demo_publish();
 
-SELECT geo_genius.open_release('demo', 'r2', '{}'::jsonb, NULL);
+SELECT * FROM geo_genius.prepare_import(
+  '{
+    "collection":"demo",
+    "release":"r2",
+    "collection_name":"Candidate Demo",
+    "requires_geometry":true,
+    "authorities":[{"key":"demo_auth","name":"Candidate Authority"}],
+    "area_types":[
+      {"key":"outer","rank":5,"requires_geometry":true},
+      {"key":"inner","rank":25,"requires_geometry":true}
+    ]
+  }'::jsonb,
+  '{"owner":"pgtap-release-views","runner_backend":"pgtap"}'::jsonb
+);
+SELECT geo_genius_test.claim_import_executor(
+  geo_genius_test.import_run_id('demo', 'r2'));
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'normalizing');
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
   'demo_auth:outer:A', ST_GeogFromText('POINT(0.25 0.25)'), '{}'::jsonb);
 SELECT geo_genius.put_area_in_release(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
   'demo_auth:inner:B', ST_GeogFromText('POINT(0.25 0.25)'), '{}'::jsonb);
+SELECT geo_genius.put_area_code(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'demo_auth:outer:A', 'postal', '30309');
+SELECT geo_genius.put_area_name(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'demo_auth:outer:A', 'Alfa', 'alias', NULL);
+
+SELECT lives_ok(
+  $$SELECT geo_genius.put_area_name(
+      geo_genius_test.import_run_id('demo', 'r2'),
+      geo_genius_test.import_executor_id('demo', 'r2'),
+      'demo_auth:outer:A', 'Aardvark Candidate', 'official', NULL)$$,
+  'a candidate writes its official name under its own release'
+);
+
+SELECT lives_ok(
+  $$SELECT geo_genius.put_area_code(
+      geo_genius_test.import_run_id('demo', 'r2'),
+      geo_genius_test.import_executor_id('demo', 'r2'),
+      'demo_auth:outer:A', 'postal', '99999')$$,
+  'a candidate writes its external code under its own release'
+);
+
+SELECT geo_genius_test.advance_import_to(
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
+  'relating');
 SELECT geo_genius.put_relation(
-  (SELECT id FROM geo_genius.release WHERE release_key = 'r2'),
+  geo_genius_test.import_run_id('demo', 'r2'),
+  geo_genius_test.import_executor_id('demo', 'r2'),
   'demo_auth:inner:B', 'demo_auth:outer:A', 'overlaps');
 
 CREATE FUNCTION pg_temp.release_id(key text)
@@ -173,6 +234,57 @@ SELECT is(
     WHERE edge.release_id = pg_temp.release_id('r2')),
   1,
   'joining release_relations to release_areas on release_id keeps one release'
+);
+
+-- A candidate and a published release may share the same stable area row.
+-- Candidate-selected names, codes, declaration labels, ranks and geometry
+-- policy must remain facts of that candidate rather than mutations visible
+-- through the published release.
+SELECT is(
+  (SELECT name FROM geo_genius.published_areas
+    WHERE area_key = 'demo_auth:outer:A'),
+  'Alpha',
+  'candidate official-name changes cannot contaminate the published release'
+);
+
+SELECT is(
+  (SELECT array_agg(code_value ORDER BY code_value)
+     FROM geo_genius.published_area_codes
+    WHERE area_key = 'demo_auth:outer:A' AND code_type = 'postal'),
+  ARRAY['30309']::text[],
+  'candidate code changes cannot contaminate the published release'
+);
+
+SELECT is(
+  (SELECT type_rank FROM geo_genius.published_areas
+    WHERE area_key = 'demo_auth:outer:A'),
+  10,
+  'candidate rank changes cannot contaminate the published release'
+);
+
+SELECT is(
+  (SELECT array_agg(release_authority.name ORDER BY release.release_key)
+     FROM geo_genius.release_authority
+     JOIN geo_genius.release ON release.id = release_authority.release_id
+    WHERE release.release_key IN ('r1', 'r2')
+      AND release_authority.authority_id = (
+        SELECT id FROM geo_genius.authority WHERE key = 'demo_auth')),
+  ARRAY['Demo Authority', 'Candidate Authority']::text[],
+  'authority descriptors remain exact declarations of their own releases'
+);
+
+SELECT is(
+  (SELECT array_agg(policy.requires_geometry ORDER BY release.release_key)
+     FROM geo_genius.release_collection_policy policy
+     JOIN geo_genius.release ON release.id = policy.release_id
+    WHERE release.release_key IN ('r1', 'r2')),
+  ARRAY[false, true]::boolean[],
+  'collection geometry policy remains exact to each release'
+);
+
+SELECT lives_ok(
+  $$SELECT geo_genius.verify_release(pg_temp.release_id('r1'))$$,
+  'candidate geometry-policy changes cannot invalidate the published release'
 );
 
 SELECT finish();

@@ -1,15 +1,16 @@
 defmodule GeoGenius.Application do
   @moduledoc """
-  Starts GeoGenius's own supervision tree: at most one child, a
-  `Task.Supervisor` registered as `GeoGenius.TaskSupervisor`.
+  Starts GeoGenius's own supervision tree: an execution-guardian supervisor
+  and, unless a host supplies one, a `Task.Supervisor` registered as
+  `GeoGenius.TaskSupervisor`.
 
   `GeoGenius.Runners.Task` uses that supervisor when a host has configured
   nothing of its own, so an asynchronous import works with zero host
   configuration. When `config :geo_genius, :task_supervisor` is already set
-  at boot, this tree starts no child at all: the host has committed to
-  supplying its own, and an idle supervisor nobody will ever reach is not
-  worth leaving in the tree -- one a host could not otherwise remove short
-  of disabling the runner entirely.
+  at boot, this tree omits only that task supervisor: the host has committed
+  to supplying its own. The guardian remains package-owned because it
+  monitors executions under every backend, including PgFlow and a host task
+  supervisor.
 
   Do not add `GeoGenius.Preflight` to this tree. It must stay a child the
   *host* places, immediately after its own Repo, for two reasons this
@@ -58,22 +59,21 @@ defmodule GeoGenius.Application do
   from the outside.
 
   Killing a running import task this way is still not graceful: a `Task`
-  does not trap exits, so it dies the instant its supervisor tells it to,
-  mid-statement if that is where it happens to be -- the standard shutdown
-  timeout is never actually spent, because there is no cleanup phase to
-  spend it on. Nothing here should be made to trap exits either: a trapping
-  task would need to finish or abort a phase inside that window, and no
-  phase can. Neither arrangement lets a task write
-  `GeoGenius.Catalog.fail_import/3` or drop its own staging table on the
-  way out: under the default ordering it keeps running and both calls fail
-  against a Repo that is already gone; under the override it is killed
-  before it gets the chance to make either call at all. What the correct
-  ordering buys is narrower than a graceful shutdown: the task dies while
-  the Repo can still be reached rather than while it cannot, so it fails
-  cleanly instead of failing repeatedly against a connection that is
-  already gone. Either way, what actually recovers the run is what it has
-  always been: the lease, reclaimed once `stale_after` elapses. See
-  `GeoGenius.Runners.Task`'s moduledoc.
+  does not trap exits, so it dies wherever it happens to be and cannot clean
+  up its staging table. The independently supervised execution guardian
+  monitors that task, however. With the host-owned ordering above, the task
+  dies while both the guardian and Repo are still alive, so the guardian
+  records a durable failure using the exact executor identity before the
+  Repo stops. The executor is never transferred or taken over.
+
+  The package-owned default cannot make the same shutdown guarantee. The
+  host Repo has already stopped by the time the dependency application's
+  task and guardian supervisors shut down, so the guardian may be unable to
+  record the task's death. Whole-VM or whole-node loss has the same limit:
+  no surviving local process exists to write the outcome. In those cases a
+  stale heartbeat remains diagnostic; an operator records the abandoned
+  attempt's failure and starts a new one explicitly with
+  `GeoGenius.retry_failed/2`. See `GeoGenius.Runners.Task`'s moduledoc.
 
   A host can list the pids of tasks currently running under either
   supervisor with `Task.Supervisor.children/1` -- bare pids, not run ids,
@@ -88,10 +88,13 @@ defmodule GeoGenius.Application do
   @doc false
   @spec children() :: [Supervisor.child_spec() | {module(), keyword()}]
   def children do
+    guardian =
+      {DynamicSupervisor, strategy: :one_for_one, name: GeoGenius.ExecutionGuardianSupervisor}
+
     if Application.get_env(:geo_genius, :task_supervisor) do
-      []
+      [guardian]
     else
-      [{Task.Supervisor, name: GeoGenius.TaskSupervisor}]
+      [guardian, {Task.Supervisor, name: GeoGenius.TaskSupervisor}]
     end
   end
 

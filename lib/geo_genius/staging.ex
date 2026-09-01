@@ -8,8 +8,9 @@ defmodule GeoGenius.Staging do
   written to at a pace no parser sets, and a provider's parsing is testable
   against a table rather than against the catalog's constraints.
 
-  It is not where a resumed run picks up. Every attempt stages afresh, so a
-  pass begins by emptying the run's table -- see `reset/2`.
+  It is not recovery input. Every attempt stages afresh from its immutable
+  artifact snapshot, so a pass begins by emptying the run's table -- see
+  `reset/3`.
 
   The table is created and dropped per run and is `UNLOGGED`, because its
   content is reproducible from a checksummed artifact and skipping WAL for a
@@ -18,6 +19,7 @@ defmodule GeoGenius.Staging do
   """
 
   alias GeoGenius.{Catalog, Context, StagingError}
+  alias GeoGenius.Stores.Postgres
 
   defmodule Row do
     @moduledoc """
@@ -63,42 +65,45 @@ defmodule GeoGenius.Staging do
   end
 
   @doc "Creates a run's staging table, if it does not already exist, returning its name."
-  @spec create(Context.t(), Ecto.UUID.t()) :: String.t()
-  def create(%Context{} = context, run_id), do: Catalog.create_staging(context, run_id)
+  @spec create(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: String.t()
+  def create(%Context{} = context, run_id, executor_id),
+    do: Catalog.create_staging(context, run_id, executor_id)
 
   @doc """
   Empties a run's staging table, creating it if it is not there, and returns
   its name.
 
-  `create/2` alone is `CREATE UNLOGGED TABLE IF NOT EXISTS`, which is what a
-  staging pass wants on the second call and not what it wants on the second
-  attempt. A run whose worker died where the pipeline's own cleanup could not
-  run -- a killed VM, a lost machine -- leaves its rows behind under the same
-  run id, and the next attempt to stage that run parses the same artifact into
-  the same table again. The rows double, and the ones from the first attempt
-  are the ones the source has since changed: a row deleted upstream is still
-  staged, still normalized, and back in the release.
+  `create/3` alone is `CREATE UNLOGGED TABLE IF NOT EXISTS`, which is what a
+  staging pass wants on the second call and not what it wants at the start of
+  execution. A table can survive an abrupt worker or VM death, or be created
+  manually before the pipeline starts. Neither case authorizes those rows as
+  input to a future executor.
 
   So a pass starts from a table that is empty by construction. The table is
   dropped rather than truncated, which also resets the identity sequence the
   keyset pagination in `stream/3` reads through, and leaves nothing of the
   previous attempt's shape behind for this one to inherit.
 
-  Nothing is lost by emptying it: staging is not where a resumed run picks up.
-  `GeoGenius.Pipeline.execute/3` walks a resumed run through every phase from
-  downloading, so the rows an interrupted attempt staged would be re-staged
-  beside themselves rather than reused. What makes a retry cheap is the
-  artifact cache, which skips the network.
+  Nothing durable is lost by emptying it: staging is reproducible scratch
+  space, not attempt evidence or a recovery checkpoint. A corrected retry has
+  a new run and stages from its own artifact snapshot. What makes that retry
+  cheap is the artifact cache, which skips the network.
   """
-  @spec reset(Context.t(), Ecto.UUID.t()) :: String.t()
-  def reset(%Context{} = context, run_id) do
-    :ok = drop(context, run_id)
-    create(context, run_id)
+  @spec reset(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: String.t()
+  def reset(%Context{} = context, run_id, executor_id) do
+    create(context, run_id, executor_id)
+    :ok = drop(context, run_id, executor_id)
+    create(context, run_id, executor_id)
   end
 
-  @doc "Drops a run's staging table, if it exists."
+  @doc "Drops a terminal or orphaned run's staging table, if it exists."
   @spec drop(Context.t(), Ecto.UUID.t()) :: :ok
   def drop(%Context{} = context, run_id), do: Catalog.drop_staging(context, run_id)
+
+  @doc "Drops the current executor's active staging table, if it exists."
+  @spec drop(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: :ok
+  def drop(%Context{} = context, run_id, executor_id),
+    do: Catalog.drop_staging(context, run_id, executor_id)
 
   @doc """
   Every staging table no run still needs.
@@ -108,7 +113,7 @@ defmodule GeoGenius.Staging do
   cannot be recovered any other way: an earlier version of this function
   joined `import_run` to `pg_class`, so a table whose run row was gone had
   nothing to join to, never appeared here, and `mix geo_genius.sweep_staging`
-  could never drop it. `v01_down.sql` refuses to drop a non-empty schema, so
+  could never drop it. The schema down migration refuses to drop a non-empty schema, so
   an unreclaimable table eventually blocks an uninstall outright.
 
   The scan therefore starts from `pg_class` and left-joins `import_run`.
@@ -173,30 +178,38 @@ defmodule GeoGenius.Staging do
   `opts` reaches `Repo.query/3`. One batch of a national artifact is a single
   multi-megabyte `unnest` insert, which is exactly the shape DBConnection's
   fifteen-second default cuts short, so a caller raises `:timeout` here rather
-  than on its whole Repo.
+  than on its whole Repo. The insert always forces `checkout_retries: 0`: after
+  a disconnect, only the pipeline can safely decide whether to start a new
+  import attempt rather than repeating an ambiguously completed mutation.
   """
-  @spec insert(Context.t(), Ecto.UUID.t(), [Row.t()], keyword()) :: non_neg_integer()
-  def insert(context, run_id, rows, opts \\ [])
+  @spec insert(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [Row.t()], keyword()) ::
+          non_neg_integer()
+  def insert(context, run_id, executor_id, rows, opts \\ [])
 
-  def insert(%Context{}, run_id, [], _opts) do
+  def insert(%Context{}, run_id, executor_id, [], _opts) do
     table_name(run_id)
+    Postgres.dump_uuid(executor_id)
     0
   end
 
-  def insert(%Context{} = context, run_id, rows, opts) when is_list(rows) do
-    table = table_name(run_id)
+  def insert(%Context{} = context, run_id, executor_id, rows, opts) when is_list(rows) do
+    table_name(run_id)
 
     artifacts = Enum.map(rows, & &1.artifact)
     payloads = Enum.map(rows, & &1.payload)
     geoms = Enum.map(rows, & &1.geom)
 
-    sql = """
-    INSERT INTO "#{context.prefix}"."#{table}" (artifact, payload, geom)
-    SELECT * FROM unnest($1::text[], $2::jsonb[], $3::geometry[])
-    """
+    sql =
+      "SELECT \"#{context.prefix}\".insert_staging_many($1, $2, $3, $4, $5) AS result"
 
-    %Postgrex.Result{num_rows: num_rows} =
-      execute(context, sql, [artifacts, payloads, geoms], "insert", opts)
+    %Postgrex.Result{rows: [[num_rows]]} =
+      execute(
+        context,
+        sql,
+        [Postgres.dump_uuid(run_id), Postgres.dump_uuid(executor_id), artifacts, payloads, geoms],
+        "insert",
+        Keyword.put(opts, :checkout_retries, 0)
+      )
 
     num_rows
   end

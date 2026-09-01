@@ -10,7 +10,9 @@ defmodule GeoGenius.OperationalTasksTest do
   alias GeoGenius.Catalog
   alias GeoGenius.Context
   alias GeoGenius.ImportFixture
+  alias GeoGenius.Manifest
   alias GeoGenius.RecordingRepo
+  alias GeoGenius.Registration
   alias GeoGenius.Runners
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
@@ -56,8 +58,7 @@ defmodule GeoGenius.OperationalTasksTest do
   # asserted together with the probe prefix, in the same statement, at the
   # recording repo the `--repo` option named.
   @forwarding [
-    {"geo_genius.import", Import, ["--collection", "demo", "--release", "r1"],
-     "upsert_collection"},
+    {"geo_genius.import", Import, ["--collection", "demo", "--release", "r1"], "prepare_import"},
     {"geo_genius.publish --release-id", Publish, ["--release-id", @probe_uuid],
      "publish_release"},
     {"geo_genius.publish --collection", Publish, ["--collection", "demo", "--release", "r1"],
@@ -556,7 +557,9 @@ defmodule GeoGenius.OperationalTasksTest do
     test "geo_genius.sweep_staging drops a staging table whose run row is gone" do
       ctx = context()
       {collection, _release_id, run_id} = ImportFixture.claim_run!(ctx)
-      table = Staging.create(ctx, run_id)
+      executor_id = ImportFixture.claim_executor!(ctx, run_id)
+      ImportFixture.advance_to!(ctx, run_id, executor_id, "staging")
+      table = Staging.create(ctx, run_id, executor_id)
       on_exit(fn -> TestRepo.query!(~s(DROP TABLE IF EXISTS "geo_genius"."#{table}")) end)
 
       # Remove the run row and leave its table standing. Nothing that starts
@@ -585,8 +588,10 @@ defmodule GeoGenius.OperationalTasksTest do
     test "geo_genius.sweep_staging drops nothing without --yes" do
       ctx = context()
       {_collection, _release_id, run_id} = ImportFixture.claim_run!(ctx)
-      table = Staging.create(ctx, run_id)
-      Catalog.advance_import(ctx, run_id, "completed", %{})
+      executor_id = ImportFixture.claim_executor!(ctx, run_id)
+      ImportFixture.advance_to!(ctx, run_id, executor_id, "staging")
+      table = Staging.create(ctx, run_id, executor_id)
+      Catalog.fail_import(ctx, run_id, executor_id, %{"reason" => "finished fixture"})
       on_exit(fn -> TestRepo.query!(~s(DROP TABLE IF EXISTS "geo_genius"."#{table}")) end)
 
       SweepStaging.run(repo_args())
@@ -602,11 +607,13 @@ defmodule GeoGenius.OperationalTasksTest do
     test "geo_genius.sweep_staging leaves a still-running run's staging table alone" do
       ctx = context()
       {_collection, _release_id, run_id} = ImportFixture.claim_run!(ctx)
-      table = Staging.create(ctx, run_id)
+      executor_id = ImportFixture.claim_executor!(ctx, run_id)
+      ImportFixture.advance_to!(ctx, run_id, executor_id, "staging")
+      table = Staging.create(ctx, run_id, executor_id)
       on_exit(fn -> TestRepo.query!(~s(DROP TABLE IF EXISTS "geo_genius"."#{table}")) end)
 
-      # The run is still `pending`: its staging table is the landing area the
-      # import is about to fill, and dropping it would destroy work in flight.
+      # The run is still in `staging`: its table is the landing area the
+      # import is filling, and dropping it would destroy work in flight.
       SweepStaging.run(~w(--yes) ++ repo_args())
       assert_receive {:mix_shell, :info, [_swept]}
 
@@ -687,7 +694,11 @@ defmodule GeoGenius.OperationalTasksTest do
 
       for status <- ~w(pending downloading normalizing verifying) do
         {collection, release, run_id} = claim_probe_run!(ctx)
-        if status != "pending", do: Catalog.advance_import(ctx, run_id, status, %{})
+
+        if status != "pending" do
+          executor_id = ImportFixture.claim_executor!(ctx, run_id)
+          ImportFixture.advance_to!(ctx, run_id, executor_id, status)
+        end
 
         Status.run(~w(--run-id #{run_id}) ++ repo_args())
         assert_receive {:mix_shell, :info, [line]}
@@ -710,14 +721,19 @@ defmodule GeoGenius.OperationalTasksTest do
     test "renders a run's own attempt number and a failed run as failed" do
       ctx = context()
       {_collection, release_id, first_run} = claim_probe_run!(ctx, :with_release_id)
-      Catalog.fail_import(ctx, first_run, %{"reason" => "probe failure"})
+      executor_id = ImportFixture.claim_executor!(ctx, first_run)
+      Catalog.fail_import(ctx, first_run, executor_id, %{"reason" => "probe failure"})
 
-      retry =
-        Catalog.begin_or_resume_import(ctx, release_id, %{
-          owner: "gg-retry-owner",
-          runner_backend: "gg-probe-backend",
-          stale_after_seconds: 300
-        })
+      {:ok, manifest} = ctx |> Catalog.release_manifest(release_id) |> Manifest.from_map()
+
+      assert {:enqueue, retry_candidate} =
+               Registration.retry_failed(ctx, first_run, manifest, %{
+                 "owner" => "gg-retry-owner",
+                 "runner_backend" => "gg-probe-backend",
+                 "stale_after_seconds" => 300
+               })
+
+      retry = retry_candidate.run_id
 
       assert retry != first_run
 
@@ -1066,7 +1082,10 @@ defmodule GeoGenius.OperationalTasksTest do
       # finished, so both leak; one leak could not tell a sweep that drops
       # every table from one that drops the first.
       second_run_id = run_id!(alt_context(), collection, second)
-      tables = Enum.map([run_id, second_run_id], &Staging.create(alt_context(), &1))
+      # A completed pipeline drops its own staging table. The sweep task exists
+      # for crash leftovers, so create that counterfactual catalog state
+      # directly without reopening a terminal import for writes.
+      tables = Enum.map([run_id, second_run_id], &create_leaked_staging!(@alt_prefix, &1))
       assert Enum.all?(tables, &staging_table?(@alt_prefix, &1))
 
       SweepStaging.run(~w(--yes) ++ alt_args())
@@ -1297,14 +1316,22 @@ defmodule GeoGenius.OperationalTasksTest do
 
     Enum.map(1..count, fn _seeded ->
       {_collection, _release_id, run_id} = ImportFixture.claim_run!(ctx)
-      table = Staging.create(ctx, run_id)
-      Catalog.advance_import(ctx, run_id, "completed", %{})
+      executor_id = ImportFixture.claim_executor!(ctx, run_id)
+      ImportFixture.advance_to!(ctx, run_id, executor_id, "staging")
+      table = Staging.create(ctx, run_id, executor_id)
+      Catalog.fail_import(ctx, run_id, executor_id, %{"reason" => "finished fixture"})
 
       on_exit(fn -> TestRepo.query!(~s(DROP TABLE IF EXISTS "geo_genius"."#{table}")) end)
 
       assert Enum.any?(Staging.leaked(ctx), fn {id, _table} -> id == run_id end)
       {run_id, table}
     end)
+  end
+
+  defp create_leaked_staging!(prefix, run_id) do
+    table = "staging_" <> String.replace(run_id, "-", "")
+    TestRepo.query!(~s|CREATE TABLE "#{prefix}"."#{table}" (payload jsonb)|, [])
+    table
   end
 
   # The count `mix geo_genius.sweep_staging` reports, and the table names it

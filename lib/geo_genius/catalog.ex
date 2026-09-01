@@ -17,9 +17,10 @@ defmodule GeoGenius.Catalog do
   Elixir side instead, because that name reads better at every call site that
   will use it: `put_area_in_release`'s `:attributes` (SQL `data`),
   `put_boundary`'s `:geometry` (SQL `input_geom`) and `:source_release_id`
-  (SQL `target_source_release_id`), and `begin_or_resume_import`'s
-  `:stale_after_seconds` (SQL `stale_after`, expressed in seconds rather than
-  as an interval). This shape keeps every wrapper's arity under Credo's cap
+  (SQL `target_source_release_id`). Candidate registration and failed-attempt
+  retry accept `:stale_after_seconds` inside their claim maps (SQL
+  `stale_after`, expressed in seconds rather than as an interval). This shape
+  keeps every wrapper's arity under Credo's cap
   and means a caller cannot silently transpose two same-typed arguments by
   getting their position wrong.
 
@@ -29,10 +30,19 @@ defmodule GeoGenius.Catalog do
 
   alias GeoGenius.{Context, ImportRun, Stores.Postgres}
 
+  @claim_results %{
+    "claimed" => :claimed,
+    "occupied" => :occupied,
+    "completed" => :completed,
+    "failed" => :failed,
+    "missing" => :missing,
+    "superseded" => :superseded
+  }
+
   @view_columns """
   run_id::text AS run_id, release_id::text AS release_id, collection_key, release_key,
   attempt, status, owner, runner_backend, started_at, heartbeat_at, completed_at,
-  error, stage_metrics, progress
+  error, stage_metrics, progress, executor_id::text AS executor_id, execution_started_at, manifest
   """
 
   @artifact_columns """
@@ -98,24 +108,41 @@ defmodule GeoGenius.Catalog do
 
   Returns `[]` without touching the database for an empty list.
   """
-  @spec upsert_area_many(Context.t(), String.t(), [map()]) :: [Ecto.UUID.t()]
-  def upsert_area_many(context, collection_key, areas)
+  @spec upsert_area_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()]) :: [Ecto.UUID.t()]
+  @spec upsert_area_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()], keyword()) ::
+          [Ecto.UUID.t()]
+  def upsert_area_many(context, run_id, executor_id, areas, opts \\ [])
 
-  def upsert_area_many(%Context{}, _collection_key, []), do: []
+  def upsert_area_many(%Context{}, run_id, executor_id, [], _opts) do
+    dump_uuid(run_id)
+    dump_uuid(executor_id)
+    []
+  end
 
-  def upsert_area_many(%Context{} = context, collection_key, areas) do
-    scalar_list(context, "upsert_area_many", "$1, $2, $3, $4", [
-      collection_key,
-      Enum.map(areas, &Map.fetch!(&1, :authority_key)),
-      Enum.map(areas, &Map.fetch!(&1, :area_type_key)),
-      Enum.map(areas, &Map.fetch!(&1, :code))
-    ])
+  def upsert_area_many(%Context{} = context, run_id, executor_id, areas, opts)
+      when is_list(areas) do
+    scalar_list(
+      context,
+      "upsert_area_many",
+      "$1::uuid, $2::uuid, $3, $4, $5",
+      [
+        dump_uuid(run_id),
+        dump_uuid(executor_id),
+        Enum.map(areas, &Map.fetch!(&1, :authority_key)),
+        Enum.map(areas, &Map.fetch!(&1, :area_type_key)),
+        Enum.map(areas, &Map.fetch!(&1, :code))
+      ],
+      long_query_opts(opts)
+    )
   end
 
   @doc "Sets one of an area's names, returning the name row's id."
-  @spec put_area_name(Context.t(), String.t(), map()) :: Ecto.UUID.t()
-  def put_area_name(%Context{} = context, area_key, attrs) do
-    scalar(context, "put_area_name", "$1, $2, $3, $4", [
+  @spec put_area_name(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) ::
+          Ecto.UUID.t()
+  def put_area_name(%Context{} = context, run_id, executor_id, area_key, attrs) do
+    scalar(context, "put_area_name", "$1, $2, $3, $4, $5, $6", [
+      dump_uuid(run_id),
+      dump_uuid(executor_id),
       area_key,
       Map.fetch!(attrs, :name),
       Map.fetch!(attrs, :kind),
@@ -128,29 +155,48 @@ defmodule GeoGenius.Catalog do
   were given.
 
   Each map carries `:area_key`, `:name`, `:kind`, and an optional `:locale`.
-  This is `put_area_name/3` over a whole batch, in one round trip; `:locale`
+  This is `put_area_name/5` over a whole batch, in one round trip; `:locale`
   is the one field that may be `nil`.
 
   Returns `[]` without touching the database for an empty list.
   """
-  @spec put_area_name_many(Context.t(), [map()]) :: [Ecto.UUID.t()]
-  def put_area_name_many(context, names)
+  @spec put_area_name_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()]) ::
+          [Ecto.UUID.t()]
+  @spec put_area_name_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()], keyword()) ::
+          [Ecto.UUID.t()]
+  def put_area_name_many(context, run_id, executor_id, names, opts \\ [])
 
-  def put_area_name_many(%Context{}, []), do: []
+  def put_area_name_many(%Context{}, run_id, executor_id, [], _opts) do
+    dump_uuid(run_id)
+    dump_uuid(executor_id)
+    []
+  end
 
-  def put_area_name_many(%Context{} = context, names) do
-    scalar_list(context, "put_area_name_many", "$1, $2, $3, $4", [
-      Enum.map(names, &Map.fetch!(&1, :area_key)),
-      Enum.map(names, &Map.fetch!(&1, :name)),
-      Enum.map(names, &Map.fetch!(&1, :kind)),
-      Enum.map(names, &Map.get(&1, :locale))
-    ])
+  def put_area_name_many(%Context{} = context, run_id, executor_id, names, opts)
+      when is_list(names) do
+    scalar_list(
+      context,
+      "put_area_name_many",
+      "$1, $2, $3, $4, $5, $6",
+      [
+        dump_uuid(run_id),
+        dump_uuid(executor_id),
+        Enum.map(names, &Map.fetch!(&1, :area_key)),
+        Enum.map(names, &Map.fetch!(&1, :name)),
+        Enum.map(names, &Map.fetch!(&1, :kind)),
+        Enum.map(names, &Map.get(&1, :locale))
+      ],
+      long_query_opts(opts)
+    )
   end
 
   @doc "Sets one of an area's external codes, returning the code row's id."
-  @spec put_area_code(Context.t(), String.t(), map()) :: Ecto.UUID.t()
-  def put_area_code(%Context{} = context, area_key, attrs) do
-    scalar(context, "put_area_code", "$1, $2, $3", [
+  @spec put_area_code(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) ::
+          Ecto.UUID.t()
+  def put_area_code(%Context{} = context, run_id, executor_id, area_key, attrs) do
+    scalar(context, "put_area_code", "$1, $2, $3, $4, $5", [
+      dump_uuid(run_id),
+      dump_uuid(executor_id),
       area_key,
       Map.fetch!(attrs, :code_type),
       Map.fetch!(attrs, :code_value)
@@ -166,27 +212,44 @@ defmodule GeoGenius.Catalog do
 
   Returns `[]` without touching the database for an empty list.
   """
-  @spec put_area_code_many(Context.t(), [map()]) :: [Ecto.UUID.t()]
-  def put_area_code_many(context, codes)
+  @spec put_area_code_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()]) ::
+          [Ecto.UUID.t()]
+  @spec put_area_code_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()], keyword()) ::
+          [Ecto.UUID.t()]
+  def put_area_code_many(context, run_id, executor_id, codes, opts \\ [])
 
-  def put_area_code_many(%Context{}, []), do: []
+  def put_area_code_many(%Context{}, run_id, executor_id, [], _opts) do
+    dump_uuid(run_id)
+    dump_uuid(executor_id)
+    []
+  end
 
-  def put_area_code_many(%Context{} = context, codes) do
-    scalar_list(context, "put_area_code_many", "$1, $2, $3", [
-      Enum.map(codes, &Map.fetch!(&1, :area_key)),
-      Enum.map(codes, &Map.fetch!(&1, :code_type)),
-      Enum.map(codes, &Map.fetch!(&1, :code_value))
-    ])
+  def put_area_code_many(%Context{} = context, run_id, executor_id, codes, opts)
+      when is_list(codes) do
+    scalar_list(
+      context,
+      "put_area_code_many",
+      "$1, $2, $3, $4, $5",
+      [
+        dump_uuid(run_id),
+        dump_uuid(executor_id),
+        Enum.map(codes, &Map.fetch!(&1, :area_key)),
+        Enum.map(codes, &Map.fetch!(&1, :code_type)),
+        Enum.map(codes, &Map.fetch!(&1, :code_value))
+      ],
+      long_query_opts(opts)
+    )
   end
 
   @doc """
   Places an area into a release with its centroid and release-scoped
   attributes.
   """
-  @spec put_area_in_release(Context.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
-  def put_area_in_release(%Context{} = context, release_id, area_key, attrs) do
-    void(context, "put_area_in_release", "$1, $2, $3, $4", [
-      dump_uuid(release_id),
+  @spec put_area_in_release(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
+  def put_area_in_release(%Context{} = context, run_id, executor_id, area_key, attrs) do
+    void(context, "put_area_in_release", "$1, $2, $3, $4, $5", [
+      dump_uuid(run_id),
+      dump_uuid(executor_id),
       area_key,
       Map.fetch!(attrs, :centroid),
       Map.get(attrs, :attributes, %{})
@@ -198,27 +261,43 @@ defmodule GeoGenius.Catalog do
 
   Each map carries `:area_key`, `:centroid`, and optional `:attributes`.
   Membership is last-write-wins, so an area named twice in one batch keeps the
-  last of the two, exactly as two `put_area_in_release/4` calls would leave it.
+  last of the two, exactly as two `put_area_in_release/5` calls would leave it.
 
   Returns `:ok` without touching the database for an empty list, having
   validated `release_id` first, so a malformed release id fails the way it
   would for a batch that had rows.
   """
-  @spec put_area_in_release_many(Context.t(), Ecto.UUID.t(), [map()]) :: :ok
-  def put_area_in_release_many(context, release_id, memberships)
+  @spec put_area_in_release_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()]) :: :ok
+  @spec put_area_in_release_many(
+          Context.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          [map()],
+          keyword()
+        ) :: :ok
+  def put_area_in_release_many(context, run_id, executor_id, memberships, opts \\ [])
 
-  def put_area_in_release_many(%Context{}, release_id, []) do
-    dump_uuid(release_id)
+  def put_area_in_release_many(%Context{}, run_id, executor_id, [], _opts) do
+    dump_uuid(run_id)
+    dump_uuid(executor_id)
     :ok
   end
 
-  def put_area_in_release_many(%Context{} = context, release_id, memberships) do
-    void(context, "put_area_in_release_many", "$1, $2, $3, $4", [
-      dump_uuid(release_id),
-      Enum.map(memberships, &Map.fetch!(&1, :area_key)),
-      Enum.map(memberships, &Map.fetch!(&1, :centroid)),
-      Enum.map(memberships, &Map.get(&1, :attributes, %{}))
-    ])
+  def put_area_in_release_many(%Context{} = context, run_id, executor_id, memberships, opts)
+      when is_list(memberships) do
+    void(
+      context,
+      "put_area_in_release_many",
+      "$1, $2, $3, $4, $5",
+      [
+        dump_uuid(run_id),
+        dump_uuid(executor_id),
+        Enum.map(memberships, &Map.fetch!(&1, :area_key)),
+        Enum.map(memberships, &Map.fetch!(&1, :centroid)),
+        Enum.map(memberships, &Map.get(&1, :attributes, %{}))
+      ],
+      long_query_opts(opts)
+    )
   end
 
   @doc """
@@ -229,15 +308,16 @@ defmodule GeoGenius.Catalog do
   A nonzero tolerance retains the singular SQL path so existing callers keep
   its display-geometry simplification behavior.
   """
-  @spec put_boundary(Context.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
-  def put_boundary(%Context{} = context, release_id, area_key, attrs) do
+  @spec put_boundary(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
+  def put_boundary(%Context{} = context, run_id, executor_id, area_key, attrs) do
     case Map.get(attrs, :simplify_tolerance, 0.0) do
       tolerance when tolerance in [0, 0.0] ->
-        put_boundaries(context, release_id, [Map.put(attrs, :area_key, area_key)])
+        put_boundaries(context, run_id, executor_id, [Map.put(attrs, :area_key, area_key)])
 
       tolerance ->
-        void(context, "put_boundary", "$1, $2, $3, $4, $5", [
-          dump_uuid(release_id),
+        void(context, "put_boundary", "$1, $2, $3, $4, $5, $6", [
+          dump_uuid(run_id),
+          dump_uuid(executor_id),
           area_key,
           dump_uuid(Map.fetch!(attrs, :source_release_id)),
           Map.fetch!(attrs, :geometry),
@@ -256,35 +336,41 @@ defmodule GeoGenius.Catalog do
   Returns `:ok` without touching the database for an empty list, having
   validated `release_id` first.
   """
-  @spec put_boundaries(Context.t(), Ecto.UUID.t(), [map()]) :: :ok
-  def put_boundaries(context, release_id, boundaries)
+  @spec put_boundaries(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()]) :: :ok
+  @spec put_boundaries(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()], keyword()) :: :ok
+  def put_boundaries(context, run_id, executor_id, boundaries, opts \\ [])
 
-  def put_boundaries(%Context{}, release_id, []) do
-    dump_uuid(release_id)
+  def put_boundaries(%Context{}, run_id, executor_id, [], _opts) do
+    dump_uuid(run_id)
+    dump_uuid(executor_id)
     :ok
   end
 
-  def put_boundaries(%Context{} = context, release_id, boundaries) do
+  def put_boundaries(%Context{} = context, run_id, executor_id, boundaries, opts)
+      when is_list(boundaries) do
     void(
       context,
       "put_boundaries",
-      "$1::uuid, $2::text[], $3::uuid[], $4::geometry[], $5::integer[], $6::jsonb[]",
+      "$1::uuid, $2::uuid, $3::text[], $4::uuid[], $5::geometry[], $6::integer[], $7::jsonb[]",
       [
-        dump_uuid(release_id),
+        dump_uuid(run_id),
+        dump_uuid(executor_id),
         Enum.map(boundaries, &Map.fetch!(&1, :area_key)),
         Enum.map(boundaries, &(&1 |> Map.fetch!(:source_release_id) |> dump_uuid())),
         Enum.map(boundaries, &Map.fetch!(&1, :geometry)),
         Enum.map(boundaries, &Map.get(&1, :display_tier, 0)),
         Enum.map(boundaries, &Map.get(&1, :source_properties, %{}))
-      ]
+      ],
+      long_query_opts(opts)
     )
   end
 
   @doc "Asserts a relation between two areas within a release."
-  @spec put_relation(Context.t(), Ecto.UUID.t(), map()) :: :ok
-  def put_relation(%Context{} = context, release_id, attrs) do
-    void(context, "put_relation", "$1, $2, $3, $4", [
-      dump_uuid(release_id),
+  @spec put_relation(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) :: :ok
+  def put_relation(%Context{} = context, run_id, executor_id, attrs) do
+    void(context, "put_relation", "$1, $2, $3, $4, $5", [
+      dump_uuid(run_id),
+      dump_uuid(executor_id),
       Map.fetch!(attrs, :parent_area_key),
       Map.fetch!(attrs, :child_area_key),
       Map.fetch!(attrs, :relation_type)
@@ -296,26 +382,36 @@ defmodule GeoGenius.Catalog do
 
   Each map carries `:parent_area_key`, `:child_area_key`, and
   `:relation_type`. A pair asserted twice in one batch keeps the last
-  `:relation_type`, the way two `put_relation/3` calls would leave it.
+  `:relation_type`, the way two `put_relation/4` calls would leave it.
 
   Returns `:ok` without touching the database for an empty list, having
   validated `release_id` first.
   """
-  @spec put_relation_many(Context.t(), Ecto.UUID.t(), [map()]) :: :ok
-  def put_relation_many(context, release_id, relations)
+  @spec put_relation_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()]) :: :ok
+  @spec put_relation_many(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), [map()], keyword()) :: :ok
+  def put_relation_many(context, run_id, executor_id, relations, opts \\ [])
 
-  def put_relation_many(%Context{}, release_id, []) do
-    dump_uuid(release_id)
+  def put_relation_many(%Context{}, run_id, executor_id, [], _opts) do
+    dump_uuid(run_id)
+    dump_uuid(executor_id)
     :ok
   end
 
-  def put_relation_many(%Context{} = context, release_id, relations) do
-    void(context, "put_relation_many", "$1, $2, $3, $4", [
-      dump_uuid(release_id),
-      Enum.map(relations, &Map.fetch!(&1, :parent_area_key)),
-      Enum.map(relations, &Map.fetch!(&1, :child_area_key)),
-      Enum.map(relations, &Map.fetch!(&1, :relation_type))
-    ])
+  def put_relation_many(%Context{} = context, run_id, executor_id, relations, opts)
+      when is_list(relations) do
+    void(
+      context,
+      "put_relation_many",
+      "$1, $2, $3, $4, $5",
+      [
+        dump_uuid(run_id),
+        dump_uuid(executor_id),
+        Enum.map(relations, &Map.fetch!(&1, :parent_area_key)),
+        Enum.map(relations, &Map.fetch!(&1, :child_area_key)),
+        Enum.map(relations, &Map.fetch!(&1, :relation_type))
+      ],
+      long_query_opts(opts)
+    )
   end
 
   @doc """
@@ -327,9 +423,15 @@ defmodule GeoGenius.Catalog do
   caller raises `:timeout` past DBConnection's fifteen-second default for a
   release large enough to need it.
   """
-  @spec rebuild_relations(Context.t(), Ecto.UUID.t(), keyword()) :: integer()
-  def rebuild_relations(%Context{} = context, release_id, opts \\ []) do
-    value(context, "rebuild_relations", "$1", [dump_uuid(release_id)], opts)
+  @spec rebuild_relations(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: integer()
+  def rebuild_relations(%Context{} = context, run_id, executor_id, opts \\ []) do
+    value(
+      context,
+      "rebuild_relations",
+      "$1, $2",
+      [dump_uuid(run_id), dump_uuid(executor_id)],
+      long_query_opts(opts)
+    )
   end
 
   @doc """
@@ -342,7 +444,32 @@ defmodule GeoGenius.Catalog do
   """
   @spec verify_release(Context.t(), Ecto.UUID.t(), keyword()) :: map()
   def verify_release(%Context{} = context, release_id, opts \\ []) do
-    value(context, "verify_release", "$1", [dump_uuid(release_id)], opts)
+    value(context, "verify_release", "$1", [dump_uuid(release_id)], long_query_opts(opts))
+  end
+
+  @doc "Checks the current leased import attempt's structural invariants."
+  @spec verify_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: map()
+  def verify_import(%Context{} = context, run_id, executor_id, opts \\ []) do
+    value(
+      context,
+      "verify_import",
+      "$1, $2",
+      [dump_uuid(run_id), dump_uuid(executor_id)],
+      long_query_opts(opts)
+    )
+  end
+
+  @doc "Completes the verified current import attempt without publishing its release."
+  @spec complete_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          Ecto.UUID.t()
+  def complete_import(%Context{} = context, run_id, executor_id, metrics, opts \\ []) do
+    scalar(
+      context,
+      "complete_import",
+      "$1, $2, $3",
+      [dump_uuid(run_id), dump_uuid(executor_id), metrics],
+      long_query_opts(opts)
+    )
   end
 
   @doc """
@@ -357,7 +484,19 @@ defmodule GeoGenius.Catalog do
   """
   @spec publish_release(Context.t(), Ecto.UUID.t(), keyword()) :: Ecto.UUID.t()
   def publish_release(%Context{} = context, release_id, opts \\ []) do
-    scalar(context, "publish_release", "$1", [dump_uuid(release_id)], opts)
+    scalar(context, "publish_release", "$1", [dump_uuid(release_id)], long_query_opts(opts))
+  end
+
+  @doc "Publishes the candidate owned by the current leased import attempt."
+  @spec publish_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: Ecto.UUID.t()
+  def publish_import(%Context{} = context, run_id, executor_id, opts \\ []) do
+    scalar(
+      context,
+      "publish_import",
+      "$1, $2",
+      [dump_uuid(run_id), dump_uuid(executor_id)],
+      long_query_opts(opts)
+    )
   end
 
   @doc """
@@ -371,7 +510,13 @@ defmodule GeoGenius.Catalog do
   """
   @spec rollback_publication(Context.t(), String.t()) :: Ecto.UUID.t() | nil
   def rollback_publication(%Context{} = context, collection_key) do
-    scalar(context, "rollback_publication", "$1", [collection_key])
+    scalar(
+      context,
+      "rollback_publication",
+      "$1",
+      [collection_key],
+      no_checkout_retry_opts([])
+    )
   end
 
   @doc """
@@ -384,7 +529,13 @@ defmodule GeoGenius.Catalog do
   """
   @spec retire_releases(Context.t(), String.t(), pos_integer()) :: non_neg_integer()
   def retire_releases(%Context{} = context, collection_key, keep) do
-    value(context, "retire_releases", "$1, $2", [collection_key, keep])
+    value(
+      context,
+      "retire_releases",
+      "$1, $2",
+      [collection_key, keep],
+      no_checkout_retry_opts([])
+    )
   end
 
   @doc "The currently published release for a collection, or `nil` if none is published."
@@ -393,44 +544,60 @@ defmodule GeoGenius.Catalog do
     scalar(context, "published_release", "$1", [collection_key])
   end
 
-  @doc """
-  Claims a fresh or existing import run for a release, returning its id.
+  @doc "Atomically registers or diagnoses one exact manifest and its import attempt."
+  @spec prepare_import(Context.t(), map(), map()) :: map()
+  def prepare_import(%Context{} = context, manifest, claim) do
+    candidate_lifecycle(context, "prepare_import", [manifest, claim])
+  end
 
-  `:stale_after_seconds` is a plain number rather than an interval string, so
-  a caller holds an integer instead of assembling `"\#{n} seconds"` at every
-  call site -- the one place that string gets built is here.
-  """
-  @spec begin_or_resume_import(Context.t(), Ecto.UUID.t(), map()) :: Ecto.UUID.t()
-  def begin_or_resume_import(%Context{} = context, release_id, attrs) do
-    stale_after_seconds = Map.get(attrs, :stale_after_seconds, 900)
+  @doc "Atomically resets one failed latest attempt to an exact replacement manifest."
+  @spec retry_failed(Context.t(), Ecto.UUID.t(), map(), map()) :: map()
+  def retry_failed(%Context{} = context, failed_run_id, manifest, claim) do
+    candidate_lifecycle(context, "retry_failed", [dump_uuid(failed_run_id), manifest, claim])
+  end
 
-    # `$4` is left untyped rather than cast directly (`$4::interval`), because
-    # a direct cast on a bare parameter fixes its expected wire type to
-    # interval and Postgrex has no interval literal to encode a plain number
-    # as. Concatenating with a text literal first types `$4` as text instead,
-    # so a caller's integer seconds still crosses as an ordinary bound value.
-    scalar(context, "begin_or_resume_import", "$1, $2, $3, ($4 || ' seconds')::interval", [
-      dump_uuid(release_id),
-      Map.fetch!(attrs, :owner),
-      Map.fetch!(attrs, :runner_backend),
-      to_string(stale_after_seconds)
-    ])
+  @doc "Atomically claims the one executor allowed to run a pending import attempt."
+  @spec claim_import_execution(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          :claimed | :occupied | :completed | :failed | :missing | :superseded
+  def claim_import_execution(%Context{} = context, run_id, executor_id) do
+    params = [dump_uuid(run_id), dump_uuid(executor_id)]
+
+    result =
+      value(context, "claim_import_execution", "$1, $2", params, no_checkout_retry_opts([]))
+
+    case Map.fetch(@claim_results, result) do
+      {:ok, claim_result} ->
+        claim_result
+
+      :error ->
+        raise GeoGenius.CatalogError,
+          function: "claim_import_execution",
+          reason: {:unexpected_result, result}
+    end
   end
 
   @doc "Merges a progress patch into a run's active lease."
-  @spec heartbeat_import(Context.t(), Ecto.UUID.t(), map()) :: :ok
-  def heartbeat_import(%Context{} = context, run_id, progress_patch) do
-    void(context, "heartbeat_import", "$1, $2", [dump_uuid(run_id), progress_patch])
+  @spec heartbeat_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) :: :ok
+  def heartbeat_import(%Context{} = context, run_id, executor_id, progress_patch) do
+    void(
+      context,
+      "heartbeat_import",
+      "$1, $2, $3",
+      [dump_uuid(run_id), dump_uuid(executor_id), progress_patch],
+      no_checkout_retry_opts([])
+    )
   end
 
   @doc "Advances a run to its next status, merging a metrics patch into its stage metrics."
-  @spec advance_import(Context.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
-  def advance_import(%Context{} = context, run_id, next_status, metrics_patch) do
-    void(context, "advance_import", "$1, $2, $3", [
-      dump_uuid(run_id),
-      next_status,
-      metrics_patch
-    ])
+  @spec advance_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), String.t(), map()) :: :ok
+  def advance_import(%Context{} = context, run_id, executor_id, next_status, metrics_patch) do
+    void(
+      context,
+      "advance_import",
+      "$1, $2, $3, $4",
+      [dump_uuid(run_id), dump_uuid(executor_id), next_status, metrics_patch],
+      no_checkout_retry_opts([])
+    )
   end
 
   @doc """
@@ -439,9 +606,15 @@ defmodule GeoGenius.Catalog do
   Raises 55000 for a run that has completed. Idempotent on one that already
   failed.
   """
-  @spec fail_import(Context.t(), Ecto.UUID.t(), map()) :: :ok
-  def fail_import(%Context{} = context, run_id, error_detail) do
-    void(context, "fail_import", "$1, $2", [dump_uuid(run_id), error_detail])
+  @spec fail_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), map()) :: :ok
+  def fail_import(%Context{} = context, run_id, executor_id, error_detail) do
+    void(
+      context,
+      "fail_import",
+      "$1, $2, $3",
+      [dump_uuid(run_id), dump_uuid(executor_id), error_detail],
+      no_checkout_retry_opts([])
+    )
   end
 
   @doc "One import run, or nil when no run carries that id."
@@ -492,7 +665,7 @@ defmodule GeoGenius.Catalog do
   Records an artifact belonging to a source release, returning its id.
 
   `:expected_sha256` and `:expected_bytes` come from the reviewed manifest and
-  are what `record_artifact_observation/3` later checks a download against.
+  are what `record_artifact_observation/5` later checks a download against.
   """
   @spec put_artifact(Context.t(), Ecto.UUID.t(), map()) :: Ecto.UUID.t()
   def put_artifact(%Context{} = context, source_release_id, attrs) do
@@ -512,9 +685,17 @@ defmodule GeoGenius.Catalog do
   Records what a download actually produced, checking it against the
   artifact's manifest expectation.
   """
-  @spec record_artifact_observation(Context.t(), Ecto.UUID.t(), map()) :: :ok
-  def record_artifact_observation(%Context{} = context, artifact_id, attrs) do
-    void(context, "record_artifact_observation", "$1, $2, $3", [
+  @spec record_artifact_observation(
+          Context.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          map()
+        ) :: :ok
+  def record_artifact_observation(%Context{} = context, run_id, executor_id, artifact_id, attrs) do
+    void(context, "record_artifact_observation", "$1, $2, $3, $4, $5", [
+      dump_uuid(run_id),
+      dump_uuid(executor_id),
       dump_uuid(artifact_id),
       Map.fetch!(attrs, :observed_sha256),
       Map.fetch!(attrs, :observed_bytes)
@@ -544,12 +725,21 @@ defmodule GeoGenius.Catalog do
     ])
   end
 
+  @doc "Attaches one immutable artifact definition to the exact release that selected it."
+  @spec attach_artifact(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: :ok
+  def attach_artifact(%Context{} = context, release_id, artifact_id) do
+    void(context, "attach_artifact", "$1, $2", [
+      dump_uuid(release_id),
+      dump_uuid(artifact_id)
+    ])
+  end
+
   @doc """
   The manifest a release was opened with, as a decoded map.
 
-  The pipeline rebuilds its manifest from here rather than re-reading the file,
-  so a resumed or retried run uses the document the release was opened with
-  even if the file on disk has since changed.
+  This is the release's current declaration. Import execution instead rebuilds
+  from `import_run.manifest`, preserving the exact document selected by that
+  attempt even when a corrected retry replaces the candidate declaration.
   """
   @spec release_manifest(Context.t(), Ecto.UUID.t()) :: map() | nil
   def release_manifest(%Context{} = context, release_id) do
@@ -583,6 +773,17 @@ defmodule GeoGenius.Catalog do
     read(context, sql, [dump_uuid(release_id)], "release_artifacts", &rows_to_maps/1)
   end
 
+  @doc "The exact artifact definitions and observations for one import attempt."
+  @spec run_artifacts(Context.t(), Ecto.UUID.t()) :: [map()]
+  def run_artifacts(%Context{} = context, run_id) do
+    sql =
+      "SELECT run_id::text AS run_id, #{@artifact_columns} " <>
+        "FROM \"#{context.prefix}\".run_artifacts " <>
+        "WHERE run_id = $1 ORDER BY logical_name"
+
+    read(context, sql, [dump_uuid(run_id)], "run_artifacts", &rows_to_maps/1)
+  end
+
   @doc """
   The key of the collection a release belongs to, or `nil` for a release id the
   catalog does not carry.
@@ -607,15 +808,21 @@ defmodule GeoGenius.Catalog do
   end
 
   @doc "Creates a release's staging table, returning its name."
-  @spec create_staging(Context.t(), Ecto.UUID.t()) :: String.t()
-  def create_staging(%Context{} = context, run_id) do
-    value(context, "create_staging", "$1", [dump_uuid(run_id)])
+  @spec create_staging(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: String.t()
+  def create_staging(%Context{} = context, run_id, executor_id) do
+    value(context, "create_staging", "$1, $2", [dump_uuid(run_id), dump_uuid(executor_id)])
   end
 
-  @doc "Drops a run's staging table, if it exists."
+  @doc "Drops a terminal or orphaned run's staging table, if it exists."
   @spec drop_staging(Context.t(), Ecto.UUID.t()) :: :ok
   def drop_staging(%Context{} = context, run_id) do
     void(context, "drop_staging", "$1", [dump_uuid(run_id)])
+  end
+
+  @doc "Drops the current executor's active staging table, if it exists."
+  @spec drop_staging(Context.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: :ok
+  def drop_staging(%Context{} = context, run_id, executor_id) do
+    void(context, "drop_staging", "$1, $2", [dump_uuid(run_id), dump_uuid(executor_id)])
   end
 
   @doc """
@@ -626,7 +833,46 @@ defmodule GeoGenius.Catalog do
   """
   @spec analyze_release(Context.t(), Ecto.UUID.t(), keyword()) :: :ok
   def analyze_release(%Context{} = context, release_id, opts \\ []) do
-    void(context, "analyze_release", "$1", [dump_uuid(release_id)], opts)
+    void(context, "analyze_release", "$1", [dump_uuid(release_id)], long_query_opts(opts))
+  end
+
+  @doc "Runs ANALYZE against the candidate owned by the current leased import attempt."
+  @spec analyze_import(Context.t(), Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: :ok
+  def analyze_import(%Context{} = context, run_id, executor_id, opts \\ []) do
+    void(
+      context,
+      "analyze_import",
+      "$1, $2",
+      [dump_uuid(run_id), dump_uuid(executor_id)],
+      long_query_opts(opts)
+    )
+  end
+
+  defp long_query_opts(opts), do: no_checkout_retry_opts(opts)
+
+  defp no_checkout_retry_opts(opts), do: Keyword.put(opts, :checkout_retries, 0)
+
+  defp candidate_lifecycle(%Context{} = context, function, params) do
+    placeholders =
+      params |> Enum.with_index(1) |> Enum.map_join(", ", fn {_value, index} -> "$#{index}" end)
+
+    sql =
+      "SELECT decision, reason, release_id::text, run_id::text, attempt " <>
+        "FROM \"#{context.prefix}\".#{function}(#{placeholders})"
+
+    case run(context.repo, sql, params, no_checkout_retry_opts([])) do
+      {:ok, %Postgrex.Result{rows: [[decision, reason, release_id, run_id, attempt]]}} ->
+        %{
+          decision: decision,
+          reason: reason,
+          release_id: release_id,
+          run_id: run_id,
+          attempt: attempt
+        }
+
+      {:error, reason} ->
+        raise GeoGenius.CatalogError, function: function, reason: reason
+    end
   end
 
   # Every uuid is projected as text so it crosses as the hyphenated string the
@@ -637,30 +883,30 @@ defmodule GeoGenius.Catalog do
       "SELECT #{function}::text AS #{function} " <>
         "FROM \"#{context.prefix}\".#{function}(#{placeholders}) AS #{function}"
 
-    single(context.repo, sql, params, function, opts)
+    single(context.repo, sql, params, function, no_checkout_retry_opts(opts))
   end
 
   # The plural writes return one id per input position as a uuid[]. Casting the
   # whole array to text[] in SQL means Postgrex decodes it as the list of
   # hyphenated strings every other id crosses this module as, rather than as a
   # list of raw sixteen-byte binaries.
-  defp scalar_list(%Context{} = context, function, placeholders, params, opts \\ []) do
+  defp scalar_list(%Context{} = context, function, placeholders, params, opts) do
     sql =
       "SELECT #{function}::text[] AS #{function} " <>
         "FROM \"#{context.prefix}\".#{function}(#{placeholders}) AS #{function}"
 
-    single(context.repo, sql, params, function, opts)
+    single(context.repo, sql, params, function, no_checkout_retry_opts(opts))
   end
 
   defp value(%Context{} = context, function, placeholders, params, opts \\ []) do
     sql = "SELECT \"#{context.prefix}\".#{function}(#{placeholders}) AS result"
-    single(context.repo, sql, params, function, opts)
+    single(context.repo, sql, params, function, no_checkout_retry_opts(opts))
   end
 
   defp void(%Context{} = context, function, placeholders, params, opts \\ []) do
     sql = "SELECT \"#{context.prefix}\".#{function}(#{placeholders})"
 
-    case run(context.repo, sql, params, opts) do
+    case run(context.repo, sql, params, no_checkout_retry_opts(opts)) do
       {:ok, _result} -> :ok
       {:error, reason} -> raise GeoGenius.CatalogError, function: function, reason: reason
     end

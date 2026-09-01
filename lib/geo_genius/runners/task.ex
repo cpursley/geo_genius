@@ -25,26 +25,23 @@ defmodule GeoGenius.Runners.Task do
   A configured name takes precedence over the library's own supervisor
   whether or not the configured one is actually running -- a host that set
   the key gets the gap named rather than silently redirected to the
-  library's default. `enqueue/3` never falls back to a bare `spawn/1`: an
-  unsupervised process that dies between phases would leave a run nothing
-  can fail, recoverable only once its lease goes stale.
+  library's default. `enqueue/3` never falls back to a bare `spawn/1`, which
+  would provide no task-supervisor lifecycle or shutdown ordering for a host
+  to inspect or control.
 
-  Supervision here does not make a dying run fail sooner -- a supervised
-  task that dies between phases leaves the run exactly as stale as an
-  unsupervised process would, and it is the lease, not the supervisor, that
-  eventually reclaims it. A `Task` does not trap exits, so it dies the
-  instant its supervisor is told to stop, wherever it happens to be in a
-  phase; the standard shutdown timeout is never actually spent, and nothing
-  here should be made to trap exits, since a trapping task would need to
-  finish or abort a phase inside that window and no phase can. What
-  supervision buys is visibility -- `Task.Supervisor.children/1` lists the
-  pids of tasks currently running under a supervisor, though only as bare
-  pids, not run ids, and, under the override, potentially mixed with
-  unrelated tasks a host started under the same name; a host wanting to see
-  actual runs queries `import_run` (or `GeoGenius.status/2`) instead -- and,
-  for a host that placed its own supervisor after Repo, a shutdown that
-  kills a running task while the Repo can still be reached rather than
-  after it is already gone.
+  A separate package-owned execution guardian monitors the task. If the task
+  dies while the Repo remains reachable, the guardian records a durable
+  failure with the exact claimed executor; it never restarts the task or
+  transfers execution. A `Task` does not trap exits, so it dies wherever it
+  happens to be when its supervisor stops and cannot clean up its staging
+  table. A host-owned supervisor placed after Repo lets the guardian record
+  that death before Repo shuts down. With the package-owned default, Repo may
+  already be gone by the time the dependency application's task dies, and
+  whole-node loss leaves no guardian alive; those cases remain stale,
+  operator-visible abandoned attempts. `Task.Supervisor.children/1` lists
+  currently running task pids, though only as bare pids and, under a shared
+  host override, potentially mixed with unrelated tasks. Query `import_run`
+  (or `GeoGenius.status/2`) for actual import state.
   """
 
   @behaviour GeoGenius.Runner
@@ -80,19 +77,20 @@ defmodule GeoGenius.Runners.Task do
   Starts the import under the resolved `Task.Supervisor` and returns
   immediately.
 
-  Returns `{:error, reason}` naming the configured name when it is set but
-  nothing is registered under it, naming `GeoGenius.TaskSupervisor` in the
-  same way should that library-started supervisor ever not be running, or
-  naming a live supervisor's refusal to start the child (a host-configured
-  `:max_children` cap, say). Never falls back to an unsupervised process,
-  and never reports `:ok` for a child that was not started.
+  Returns `{:error, {:not_enqueued, reason}}` naming the configured name when
+  it is set but nothing is registered under it, naming
+  `GeoGenius.TaskSupervisor` in the same way should that library-started
+  supervisor ever not be running, or naming a live supervisor's refusal to
+  start the child (a host-configured `:max_children` cap, say). Never falls
+  back to an unsupervised process, and never reports `:ok` for a child that
+  was not started.
   """
   @spec enqueue(GeoGenius.Context.t(), Ecto.UUID.t(), Runner.args()) ::
-          :ok | {:error, String.t()}
+          :ok | {:error, Runner.enqueue_error()}
   def enqueue(context, run_id, args) do
     case resolve() do
       {:ok, supervisor} -> start(supervisor, context, run_id, args)
-      {:error, reason} -> {:error, reason}
+      {:error, reason} -> {:error, {:not_enqueued, reason}}
     end
   end
 
@@ -102,8 +100,7 @@ defmodule GeoGenius.Runners.Task do
   # started, so nothing will ever record this run's outcome, and a caller
   # told :ok would poll a run that stays pending forever.
   defp start(supervisor, context, run_id, args) do
-    opts = [publish: Runner.publish?(args), stale_after_seconds: Runner.stale_after_seconds(args)]
-    fun = fn -> Pipeline.execute(context, run_id, opts) end
+    fun = fn -> execute_supervised(context, run_id, args) end
 
     case TaskSupervisor.start_child(supervisor, fun) do
       {:ok, pid} when is_pid(pid) ->
@@ -111,8 +108,25 @@ defmodule GeoGenius.Runners.Task do
 
       {:error, reason} ->
         {:error,
-         "Task.Supervisor.start_child/2 could not start the import under " <>
-           "#{inspect(supervisor)}: #{inspect(reason)}"}
+         {:not_enqueued,
+          "Task.Supervisor.start_child/2 could not start the import under " <>
+            "#{inspect(supervisor)}: #{inspect(reason)}"}}
+    end
+  end
+
+  defp execute_supervised(context, run_id, args) do
+    case Pipeline.execute(context, run_id, Runner.pipeline_opts(args)) do
+      {:ok, _run} ->
+        :ok
+
+      {:noop, _run} ->
+        :ok
+
+      {:error, %GeoGenius.ImportRun{}} ->
+        :ok
+
+      {:error, {:unrecorded, _certainty, reason}} ->
+        raise "GeoGenius import run #{run_id} ended without a recorded outcome: #{reason}"
     end
   end
 

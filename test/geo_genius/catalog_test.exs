@@ -2,7 +2,17 @@ defmodule GeoGenius.CatalogTest do
   use ExUnit.Case, async: false
 
   alias GeoGenius.AppEnv
-  alias GeoGenius.{Catalog, Context, GraphFixture, TestRepo}
+
+  alias GeoGenius.{
+    Catalog,
+    Context,
+    GraphFixture,
+    ImportFixture,
+    Manifest,
+    Registration,
+    TestRepo
+  }
+
   alias GeoGenius.ImportRun
 
   setup do
@@ -18,13 +28,85 @@ defmodule GeoGenius.CatalogTest do
   end
 
   defp open_demo(context) do
-    Catalog.upsert_collection(context, %{key: "demo", name: "Demo", description: nil})
+    prepare_demo(context).release_id
+  end
 
-    Catalog.open_release(context, "demo", %{
-      release_key: "r1",
-      manifest: %{"release" => "r1"},
-      source_date: ~D[2026-01-15]
-    })
+  defp prepare_demo(context) do
+    {:ok, manifest} = Manifest.from_map(demo_manifest())
+
+    ImportFixture.prepare!(context, manifest,
+      owner: "catalog-test",
+      runner_backend: "test",
+      stale_after_seconds: 300
+    )
+  end
+
+  defp import_run_id(context, release_id, status \\ nil) do
+    run =
+      context
+      |> Catalog.import_runs("demo")
+      |> Enum.find(&(&1.release_id == release_id))
+
+    if status && run.status != status do
+      :ok =
+        ImportFixture.advance_to!(
+          context,
+          run.run_id,
+          executor_id(context, run.run_id),
+          status
+        )
+    end
+
+    run.run_id
+  end
+
+  defp executor_id(context, run_id) do
+    case Catalog.import_run(context, run_id) do
+      %ImportRun{executor_id: nil} -> ImportFixture.claim_executor!(context, run_id)
+      %ImportRun{executor_id: executor_id} -> executor_id
+    end
+  end
+
+  defp demo_manifest do
+    %{
+      "collection" => "demo",
+      "release" => "r1",
+      "collection_name" => "Demo",
+      "description" => nil,
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "source_date" => "2026-01-15",
+      "authorities" => [%{"key" => "a", "name" => "A"}],
+      "area_types" => [
+        %{"key" => "t", "rank" => 10, "requires_geometry" => false},
+        %{"key" => "outer", "rank" => 20, "requires_geometry" => false},
+        %{"key" => "inner", "rank" => 30, "requires_geometry" => false},
+        %{"key" => "u", "rank" => 40, "requires_geometry" => false}
+      ],
+      "sources" => [
+        %{
+          "source_key" => "demo:fixture",
+          "provider" => "geojson",
+          "license" => "CC0",
+          "attribution" => nil,
+          "release_key" => "v1",
+          "source_date" => nil,
+          "artifacts" => [
+            %{
+              "logical_name" => "fixture.geojson",
+              "url" => "https://example.test/fixture.geojson",
+              "operator_supplied" => false,
+              "format" => "geojson",
+              "required" => true,
+              "sha256" => String.duplicate("f", 64),
+              "bytes" => 1,
+              "members" => []
+            }
+          ]
+        }
+      ],
+      "options" => %{"area_type" => "t", "code_property" => "code"}
+    }
   end
 
   test "opens a release and returns a hyphenated uuid string", %{context: context} do
@@ -43,7 +125,19 @@ defmodule GeoGenius.CatalogTest do
   end
 
   test "records a source, a vintage, and an artifact", %{context: context} do
-    release_id = open_demo(context)
+    {:ok, manifest} =
+      Manifest.from_map(
+        artifact_demo_manifest(
+          "demo:src",
+          "areas.geojson",
+          "https://example.test/areas.geojson",
+          String.duplicate("a", 64),
+          1024
+        )
+      )
+
+    candidate = ImportFixture.prepare!(context, manifest, owner: "catalog-test")
+    release_id = candidate.release_id
 
     Catalog.upsert_source(context, "demo", %{
       source_key: "demo:src",
@@ -64,11 +158,11 @@ defmodule GeoGenius.CatalogTest do
     assert stored_provider == "geojson"
     assert stored_license == "CC0"
 
-    source_release_id =
+    _source_release_id =
       Catalog.upsert_source_release(context, "demo", %{
         source_key: "demo:src",
-        release_key: "v1",
-        source_date: ~D[2026-01-15],
+        release_key: "v2",
+        source_date: ~D[2026-02-15],
         metadata: %{"attribution" => "Demo"}
       })
 
@@ -83,41 +177,81 @@ defmodule GeoGenius.CatalogTest do
         WHERE source_id = (SELECT id FROM geo_genius.source WHERE source_key = $1)
           AND release_key = $2
         """,
-        ["demo:src", "v1"]
+        ["demo:src", "v2"]
       )
 
-    assert stored_source_date == ~D[2026-01-15]
+    assert stored_source_date == ~D[2026-02-15]
     assert stored_metadata == %{"attribution" => "Demo"}
 
+    selected_source_release_id =
+      Catalog.upsert_source_release(context, "demo", %{
+        source_key: "demo:src",
+        release_key: "v1",
+        source_date: nil,
+        metadata: %{}
+      })
+
     artifact_id =
-      Catalog.put_artifact(context, source_release_id, %{
+      Catalog.put_artifact(context, selected_source_release_id, %{
         logical_name: "areas.geojson",
         url: "https://example.test/areas.geojson",
         operator_supplied: false,
         format: "geojson",
         expected_sha256: String.duplicate("a", 64),
         expected_bytes: 1024,
-        metadata: %{"required" => true}
+        metadata: %{"members" => [], "required" => true}
       })
 
     assert {:ok, _} = Ecto.UUID.cast(artifact_id)
 
+    Catalog.attach_source_release(context, release_id, selected_source_release_id)
+    Catalog.attach_artifact(context, release_id, artifact_id)
+
+    run_id = candidate.run_id
+    executor_id = executor_id(context, run_id)
+    Catalog.advance_import(context, run_id, executor_id, "downloading", %{})
+
     assert :ok =
-             Catalog.record_artifact_observation(context, artifact_id, %{
+             Catalog.record_artifact_observation(context, run_id, executor_id, artifact_id, %{
                observed_sha256: String.duplicate("a", 64),
                observed_bytes: 1024
              })
+
+    ImportFixture.advance_to!(context, run_id, executor_id, "normalizing")
+    Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "c"})
+
+    Catalog.put_area_in_release(context, run_id, executor_id, "a:t:c", %{
+      centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
+      attributes: %{}
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id, "a:t:c", %{
+      name: "Area",
+      kind: "official",
+      locale: nil
+    })
+
+    ImportFixture.advance_to!(context, run_id, executor_id, "verifying")
+    recording = %{context | repo: GeoGenius.RecordingRepo}
+    assert release_id == Catalog.complete_import(recording, run_id, executor_id, %{})
+
+    complete_opts =
+      GeoGenius.RecordingRepo.options_for(
+        GeoGenius.RecordingRepo.recorded(),
+        "complete_import"
+      )
+
+    assert complete_opts[:checkout_retries] == 0,
+           "complete_import permits an ambiguous retry"
 
     # A wrapper that transposes two same-typed arguments (for example
     # `logical_name` and `format`, both text) would still satisfy the
     # assertions above, since `record_artifact_observation` only checks the
     # sha256/byte pair. Reading the artifact back through the release closes
     # that gap by checking every field landed where it belongs.
-    Catalog.attach_source_release(context, release_id, source_release_id)
-
     assert [artifact] = Catalog.release_artifacts(context, release_id)
     assert artifact["artifact_id"] == artifact_id
-    assert artifact["source_release_id"] == source_release_id
+    assert artifact["source_release_id"] == selected_source_release_id
     assert artifact["logical_name"] == "areas.geojson"
     assert artifact["url"] == "https://example.test/areas.geojson"
     assert artifact["operator_supplied"] == false
@@ -126,12 +260,24 @@ defmodule GeoGenius.CatalogTest do
     assert artifact["expected_bytes"] == 1024
     assert artifact["observed_sha256"] == String.duplicate("a", 64)
     assert artifact["observed_bytes"] == 1024
-    assert artifact["metadata"] == %{"required" => true}
+    assert artifact["metadata"] == %{"members" => [], "required" => true}
   end
 
   test "a contradicting observation raises CatalogError carrying the driver error",
        %{context: context} do
-    open_demo(context)
+    {:ok, manifest} =
+      Manifest.from_map(
+        artifact_demo_manifest(
+          "s",
+          "a.geojson",
+          "https://example.test/a",
+          String.duplicate("a", 64),
+          10
+        )
+      )
+
+    candidate = ImportFixture.prepare!(context, manifest, owner: "catalog-test")
+    release_id = candidate.release_id
 
     Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
 
@@ -151,12 +297,19 @@ defmodule GeoGenius.CatalogTest do
         format: "geojson",
         expected_sha256: String.duplicate("a", 64),
         expected_bytes: 10,
-        metadata: %{}
+        metadata: %{"members" => [], "required" => true}
       })
+
+    Catalog.attach_source_release(context, release_id, source_release_id)
+    Catalog.attach_artifact(context, release_id, artifact_id)
+
+    run_id = candidate.run_id
+    executor_id = executor_id(context, run_id)
+    Catalog.advance_import(context, run_id, executor_id, "downloading", %{})
 
     error =
       assert_raise GeoGenius.CatalogError, fn ->
-        Catalog.record_artifact_observation(context, artifact_id, %{
+        Catalog.record_artifact_observation(context, run_id, executor_id, artifact_id, %{
           observed_sha256: String.duplicate("b", 64),
           observed_bytes: 11
         })
@@ -169,12 +322,7 @@ defmodule GeoGenius.CatalogTest do
   test "claims a run and reads it back through the status view", %{context: context} do
     release_id = open_demo(context)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    run_id = import_run_id(context, release_id)
 
     assert %ImportRun{} = run = Catalog.import_run(context, run_id)
     assert run.run_id == run_id
@@ -182,10 +330,172 @@ defmodule GeoGenius.CatalogTest do
     assert run.collection_key == "demo"
     assert run.release_key == "r1"
     assert run.status == "pending"
-    assert run.owner == "worker-1"
+    assert run.owner == "catalog-test"
     assert run.runner_backend == "test"
     assert run.attempt == 1
     assert run.progress == %{}
+  end
+
+  test "claims one executor and reports execution ownership through the status view",
+       %{context: context} do
+    candidate = prepare_demo(context)
+    executor_id = Ecto.UUID.generate()
+
+    assert Catalog.claim_import_execution(context, candidate.run_id, executor_id) == :claimed
+
+    assert Catalog.claim_import_execution(context, candidate.run_id, executor_id) == :claimed
+
+    run = Catalog.import_run(context, candidate.run_id)
+    assert run.executor_id == executor_id
+    assert %DateTime{} = run.execution_started_at
+
+    assert Catalog.claim_import_execution(context, candidate.run_id, Ecto.UUID.generate()) ==
+             :occupied
+  end
+
+  test "lifecycle control-plane mutations disable connection checkout retries",
+       %{context: context} do
+    recording = %{context | repo: GeoGenius.RecordingRepo}
+    candidate = prepare_demo(recording)
+    executor_id = Ecto.UUID.generate()
+
+    assert Catalog.claim_import_execution(recording, candidate.run_id, executor_id) == :claimed
+    assert :ok = Catalog.heartbeat_import(recording, candidate.run_id, executor_id, %{})
+
+    assert :ok =
+             Catalog.advance_import(recording, candidate.run_id, executor_id, "downloading", %{})
+
+    assert :ok =
+             Catalog.fail_import(recording, candidate.run_id, executor_id, %{
+               "reason" => "retry-option fixture"
+             })
+
+    assert %{decision: "enqueue", reason: "retried"} =
+             Catalog.retry_failed(
+               recording,
+               candidate.run_id,
+               demo_manifest(),
+               %{
+                 "owner" => "retry-option-fixture",
+                 "runner_backend" => "test",
+                 "stale_after_seconds" => 300
+               }
+             )
+
+    assert Catalog.rollback_publication(recording, "missing_control_plane_collection") == nil
+
+    assert_raise GeoGenius.CatalogError, fn ->
+      Catalog.retire_releases(recording, "missing_control_plane_collection", 1)
+    end
+
+    recorded = GeoGenius.RecordingRepo.recorded()
+
+    for function <- ~w(
+      prepare_import
+      retry_failed
+      claim_import_execution
+      heartbeat_import
+      advance_import
+      fail_import
+      rollback_publication
+      retire_releases
+    ) do
+      opts = GeoGenius.RecordingRepo.options_for(recorded, function)
+      assert opts != nil, "no query recorded for #{function}"
+      assert opts[:checkout_retries] == 0, "#{function} permits an ambiguous retry"
+    end
+  end
+
+  test "scalar catalog mutations disable connection checkout retries", %{context: context} do
+    recording = %{context | repo: GeoGenius.RecordingRepo}
+    candidate = prepare_demo(recording)
+    executor_id = Ecto.UUID.generate()
+    area_key = "demo_auth:place:A"
+
+    assert Catalog.claim_import_execution(recording, candidate.run_id, executor_id) == :claimed
+
+    Enum.each(
+      [
+        fn ->
+          Catalog.upsert_collection(recording, %{
+            key: "retry_policy_collection",
+            name: "Retry Policy"
+          })
+        end,
+        fn ->
+          Catalog.put_area_name(recording, candidate.run_id, executor_id, area_key, %{
+            name: "Alpha",
+            kind: "official"
+          })
+        end,
+        fn ->
+          Catalog.put_area_code(recording, candidate.run_id, executor_id, area_key, %{
+            code_type: "slug",
+            code_value: "alpha"
+          })
+        end,
+        fn ->
+          Catalog.put_area_in_release(recording, candidate.run_id, executor_id, area_key, %{
+            centroid: nil
+          })
+        end,
+        fn ->
+          Catalog.put_relation(recording, candidate.run_id, executor_id, %{
+            parent_area_key: area_key,
+            child_area_key: area_key,
+            relation_type: "contains"
+          })
+        end
+      ],
+      fn write ->
+        try do
+          write.()
+        rescue
+          GeoGenius.CatalogError -> :ok
+        end
+      end
+    )
+
+    recorded = GeoGenius.RecordingRepo.recorded()
+
+    for function <-
+          ~w(upsert_collection put_area_name put_area_code put_area_in_release put_relation) do
+      opts = GeoGenius.RecordingRepo.options_for(recorded, function)
+      assert opts != nil, "no query recorded for #{function}"
+      assert opts[:checkout_retries] == 0, "#{function} permits an ambiguous retry"
+    end
+  end
+
+  test "simultaneous executor claims produce exactly one winner", %{context: context} do
+    candidate = prepare_demo(context)
+    parent = self()
+
+    tasks =
+      for executor_id <- [Ecto.UUID.generate(), Ecto.UUID.generate()] do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do: (:claim ->
+                         Catalog.claim_import_execution(context, candidate.run_id, executor_id))
+        end)
+      end
+
+    claimers =
+      for _ <- tasks,
+          do:
+            (
+              assert_receive {:ready, claimer}
+              claimer
+            )
+
+    Enum.each(claimers, &send(&1, :claim))
+
+    assert tasks |> Task.await_many() |> Enum.sort() == [:claimed, :occupied]
+
+    assert %ImportRun{executor_id: executor_id, execution_started_at: %DateTime{}} =
+             Catalog.import_run(context, candidate.run_id)
+
+    assert executor_id != nil
   end
 
   test "import_run returns nil for a run that does not exist", %{context: context} do
@@ -196,38 +506,61 @@ defmodule GeoGenius.CatalogTest do
        %{context: context} do
     release_id = open_demo(context)
 
-    first_run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    first_run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, first_run_id)
 
-    assert :ok = Catalog.fail_import(context, first_run_id, %{"reason" => "boom"})
+    assert :ok = Catalog.fail_import(context, first_run_id, executor_id, %{"reason" => "boom"})
 
-    second_run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-2",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    {:ok, corrected_manifest} =
+      demo_manifest()
+      |> Map.put("description", "Corrected catalog fixture")
+      |> Manifest.from_map()
+
+    assert {:enqueue, retry} =
+             Registration.retry_failed(context, first_run_id, corrected_manifest, %{
+               owner: "catalog-test-retry",
+               runner_backend: "test",
+               stale_after_seconds: 300
+             })
+
+    second_run_id = retry.run_id
 
     assert [%ImportRun{run_id: ^second_run_id}, %ImportRun{run_id: ^first_run_id}] =
              Catalog.import_runs(context, "demo")
   end
 
+  test "retry_failed is idempotent after a committed successor", %{context: context} do
+    release_id = open_demo(context)
+    first_run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, first_run_id)
+
+    assert :ok = Catalog.fail_import(context, first_run_id, executor_id, %{"reason" => "boom"})
+
+    {:ok, manifest} = Manifest.from_map(demo_manifest())
+    claim = %{owner: "catalog-test-retry", runner_backend: "test", stale_after_seconds: 300}
+
+    assert {:enqueue, first} =
+             Registration.retry_failed(context, first_run_id, manifest, claim)
+
+    assert {:enqueue, replay} =
+             Registration.retry_failed(context, first_run_id, manifest, claim)
+
+    assert replay.run_id == first.run_id
+    assert replay.attempt == first.attempt
+    assert Catalog.import_run(context, first.run_id).status == "pending"
+  end
+
   test "advances a run and accumulates stage metrics", %{context: context} do
     release_id = open_demo(context)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, run_id)
 
-    assert :ok = Catalog.advance_import(context, run_id, "downloading", %{"files" => 1})
-    assert :ok = Catalog.advance_import(context, run_id, "staging", %{"rows" => 5})
+    assert :ok =
+             Catalog.advance_import(context, run_id, executor_id, "downloading", %{"files" => 1})
+
+    assert :ok = Catalog.advance_import(context, run_id, executor_id, "validating", %{})
+    assert :ok = Catalog.advance_import(context, run_id, executor_id, "staging", %{"rows" => 5})
 
     run = Catalog.import_run(context, run_id)
     assert run.status == "staging"
@@ -237,12 +570,8 @@ defmodule GeoGenius.CatalogTest do
   test "heartbeat merges into the lease progress", %{context: context} do
     release_id = open_demo(context)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, run_id)
 
     # The second patch is not a superset of the first (it omits "stage"), so
     # the merge only reads as a merge if the result keeps "stage" from the
@@ -250,9 +579,12 @@ defmodule GeoGenius.CatalogTest do
     # second is a superset of the first cannot tell a merge from an outright
     # overwrite -- both produce the same result.
     assert :ok =
-             Catalog.heartbeat_import(context, run_id, %{"rows" => 100, "stage" => "download"})
+             Catalog.heartbeat_import(context, run_id, executor_id, %{
+               "rows" => 100,
+               "stage" => "download"
+             })
 
-    assert :ok = Catalog.heartbeat_import(context, run_id, %{"rows" => 200})
+    assert :ok = Catalog.heartbeat_import(context, run_id, executor_id, %{"rows" => 200})
 
     assert Catalog.import_run(context, run_id).progress == %{"rows" => 200, "stage" => "download"}
   end
@@ -260,14 +592,10 @@ defmodule GeoGenius.CatalogTest do
   test "fails a run and stores the error", %{context: context} do
     release_id = open_demo(context)
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
+    run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, run_id)
 
-    assert :ok = Catalog.fail_import(context, run_id, %{"reason" => "boom"})
+    assert :ok = Catalog.fail_import(context, run_id, executor_id, %{"reason" => "boom"})
 
     run = Catalog.import_run(context, run_id)
     assert run.status == "failed"
@@ -286,27 +614,39 @@ defmodule GeoGenius.CatalogTest do
 
   test "verify_release requires boundaries only for area types marked as requiring geometry",
        %{context: context} do
-    release_id = open_demo(context)
+    manifest_map =
+      Map.update!(demo_manifest(), "area_types", fn area_types ->
+        area_types ++
+          [
+            %{"key" => "bounded_zone", "rank" => 50, "requires_geometry" => true},
+            %{"key" => "metadata_record", "rank" => 60, "requires_geometry" => false}
+          ]
+      end)
+
+    {:ok, manifest} = Manifest.from_map(manifest_map)
+    candidate = ImportFixture.prepare!(context, manifest, owner: "catalog-test")
+    release_id = candidate.release_id
+    run_id = import_run_id(context, release_id, "normalizing")
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
 
     Catalog.upsert_area_type(context, "demo", %{
       key: "bounded_zone",
-      rank: 10,
+      rank: 50,
       requires_geometry: true
     })
 
     Catalog.upsert_area_type(context, "demo", %{
       key: "metadata_record",
-      rank: 20,
+      rank: 60,
       requires_geometry: false
     })
 
-    Catalog.upsert_area_many(context, "demo", [
+    Catalog.upsert_area_many(context, run_id, executor_id(context, run_id), [
       %{authority_key: "a", area_type_key: "bounded_zone", code: "alpha"},
       %{authority_key: "a", area_type_key: "metadata_record", code: "detail"}
     ])
 
-    Catalog.put_area_in_release_many(context, release_id, [
+    Catalog.put_area_in_release_many(context, run_id, executor_id(context, run_id), [
       %{area_key: "a:bounded_zone:alpha", centroid: nil, attributes: %{}},
       %{area_key: "a:metadata_record:detail", centroid: nil, attributes: %{}}
     ])
@@ -326,7 +666,7 @@ defmodule GeoGenius.CatalogTest do
     assert %{"ok" => false, "failures" => ["1 areas lack a boundary"]} =
              Catalog.verify_release(context, release_id)
 
-    Catalog.put_boundary(context, release_id, "a:bounded_zone:alpha", %{
+    Catalog.put_boundary(context, run_id, executor_id(context, run_id), "a:bounded_zone:alpha", %{
       source_release_id: source_release_id,
       geometry: square(0.0, 1.0)
     })
@@ -334,7 +674,7 @@ defmodule GeoGenius.CatalogTest do
     assert %{"ok" => true, "boundary_count" => 1} = Catalog.verify_release(context, release_id)
   end
 
-  test "legacy uncast SQL upsert_area_type calls resolve to the false wrapper",
+  test "legacy uncast SQL upsert_area_type calls create only key identity",
        %{context: context} do
     open_demo(context)
 
@@ -345,10 +685,18 @@ defmodule GeoGenius.CatalogTest do
       )
 
     assert query_rows(context, """
-           SELECT requires_geometry
+           SELECT key
              FROM geo_genius.area_type
             WHERE key = 'legacy_type'
-           """) == [[false]]
+           """) == [["legacy_type"]]
+
+    assert query_rows(context, """
+           SELECT column_name
+             FROM information_schema.columns
+            WHERE table_schema = 'geo_genius'
+              AND table_name = 'area_type'
+              AND column_name IN ('rank', 'requires_geometry')
+           """) == []
   end
 
   test "the explicit geometry-aware area type SQL function has no default argument" do
@@ -371,18 +719,12 @@ defmodule GeoGenius.CatalogTest do
 
   test "creates and drops a staging table, returning its name", %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "staging")
 
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
-        owner: "worker-1",
-        runner_backend: "test",
-        stale_after_seconds: 300
-      })
-
-    table = Catalog.create_staging(context, run_id)
+    table = Catalog.create_staging(context, run_id, executor_id(context, run_id))
     assert table == "staging_" <> String.replace(run_id, "-", "")
 
-    assert :ok = Catalog.drop_staging(context, run_id)
+    assert :ok = Catalog.drop_staging(context, run_id, executor_id(context, run_id))
   end
 
   test "published_release is nil before publication and the release id after",
@@ -390,6 +732,11 @@ defmodule GeoGenius.CatalogTest do
     assert Catalog.published_release(context, "demo") == nil
 
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, run_id)
+    ImportFixture.advance_to!(context, run_id, executor_id, "downloading")
+    ImportFixture.observe_selected_artifacts!(context, release_id, run_id, executor_id)
+    ImportFixture.advance_to!(context, run_id, executor_id, "normalizing")
 
     # `open_release/3`'s `:source_date` is written but never read back
     # anywhere else: a wrapper that dropped it (bound `NULL` regardless of
@@ -404,7 +751,17 @@ defmodule GeoGenius.CatalogTest do
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "c"})
-    Catalog.put_area_name(context, "a:t:c", %{name: "Area", kind: "official", locale: nil})
+
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
+      attributes: %{"population" => 10}
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      name: "Area",
+      kind: "official",
+      locale: nil
+    })
 
     Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
 
@@ -418,12 +775,7 @@ defmodule GeoGenius.CatalogTest do
 
     Catalog.attach_source_release(context, release_id, source_release_id)
 
-    Catalog.put_area_in_release(context, release_id, "a:t:c", %{
-      centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
-      attributes: %{"population" => 10}
-    })
-
-    # `put_area_in_release/4`'s `:attributes` is likewise written but never
+    # `put_area_in_release/5`'s `:attributes` is likewise written but never
     # read back anywhere else: a wrapper that dropped it (bound `{}`
     # regardless of what was passed) would still pass every other Catalog
     # test.
@@ -439,17 +791,45 @@ defmodule GeoGenius.CatalogTest do
 
     assert stored_attributes == %{"population" => 10}
 
-    assert Catalog.publish_release(context, release_id)
+    error =
+      assert_raise GeoGenius.CatalogError, fn ->
+        Catalog.publish_release(context, release_id)
+      end
+
+    assert error.function == "publish_release"
+    assert %Postgrex.Error{postgres: %{code: :object_not_in_prerequisite_state}} = error.reason
+    assert Catalog.published_release(context, "demo") == nil
+
+    assert :ok =
+             ImportFixture.advance_to!(context, run_id, executor_id, "publishing")
+
+    %{rows: [[collection_id]]} =
+      TestRepo.query!("SELECT collection_id::text FROM geo_genius.release WHERE id = $1", [
+        Ecto.UUID.dump!(release_id)
+      ])
+
+    assert Catalog.publish_import(context, run_id, executor_id) == collection_id
     assert Catalog.published_release(context, "demo") == release_id
   end
 
   test "a boundary binds a Geo struct and a centroid binds a geography point",
        %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "normalizing")
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "c"})
-    Catalog.put_area_name(context, "a:t:c", %{name: "Area", kind: "official", locale: nil})
+
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      centroid: %Geo.Point{coordinates: {0.5, 0.5}, srid: 4326},
+      attributes: %{}
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      name: "Area",
+      kind: "official",
+      locale: nil
+    })
 
     Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
 
@@ -463,13 +843,8 @@ defmodule GeoGenius.CatalogTest do
 
     Catalog.attach_source_release(context, release_id, source_release_id)
 
-    Catalog.put_area_in_release(context, release_id, "a:t:c", %{
-      centroid: %Geo.Point{coordinates: {0.5, 0.5}, srid: 4326},
-      attributes: %{}
-    })
-
     assert :ok =
-             Catalog.put_boundary(context, release_id, "a:t:c", %{
+             Catalog.put_boundary(context, run_id, executor_id(context, run_id), "a:t:c", %{
                source_release_id: source_release_id,
                geometry: %Geo.Polygon{
                  coordinates: [[{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}, {0.0, 1.0}, {0.0, 0.0}]],
@@ -485,13 +860,34 @@ defmodule GeoGenius.CatalogTest do
   test "rebuild_relations measures one relation from two overlapping boundaries",
        %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "normalizing")
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "outer", rank: 10})
     Catalog.upsert_area_type(context, "demo", %{key: "inner", rank: 20})
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "outer", code: "A"})
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "inner", code: "B"})
-    Catalog.put_area_name(context, "a:outer:A", %{name: "Outer", kind: "official", locale: nil})
-    Catalog.put_area_name(context, "a:inner:B", %{name: "Inner", kind: "official", locale: nil})
+
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:outer:A", %{
+      centroid: %Geo.Point{coordinates: {0.25, 0.25}, srid: 4326},
+      attributes: %{}
+    })
+
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:inner:B", %{
+      centroid: %Geo.Point{coordinates: {0.1, 0.1}, srid: 4326},
+      attributes: %{}
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:outer:A", %{
+      name: "Outer",
+      kind: "official",
+      locale: nil
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:inner:B", %{
+      name: "Inner",
+      kind: "official",
+      locale: nil
+    })
 
     Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
 
@@ -505,16 +901,6 @@ defmodule GeoGenius.CatalogTest do
 
     Catalog.attach_source_release(context, release_id, source_release_id)
 
-    Catalog.put_area_in_release(context, release_id, "a:outer:A", %{
-      centroid: %Geo.Point{coordinates: {0.25, 0.25}, srid: 4326},
-      attributes: %{}
-    })
-
-    Catalog.put_area_in_release(context, release_id, "a:inner:B", %{
-      centroid: %Geo.Point{coordinates: {0.1, 0.1}, srid: 4326},
-      attributes: %{}
-    })
-
     outer_square = %Geo.Polygon{
       coordinates: [[{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}, {0.0, 1.0}, {0.0, 0.0}]],
       srid: 4326
@@ -525,45 +911,66 @@ defmodule GeoGenius.CatalogTest do
       srid: 4326
     }
 
-    Catalog.put_boundary(context, release_id, "a:outer:A", %{
+    Catalog.put_boundary(context, run_id, executor_id(context, run_id), "a:outer:A", %{
       source_release_id: source_release_id,
       geometry: outer_square,
       simplify_tolerance: 0.0
     })
 
-    Catalog.put_boundary(context, release_id, "a:inner:B", %{
+    Catalog.put_boundary(context, run_id, executor_id(context, run_id), "a:inner:B", %{
       source_release_id: source_release_id,
       geometry: inner_square,
       simplify_tolerance: 0.0
     })
 
-    assert Catalog.rebuild_relations(context, release_id) == 1
+    Catalog.advance_import(context, run_id, executor_id(context, run_id), "relating", %{})
+    assert Catalog.rebuild_relations(context, run_id, executor_id(context, run_id)) == 1
   end
 
   test "put_relation asserts a relation between two areas in a release",
        %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "normalizing")
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
 
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "parent"})
 
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "child"})
-    Catalog.put_area_name(context, "a:t:parent", %{name: "Parent", kind: "official", locale: nil})
-    Catalog.put_area_name(context, "a:t:child", %{name: "Child", kind: "official", locale: nil})
 
-    Catalog.put_area_in_release(context, release_id, "a:t:parent", %{
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:t:parent", %{
       centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
       attributes: %{}
     })
 
-    Catalog.put_area_in_release(context, release_id, "a:t:child", %{
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:t:child", %{
       centroid: %Geo.Point{coordinates: {0.1, 0.1}, srid: 4326},
       attributes: %{}
     })
 
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:t:parent", %{
+      name: "Parent",
+      kind: "official",
+      locale: nil
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:t:child", %{
+      name: "Child",
+      kind: "official",
+      locale: nil
+    })
+
     assert :ok =
-             Catalog.put_relation(context, release_id, %{
+             Catalog.advance_import(
+               context,
+               run_id,
+               executor_id(context, run_id),
+               "relating",
+               %{}
+             )
+
+    assert :ok =
+             Catalog.put_relation(context, run_id, executor_id(context, run_id), %{
                parent_area_key: "a:t:parent",
                child_area_key: "a:t:child",
                relation_type: "contains"
@@ -584,17 +991,27 @@ defmodule GeoGenius.CatalogTest do
 
   test "put_area_code sets an external code on an area", %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "normalizing")
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "c"})
-    Catalog.put_area_name(context, "a:t:c", %{name: "Area", kind: "official", locale: nil})
 
-    Catalog.put_area_in_release(context, release_id, "a:t:c", %{
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:t:c", %{
       centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
       attributes: %{}
     })
 
-    code_id = Catalog.put_area_code(context, "a:t:c", %{code_type: "fips", code_value: "12345"})
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      name: "Area",
+      kind: "official",
+      locale: nil
+    })
+
+    code_id =
+      Catalog.put_area_code(context, run_id, executor_id(context, run_id), "a:t:c", %{
+        code_type: "fips",
+        code_value: "12345"
+      })
 
     assert {:ok, _} = Ecto.UUID.cast(code_id)
 
@@ -620,10 +1037,25 @@ defmodule GeoGenius.CatalogTest do
   test "rollback_publication raises when a published collection has no previous release",
        %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id)
+    executor_id = executor_id(context, run_id)
+    ImportFixture.advance_to!(context, run_id, executor_id, "downloading")
+    ImportFixture.observe_selected_artifacts!(context, release_id, run_id, executor_id)
+    ImportFixture.advance_to!(context, run_id, executor_id, "normalizing")
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
     Catalog.upsert_area(context, "demo", %{authority_key: "a", area_type_key: "t", code: "c"})
-    Catalog.put_area_name(context, "a:t:c", %{name: "Area", kind: "official", locale: nil})
+
+    Catalog.put_area_in_release(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
+      attributes: %{}
+    })
+
+    Catalog.put_area_name(context, run_id, executor_id(context, run_id), "a:t:c", %{
+      name: "Area",
+      kind: "official",
+      locale: nil
+    })
 
     Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
 
@@ -637,12 +1069,10 @@ defmodule GeoGenius.CatalogTest do
 
     Catalog.attach_source_release(context, release_id, source_release_id)
 
-    Catalog.put_area_in_release(context, release_id, "a:t:c", %{
-      centroid: %Geo.Point{coordinates: {0.0, 0.0}, srid: 4326},
-      attributes: %{}
-    })
+    assert :ok =
+             ImportFixture.advance_to!(context, run_id, executor_id, "publishing")
 
-    Catalog.publish_release(context, release_id)
+    Catalog.publish_import(context, run_id, executor_id)
 
     error =
       assert_raise GeoGenius.CatalogError, fn ->
@@ -653,11 +1083,12 @@ defmodule GeoGenius.CatalogTest do
     assert %Postgrex.Error{postgres: %{code: :check_violation}} = error.reason
   end
 
-  test "analyze_release runs against a release's partitions without raising",
+  test "analyze_import runs against the current import's partitions without raising",
        %{context: context} do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "indexing")
 
-    assert :ok = Catalog.analyze_release(context, release_id)
+    assert :ok = Catalog.analyze_import(context, run_id, executor_id(context, run_id))
   end
 
   test "retire_releases returns 0 for a collection with a single release",
@@ -671,15 +1102,16 @@ defmodule GeoGenius.CatalogTest do
        %{context: context} do
     release_id = open_demo(context)
 
-    assert Catalog.release_manifest(context, release_id) == %{"release" => "r1"}
+    assert Catalog.release_manifest(context, release_id) == demo_manifest()
     assert Catalog.release_manifest(context, Ecto.UUID.generate()) == nil
   end
 
-  test "release_artifacts returns one entry per attached artifact, and [] with no attached sources",
+  test "release_artifacts returns one entry per artifact selected by the manifest",
        %{context: context} do
     release_id = open_demo(context)
 
-    assert Catalog.release_artifacts(context, release_id) == []
+    assert [%{"logical_name" => "fixture.geojson"}] =
+             Catalog.release_artifacts(context, release_id)
 
     Catalog.upsert_source(context, "demo", %{source_key: "s", provider: "geojson", license: "CC0"})
 
@@ -691,19 +1123,25 @@ defmodule GeoGenius.CatalogTest do
         metadata: %{}
       })
 
-    Catalog.put_artifact(context, source_release_id, %{
-      logical_name: "areas.geojson",
-      url: "https://example.test/areas.geojson",
-      operator_supplied: false,
-      format: "geojson",
-      expected_sha256: String.duplicate("a", 64),
-      expected_bytes: 1024,
-      metadata: %{}
-    })
+    artifact_id =
+      Catalog.put_artifact(context, source_release_id, %{
+        logical_name: "areas.geojson",
+        url: "https://example.test/areas.geojson",
+        operator_supplied: false,
+        format: "geojson",
+        expected_sha256: String.duplicate("a", 64),
+        expected_bytes: 1024,
+        metadata: %{}
+      })
 
     Catalog.attach_source_release(context, release_id, source_release_id)
+    Catalog.attach_artifact(context, release_id, artifact_id)
 
-    assert [artifact] = Catalog.release_artifacts(context, release_id)
+    assert artifact =
+             context
+             |> Catalog.release_artifacts(release_id)
+             |> Enum.find(&(&1["logical_name"] == "areas.geojson"))
+
     assert artifact["logical_name"] == "areas.geojson"
     assert artifact["source_release_id"] == source_release_id
   end
@@ -711,13 +1149,14 @@ defmodule GeoGenius.CatalogTest do
   describe "set writes" do
     test "upsert_area_many returns hyphenated ids in the caller's order",
          %{context: context} do
-      open_demo(context)
+      release_id = open_demo(context)
+      run_id = import_run_id(context, release_id, "normalizing")
       Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
       Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
       Catalog.upsert_area_type(context, "demo", %{key: "u", rank: 20})
 
       ids =
-        Catalog.upsert_area_many(context, "demo", [
+        Catalog.upsert_area_many(context, run_id, executor_id(context, run_id), [
           %{authority_key: "a", area_type_key: "t", code: "one"},
           %{authority_key: "a", area_type_key: "u", code: "two"},
           %{authority_key: "a", area_type_key: "t", code: "one"}
@@ -737,13 +1176,15 @@ defmodule GeoGenius.CatalogTest do
     test "the plural writes cost no round trip at all for an empty batch",
          %{context: context} do
       recording = %{context | repo: GeoGenius.RecordingRepo}
+      run_id = Ecto.UUID.generate()
+      executor_id = Ecto.UUID.generate()
 
-      assert Catalog.upsert_area_many(recording, "demo", []) == []
-      assert Catalog.put_area_name_many(recording, []) == []
-      assert Catalog.put_area_code_many(recording, []) == []
-      assert Catalog.put_area_in_release_many(recording, Ecto.UUID.generate(), []) == :ok
-      assert Catalog.put_relation_many(recording, Ecto.UUID.generate(), []) == :ok
-      assert Catalog.put_boundaries(recording, Ecto.UUID.generate(), []) == :ok
+      assert Catalog.upsert_area_many(recording, run_id, executor_id, []) == []
+      assert Catalog.put_area_name_many(recording, run_id, executor_id, []) == []
+      assert Catalog.put_area_code_many(recording, run_id, executor_id, []) == []
+      assert Catalog.put_area_in_release_many(recording, run_id, executor_id, []) == :ok
+      assert Catalog.put_relation_many(recording, run_id, executor_id, []) == :ok
+      assert Catalog.put_boundaries(recording, run_id, executor_id, []) == :ok
 
       refute_received {:query, _sql, _params, _opts}
     end
@@ -751,27 +1192,27 @@ defmodule GeoGenius.CatalogTest do
     test "an empty batch still refuses a release id that is not a uuid",
          %{context: context} do
       assert_raise ArgumentError, fn ->
-        Catalog.put_area_in_release_many(context, "not-a-uuid", [])
+        Catalog.put_area_in_release_many(context, "not-a-uuid", Ecto.UUID.generate(), [])
       end
 
       assert_raise ArgumentError, fn ->
-        Catalog.put_relation_many(context, "not-a-uuid", [])
+        Catalog.put_relation_many(context, "not-a-uuid", Ecto.UUID.generate(), [])
       end
 
       assert_raise ArgumentError, fn ->
-        Catalog.put_boundaries(context, "not-a-uuid", [])
+        Catalog.put_boundaries(context, "not-a-uuid", Ecto.UUID.generate(), [])
       end
     end
 
     test "a boundary batch is one typed query with ordered arrays and defaults",
          %{context: context} do
-      {release_id, source_release_id} = boundary_fixture(context, ~w(one two))
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ~w(one two))
       recording = %{context | repo: GeoGenius.RecordingRepo}
       first = square(0.0, 1.0)
       second = square(2.0, 3.0)
 
       assert :ok =
-               Catalog.put_boundaries(recording, release_id, [
+               Catalog.put_boundaries(recording, run_id, executor_id, [
                  %{
                    area_key: "a:t:one",
                    source_release_id: source_release_id,
@@ -787,13 +1228,21 @@ defmodule GeoGenius.CatalogTest do
                ])
 
       assert_received {:query, sql,
-                       [dumped_release, area_keys, source_ids, geometries, tiers, properties],
-                       _opts}
+                       [
+                         dumped_run,
+                         dumped_executor,
+                         area_keys,
+                         source_ids,
+                         geometries,
+                         tiers,
+                         properties
+                       ], _opts}
 
       assert sql =~
-               ~s|"geo_genius".put_boundaries($1::uuid, $2::text[], $3::uuid[], $4::geometry[], $5::integer[], $6::jsonb[])|
+               ~s|"geo_genius".put_boundaries($1::uuid, $2::uuid, $3::text[], $4::uuid[], $5::geometry[], $6::integer[], $7::jsonb[])|
 
-      assert dumped_release == Ecto.UUID.dump!(release_id)
+      assert dumped_run == Ecto.UUID.dump!(run_id)
+      assert dumped_executor == Ecto.UUID.dump!(executor_id)
       assert area_keys == ["a:t:one", "a:t:two"]
 
       assert source_ids == [
@@ -809,10 +1258,10 @@ defmodule GeoGenius.CatalogTest do
 
     test "a boundary batch keeps the last geometry for a repeated area",
          %{context: context} do
-      {release_id, source_release_id} = boundary_fixture(context, ["one"])
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
 
       assert :ok =
-               Catalog.put_boundaries(context, release_id, [
+               Catalog.put_boundaries(context, run_id, executor_id, [
                  %{
                    area_key: "a:t:one",
                    source_release_id: source_release_id,
@@ -836,12 +1285,12 @@ defmodule GeoGenius.CatalogTest do
 
     test "put_boundary remains a one-element compatibility wrapper",
          %{context: context} do
-      {release_id, source_release_id} = boundary_fixture(context, ["one"])
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
       recording = %{context | repo: GeoGenius.RecordingRepo}
       geometry = square(0.0, 1.0)
 
       assert :ok =
-               Catalog.put_boundary(recording, release_id, "a:t:one", %{
+               Catalog.put_boundary(recording, run_id, executor_id, "a:t:one", %{
                  source_release_id: source_release_id,
                  geometry: geometry,
                  source_properties: %{"origin" => "scalar"}
@@ -849,7 +1298,8 @@ defmodule GeoGenius.CatalogTest do
 
       assert_received {:query, sql,
                        [
-                         _release_id,
+                         _run_id,
+                         _executor_id,
                          ["a:t:one"],
                          [_source_id],
                          [^geometry],
@@ -863,29 +1313,32 @@ defmodule GeoGenius.CatalogTest do
 
     test "put_boundary preserves a nonzero simplify tolerance on the singular SQL path",
          %{context: context} do
-      {release_id, source_release_id} = boundary_fixture(context, ["one"])
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
       recording = %{context | repo: GeoGenius.RecordingRepo}
       geometry = square(0.0, 1.0)
 
       assert :ok =
-               Catalog.put_boundary(recording, release_id, "a:t:one", %{
+               Catalog.put_boundary(recording, run_id, executor_id, "a:t:one", %{
                  source_release_id: source_release_id,
                  geometry: geometry,
                  simplify_tolerance: 0.25
                })
 
-      assert_received {:query, sql, [dumped_release, "a:t:one", dumped_source, ^geometry, 0.25],
+      assert_received {:query, sql,
+                       [dumped_run, dumped_executor, "a:t:one", dumped_source, ^geometry, 0.25],
                        _opts}
 
-      assert sql =~ ~s|"geo_genius".put_boundary($1, $2, $3, $4, $5)|
-      assert dumped_release == Ecto.UUID.dump!(release_id)
+      assert sql =~ ~s|"geo_genius".put_boundary($1, $2, $3, $4, $5, $6)|
+      assert dumped_run == Ecto.UUID.dump!(run_id)
+      assert dumped_executor == Ecto.UUID.dump!(executor_id)
       assert dumped_source == Ecto.UUID.dump!(source_release_id)
       refute_received {:query, _sql, _params, _opts}
     end
 
     test "missing required boundary keys raise before the query", %{context: context} do
       recording = %{context | repo: GeoGenius.RecordingRepo}
-      release_id = Ecto.UUID.generate()
+      run_id = Ecto.UUID.generate()
+      executor_id = Ecto.UUID.generate()
       source_release_id = Ecto.UUID.generate()
 
       for boundary <- [
@@ -893,30 +1346,37 @@ defmodule GeoGenius.CatalogTest do
             %{area_key: "a:t:one", geometry: square(0.0, 1.0)},
             %{area_key: "a:t:one", source_release_id: source_release_id}
           ] do
-        assert_raise KeyError, fn -> Catalog.put_boundaries(recording, release_id, [boundary]) end
+        assert_raise KeyError, fn ->
+          Catalog.put_boundaries(recording, run_id, executor_id, [boundary])
+        end
       end
 
       refute_received {:query, _sql, _params, _opts}
     end
 
     test "names and codes land in the columns their keys name", %{context: context} do
-      open_demo(context)
+      release_id = open_demo(context)
+      run_id = import_run_id(context, release_id, "normalizing")
       Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
       Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
 
-      Catalog.upsert_area_many(context, "demo", [
+      Catalog.upsert_area_many(context, run_id, executor_id(context, run_id), [
         %{authority_key: "a", area_type_key: "t", code: "c"}
+      ])
+
+      Catalog.put_area_in_release_many(context, run_id, executor_id(context, run_id), [
+        %{area_key: "a:t:c", centroid: nil, attributes: %{}}
       ])
 
       # Every value here is distinguishable from every other, so a wrapper
       # that transposed :name with :kind, or :code_type with :code_value,
       # fails rather than writing a legal-looking row.
-      Catalog.put_area_name_many(context, [
+      Catalog.put_area_name_many(context, run_id, executor_id(context, run_id), [
         %{area_key: "a:t:c", name: "Ville", kind: "alias", locale: "fr"},
         %{area_key: "a:t:c", name: "Town", kind: "official", locale: nil}
       ])
 
-      Catalog.put_area_code_many(context, [
+      Catalog.put_area_code_many(context, run_id, executor_id(context, run_id), [
         %{area_key: "a:t:c", code_type: "fips", code_value: "01001"}
       ])
 
@@ -935,16 +1395,17 @@ defmodule GeoGenius.CatalogTest do
     test "a membership batch binds a geography array carrying a nil element",
          %{context: context} do
       release_id = open_demo(context)
+      run_id = import_run_id(context, release_id, "normalizing")
       Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
       Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
 
-      Catalog.upsert_area_many(context, "demo", [
+      Catalog.upsert_area_many(context, run_id, executor_id(context, run_id), [
         %{authority_key: "a", area_type_key: "t", code: "placed"},
         %{authority_key: "a", area_type_key: "t", code: "unplaced"}
       ])
 
       assert :ok =
-               Catalog.put_area_in_release_many(context, release_id, [
+               Catalog.put_area_in_release_many(context, run_id, executor_id(context, run_id), [
                  %{
                    area_key: "a:t:placed",
                    centroid: %Geo.Point{coordinates: {0.5, 1.5}, srid: 4326},
@@ -957,6 +1418,7 @@ defmodule GeoGenius.CatalogTest do
              SELECT area.area_key, ST_AsText(membership.centroid::geometry), membership.data
                FROM geo_genius.release_area membership
                JOIN geo_genius.area ON area.id = membership.area_id
+              WHERE membership.release_id = '#{release_id}'::uuid
               ORDER BY area.area_key
              """) == [
                ["a:t:placed", "POINT(0.5 1.5)", %{"population" => 10}],
@@ -967,21 +1429,31 @@ defmodule GeoGenius.CatalogTest do
     test "a relation batch keeps parent and child on the sides it was given",
          %{context: context} do
       release_id = open_demo(context)
+      run_id = import_run_id(context, release_id, "normalizing")
       Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
       Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
 
-      Catalog.upsert_area_many(context, "demo", [
+      Catalog.upsert_area_many(context, run_id, executor_id(context, run_id), [
         %{authority_key: "a", area_type_key: "t", code: "over"},
         %{authority_key: "a", area_type_key: "t", code: "under"}
       ])
 
-      Catalog.put_area_in_release_many(context, release_id, [
+      Catalog.put_area_in_release_many(context, run_id, executor_id(context, run_id), [
         %{area_key: "a:t:over", centroid: nil, attributes: %{}},
         %{area_key: "a:t:under", centroid: nil, attributes: %{}}
       ])
 
       assert :ok =
-               Catalog.put_relation_many(context, release_id, [
+               Catalog.advance_import(
+                 context,
+                 run_id,
+                 executor_id(context, run_id),
+                 "relating",
+                 %{}
+               )
+
+      assert :ok =
+               Catalog.put_relation_many(context, run_id, executor_id(context, run_id), [
                  %{
                    parent_area_key: "a:t:over",
                    child_area_key: "a:t:under",
@@ -999,16 +1471,21 @@ defmodule GeoGenius.CatalogTest do
 
     test "an area key nothing carries raises rather than shortening the batch",
          %{context: context} do
-      open_demo(context)
+      release_id = open_demo(context)
+      run_id = import_run_id(context, release_id, "normalizing")
       Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
       Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
 
-      Catalog.upsert_area_many(context, "demo", [
+      Catalog.upsert_area_many(context, run_id, executor_id(context, run_id), [
         %{authority_key: "a", area_type_key: "t", code: "c"}
       ])
 
+      Catalog.put_area_in_release_many(context, run_id, executor_id(context, run_id), [
+        %{area_key: "a:t:c", centroid: nil, attributes: %{}}
+      ])
+
       assert_raise GeoGenius.CatalogError, fn ->
-        Catalog.put_area_name_many(context, [
+        Catalog.put_area_name_many(context, run_id, executor_id(context, run_id), [
           %{area_key: "a:t:c", name: "Town", kind: "official", locale: nil},
           %{area_key: "a:t:absent", name: "Nowhere", kind: "official", locale: nil}
         ])
@@ -1027,19 +1504,22 @@ defmodule GeoGenius.CatalogTest do
     |> Enum.map(fn [area_key] -> area_key end)
   end
 
-  defp query_rows(%Context{repo: repo}, sql) do
-    %Postgrex.Result{rows: rows} = repo.query!(sql, [])
+  defp query_rows(%Context{repo: repo}, sql, params \\ []) do
+    %Postgrex.Result{rows: rows} = repo.query!(sql, params)
     rows
   end
 
   defp boundary_fixture(context, codes) do
     release_id = open_demo(context)
+    run_id = import_run_id(context, release_id, "normalizing")
+    executor_id = executor_id(context, run_id)
     Catalog.upsert_authority(context, "demo", %{key: "a", name: "A"})
     Catalog.upsert_area_type(context, "demo", %{key: "t", rank: 10})
 
     Catalog.upsert_area_many(
       context,
-      "demo",
+      run_id,
+      executor_id,
       Enum.map(codes, &%{authority_key: "a", area_type_key: "t", code: &1})
     )
 
@@ -1054,7 +1534,31 @@ defmodule GeoGenius.CatalogTest do
       })
 
     Catalog.attach_source_release(context, release_id, source_release_id)
-    {release_id, source_release_id}
+    {run_id, executor_id, source_release_id}
+  end
+
+  defp artifact_demo_manifest(source_key, logical_name, url, sha256, bytes) do
+    Map.put(demo_manifest(), "sources", [
+      %{
+        "source_key" => source_key,
+        "provider" => "geojson",
+        "license" => "CC0",
+        "release_key" => "v1",
+        "artifacts" => [
+          %{
+            "logical_name" => logical_name,
+            "url" => url,
+            "operator_supplied" => false,
+            "format" => "geojson",
+            "required" => true,
+            "sha256" => sha256,
+            "bytes" => bytes,
+            "members" => [],
+            "metadata" => %{}
+          }
+        ]
+      }
+    ])
   end
 
   defp square(low, high) do

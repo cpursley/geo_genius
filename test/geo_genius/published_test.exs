@@ -7,7 +7,7 @@ defmodule GeoGenius.PublishedTest do
   import GeoGenius.GraphFixture, only: [retire!: 1]
 
   alias Ecto.Adapters.SQL
-  alias GeoGenius.{GraphFixture, Published, Query, TestRepo}
+  alias GeoGenius.{Context, GraphFixture, ImportFixture, Manifest, Published, Query, TestRepo}
 
   # r2's membership, sorted the way `keys/1` returns a result: every demo area
   # except E, which stays r1-only so an area set alone separates the two
@@ -40,57 +40,149 @@ defmodule GeoGenius.PublishedTest do
   # return r1's children under r2's id. `demo_teardown/0` drops its partitions
   # along with r1's.
   defp stage_unpublished_release! do
-    %{rows: [[id]]} =
-      TestRepo.query!("SELECT geo_genius.open_release('demo', 'r2', '{}'::jsonb, NULL)::text", [])
+    context = Context.new(repo: TestRepo, prefix: "geo_genius")
+    {:ok, manifest} = Manifest.from_map(demo_manifest("r2"))
+    candidate = ImportFixture.prepare!(context, manifest)
+    executor_id = ImportFixture.claim_executor!(context, candidate.run_id)
 
-    raw = Ecto.UUID.dump!(id)
+    ImportFixture.advance_to!(context, candidate.run_id, executor_id, "normalizing")
+
+    raw_run = Ecto.UUID.dump!(candidate.run_id)
+    raw_executor = Ecto.UUID.dump!(executor_id)
 
     for area_key <- @staged_area_keys do
       TestRepo.query!(
         """
         SELECT geo_genius.put_area_in_release(
-          $1, $2, ST_GeogFromText('POINT(0.25 0.25)'), '{}'::jsonb)
+          $1, $2, $3, ST_GeogFromText('POINT(0.25 0.25)'), '{}'::jsonb)
         """,
-        [raw, area_key]
+        [raw_run, raw_executor, area_key]
       )
     end
 
-    TestRepo.query!("SELECT geo_genius.put_relation($1, $2, $3, 'contains')", [
-      raw,
+    for {area_key, name} <- [
+          {"demo_auth:outer:A", "Alpha"},
+          {"demo_auth:inner:B", "Bravo"},
+          {"demo_auth:city:C", "Charlie"},
+          {"demo_auth:district:D", "Delta"}
+        ] do
+      GeoGenius.Catalog.put_area_name(context, candidate.run_id, executor_id, area_key, %{
+        name: name,
+        kind: "official",
+        locale: nil
+      })
+    end
+
+    for {area_key, code_value} <- [
+          {"demo_auth:inner:B", "shared"},
+          {"demo_auth:city:C", "deep"}
+        ] do
+      GeoGenius.Catalog.put_area_code(context, candidate.run_id, executor_id, area_key, %{
+        code_type: "slug",
+        code_value: code_value
+      })
+    end
+
+    GeoGenius.Catalog.advance_import(context, candidate.run_id, executor_id, "relating", %{})
+
+    TestRepo.query!("SELECT geo_genius.put_relation($1, $2, $3, $4, 'contains')", [
+      raw_run,
+      raw_executor,
       "demo_auth:outer:A",
       "demo_auth:city:C"
     ])
 
-    {id, raw}
+    {candidate.release_id, Ecto.UUID.dump!(candidate.release_id)}
   end
 
   # A release of a second collection, so an id valid for one catalog can be
   # shown not to reach another's rows.
   defp stage_other_collection! do
+    context = Context.new(repo: TestRepo, prefix: "geo_genius")
+    {:ok, manifest} = Manifest.from_map(other_manifest())
+    candidate = ImportFixture.prepare!(context, manifest)
+    executor_id = ImportFixture.claim_executor!(context, candidate.run_id)
+
+    ImportFixture.advance_to!(context, candidate.run_id, executor_id, "normalizing")
+
     for statement <- [
-          "SELECT geo_genius.upsert_collection('other', 'Other', NULL)",
-          "SELECT geo_genius.upsert_authority('other', 'other_auth', 'Other Authority')",
-          "SELECT geo_genius.upsert_area_type('other', 'region', 10)",
-          "SELECT geo_genius.upsert_area('other', 'other_auth', 'region', 'Z')",
-          "SELECT geo_genius.put_area_name('other_auth:region:Z', 'Zulu', 'official', NULL)"
+          "SELECT geo_genius.upsert_area('other', 'other_auth', 'region', 'Z')"
         ] do
       TestRepo.query!(statement, [])
     end
 
-    %{rows: [[id]]} =
-      TestRepo.query!(
-        "SELECT geo_genius.open_release('other', 'o1', '{}'::jsonb, NULL)::text",
-        []
-      )
+    TestRepo.query!(
+      "SELECT geo_genius.put_area_in_release($1, $2, 'other_auth:region:Z', NULL, '{}'::jsonb)",
+      [Ecto.UUID.dump!(candidate.run_id), Ecto.UUID.dump!(executor_id)]
+    )
 
     TestRepo.query!(
-      "SELECT geo_genius.put_area_in_release($1, 'other_auth:region:Z', NULL, '{}'::jsonb)",
-      [Ecto.UUID.dump!(id)]
+      "SELECT geo_genius.put_area_name($1, $2, 'other_auth:region:Z', 'Zulu', 'official', NULL)",
+      [Ecto.UUID.dump!(candidate.run_id), Ecto.UUID.dump!(executor_id)]
     )
 
     on_exit(&teardown_other_collection!/0)
 
-    id
+    candidate.release_id
+  end
+
+  defp demo_manifest(release_key) do
+    %{
+      "collection" => "demo",
+      "collection_name" => "Demo",
+      "release" => release_key,
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "authorities" => [%{"key" => "demo_auth", "name" => "Demo Authority"}],
+      "area_types" => [
+        %{"key" => "outer", "rank" => 10, "requires_geometry" => false},
+        %{"key" => "inner", "rank" => 20, "requires_geometry" => false},
+        %{"key" => "city", "rank" => 50, "requires_geometry" => false},
+        %{"key" => "district", "rank" => 60, "requires_geometry" => false}
+      ],
+      "sources" => [
+        %{
+          "source_key" => "demo:src-#{release_key}",
+          "provider" => "geojson",
+          "license" => "test",
+          "release_key" => "v1",
+          "artifacts" => [fixture_artifact("demo-#{release_key}.geojson")]
+        }
+      ],
+      "options" => %{"area_type" => "outer", "code_property" => "code"}
+    }
+  end
+
+  defp other_manifest do
+    %{
+      "collection" => "other",
+      "collection_name" => "Other",
+      "release" => "o1",
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "authorities" => [%{"key" => "other_auth", "name" => "Other Authority"}],
+      "area_types" => [%{"key" => "region", "rank" => 10, "requires_geometry" => false}],
+      "sources" => [
+        %{
+          "source_key" => "other:src",
+          "provider" => "geojson",
+          "license" => "test",
+          "release_key" => "v1",
+          "artifacts" => [fixture_artifact("other.geojson")]
+        }
+      ],
+      "options" => %{"area_type" => "region", "code_property" => "code"}
+    }
+  end
+
+  defp fixture_artifact(logical_name) do
+    %{
+      "logical_name" => logical_name,
+      "operator_supplied" => true,
+      "format" => "geojson",
+      "sha256" => String.duplicate("0", 64),
+      "bytes" => 1
+    }
   end
 
   defp teardown_other_collection! do
@@ -104,6 +196,11 @@ defmodule GeoGenius.PublishedTest do
         SELECT id INTO target_id FROM geo_genius.collection WHERE key = 'other';
         IF target_id IS NULL THEN RETURN; END IF;
 
+        DELETE FROM geo_genius.import_run_lease
+         WHERE release_id IN (
+           SELECT id FROM geo_genius.release WHERE collection_id = target_id
+         );
+
         FOR target_release_id IN
           SELECT id FROM geo_genius.release WHERE collection_id = target_id
         LOOP
@@ -111,6 +208,26 @@ defmodule GeoGenius.PublishedTest do
         END LOOP;
 
         DELETE FROM geo_genius.publication WHERE collection_id = target_id;
+
+        DELETE FROM geo_genius.import_run
+         WHERE release_id IN (
+           SELECT id FROM geo_genius.release WHERE collection_id = target_id);
+
+        DELETE FROM geo_genius.release_artifact
+         WHERE release_id IN (
+           SELECT id FROM geo_genius.release WHERE collection_id = target_id);
+
+        DELETE FROM geo_genius.release_source
+         WHERE release_id IN (
+           SELECT id FROM geo_genius.release WHERE collection_id = target_id);
+
+        DELETE FROM geo_genius.release
+         WHERE collection_id = target_id;
+
+        DELETE FROM geo_genius.source_release
+         WHERE source_id IN (
+           SELECT id FROM geo_genius.source WHERE collection_id = target_id);
+
         DELETE FROM geo_genius.collection WHERE id = target_id;
       END;
       $$

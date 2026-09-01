@@ -8,6 +8,19 @@ defmodule GeoGenius.Providers.SimpleMaps.FipsTest do
   # assigned within one.
   @non_census_state_codes ["AA", "AE", "AP", "FM", "PW", "MH"]
 
+  test "classifies only the USPS state codes the Census does not define" do
+    for code <- @non_census_state_codes do
+      assert Fips.non_census_state_code?(code), "#{code} must use the USPS-only identity"
+    end
+
+    for code <- ~w(AL DC PR VI AS GU MP) do
+      refute Fips.non_census_state_code?(code), "#{code} has a Census state identity"
+    end
+
+    refute Fips.non_census_state_code?(nil)
+    refute Fips.non_census_state_code?("not-a-code")
+  end
+
   test "a county FIPS names the state its first two digits are assigned to" do
     assert Fips.state_code("51107") == "VA"
     assert Fips.state_code("11001") == "DC"

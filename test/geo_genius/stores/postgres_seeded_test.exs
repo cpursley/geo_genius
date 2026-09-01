@@ -8,11 +8,6 @@ defmodule GeoGenius.Stores.PostgresSeededTest do
   setup do
     TestRepo.query!("SELECT geo_genius_test.demo_fixture_build()", [])
 
-    TestRepo.query!(
-      "SELECT geo_genius.rebuild_relations((SELECT id FROM geo_genius.release WHERE release_key = 'r1'))",
-      []
-    )
-
     # A second parent/child pair, asserted rather than measured, plus one
     # childless area: a plural read has to keep three seeds apart, and a seed
     # that matches nothing is what separates dropping it from padding it.
@@ -20,33 +15,52 @@ defmodule GeoGenius.Stores.PostgresSeededTest do
           "SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'P')",
           "SELECT geo_genius.upsert_area('demo', 'demo_auth', 'inner', 'Q')",
           "SELECT geo_genius.upsert_area('demo', 'demo_auth', 'outer', 'Z')",
-          "SELECT geo_genius.put_area_name('demo_auth:outer:P', 'Papa', 'official', NULL)",
-          "SELECT geo_genius.put_area_name('demo_auth:inner:Q', 'Quebec', 'official', NULL)",
-          "SELECT geo_genius.put_area_name('demo_auth:outer:Z', 'Zulu', 'official', NULL)",
-          release_write("put_area_in_release($1, 'demo_auth:outer:P', NULL, '{}'::jsonb)"),
-          release_write("put_area_in_release($1, 'demo_auth:inner:Q', NULL, '{}'::jsonb)"),
-          release_write("put_area_in_release($1, 'demo_auth:outer:Z', NULL, '{}'::jsonb)"),
-          release_write("put_relation($1, 'demo_auth:outer:P', 'demo_auth:inner:Q', 'contains')"),
-          "SELECT geo_genius.put_area_code('demo_auth:outer:A', 'fips', '01')",
-          "SELECT geo_genius.put_area_code('demo_auth:outer:P', 'fips', '02')"
+          run_write("put_area_in_release($1, $2, 'demo_auth:outer:P', NULL, '{}'::jsonb)"),
+          run_write("put_area_in_release($1, $2, 'demo_auth:inner:Q', NULL, '{}'::jsonb)"),
+          run_write("put_area_in_release($1, $2, 'demo_auth:outer:Z', NULL, '{}'::jsonb)"),
+          run_write("put_area_name($1, $2, 'demo_auth:outer:P', 'Papa', 'official', NULL)"),
+          run_write("put_area_name($1, $2, 'demo_auth:inner:Q', 'Quebec', 'official', NULL)"),
+          run_write("put_area_name($1, $2, 'demo_auth:outer:Z', 'Zulu', 'official', NULL)"),
+          run_write("put_area_code($1, $2, 'demo_auth:outer:A', 'fips', '01')"),
+          run_write("put_area_code($1, $2, 'demo_auth:outer:P', 'fips', '02')")
         ] do
       TestRepo.query!(statement, statement_params(statement))
     end
+
+    TestRepo.query!(
+      "SELECT geo_genius.advance_import(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id(), 'relating', '{}'::jsonb)",
+      []
+    )
+
+    TestRepo.query!(
+      run_write("put_relation($1, $2, 'demo_auth:outer:P', 'demo_auth:inner:Q', 'contains')"),
+      [run_id(), executor_id()]
+    )
+
+    TestRepo.query!(
+      "SELECT geo_genius.rebuild_relations(geo_genius_test.demo_run_id(), geo_genius_test.demo_executor_id())",
+      []
+    )
 
     TestRepo.query!("SELECT geo_genius_test.demo_publish()", [])
     on_exit(fn -> TestRepo.query!("SELECT geo_genius_test.demo_teardown()", []) end)
     {:ok, context: Context.new(repo: TestRepo, prefix: "geo_genius")}
   end
 
-  defp release_write(call), do: "SELECT geo_genius.#{call}"
+  defp run_write(call), do: "SELECT geo_genius.#{call}"
 
   defp statement_params(statement) do
-    if String.contains?(statement, "$1"), do: [release_id()], else: []
+    if String.contains?(statement, "$1"), do: [run_id(), executor_id()], else: []
   end
 
-  defp release_id do
-    %{rows: [[id]]} =
-      TestRepo.query!("SELECT id FROM geo_genius.release WHERE release_key = 'r1'", [])
+  defp run_id do
+    %{rows: [[id]]} = TestRepo.query!("SELECT geo_genius_test.demo_run_id()", [])
+
+    id
+  end
+
+  defp executor_id do
+    %{rows: [[id]]} = TestRepo.query!("SELECT geo_genius_test.demo_executor_id()", [])
 
     id
   end

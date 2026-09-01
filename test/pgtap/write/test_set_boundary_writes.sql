@@ -4,9 +4,14 @@ SELECT plan(12);
 
 SELECT geo_genius_test.demo_fixture_build();
 
+CREATE TEMP TABLE boundary_attempt AS
+SELECT geo_genius_test.demo_run_id() AS run_id,
+       geo_genius_test.demo_executor_id() AS executor_id;
+
 SELECT lives_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A', 'demo_auth:inner:B', 'demo_auth:outer:A'],
       ARRAY[
         (SELECT id FROM geo_genius.source_release WHERE release_key = 'v1'),
@@ -52,7 +57,8 @@ SELECT ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A'],
       ARRAY[]::uuid[],
       ARRAY[ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326)],
@@ -64,7 +70,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A'],
       ARRAY[(SELECT id FROM geo_genius.source_release WHERE release_key = 'v1')],
       ARRAY[ST_GeomFromText('POINT(0 0)', 4326)],
@@ -76,7 +83,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A'],
       ARRAY[(SELECT id FROM geo_genius.source_release WHERE release_key = 'v1')],
       ARRAY[ST_GeomFromText('POLYGON((199 5, 201 5, 201 6, 199 6, 199 5))', 4326)],
@@ -95,7 +103,8 @@ SELECT geo_genius.upsert_source_release('other', 'other:src', 'v9', NULL, '{}'::
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['other_auth:zone:X'],
       ARRAY[(SELECT id FROM geo_genius.source_release WHERE release_key = 'v1')],
       ARRAY[ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))', 4326)],
@@ -107,7 +116,8 @@ SELECT throws_ok(
 
 SELECT lives_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A', 'demo_auth:outer:A'],
       ARRAY[
         (SELECT sr.id FROM geo_genius.source_release sr
@@ -132,7 +142,8 @@ SELECT
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A'],
       ARRAY[(SELECT sr.id FROM geo_genius.source_release sr
               JOIN geo_genius.source s ON s.id = sr.source_id
@@ -146,7 +157,8 @@ SELECT throws_ok(
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundary(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       'demo_auth:outer:A',
       (SELECT sr.id FROM geo_genius.source_release sr
         JOIN geo_genius.source s ON s.id = sr.source_id
@@ -162,7 +174,8 @@ SELECT geo_genius_test.demo_publish();
 
 SELECT throws_ok(
   $$SELECT geo_genius.put_boundaries(
-      (SELECT id FROM geo_genius.release WHERE release_key = 'r1'),
+      (SELECT run_id FROM boundary_attempt),
+      (SELECT executor_id FROM boundary_attempt),
       ARRAY['demo_auth:outer:A'],
       ARRAY[(SELECT id FROM geo_genius.source_release WHERE release_key = 'v1')],
       ARRAY[ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))', 4326)],

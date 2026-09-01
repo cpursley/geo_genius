@@ -5,6 +5,7 @@ defmodule GeoGenius.PipelineTest do
   alias GeoGenius.Caches.FileSystem
   alias GeoGenius.Catalog
   alias GeoGenius.Context
+  alias GeoGenius.ExecutionGuardian
   alias GeoGenius.GraphFixture
   alias GeoGenius.ImportFixture
   alias GeoGenius.ImportRun
@@ -17,7 +18,6 @@ defmodule GeoGenius.PipelineTest do
   alias GeoGenius.Provider.Area.Name
   alias GeoGenius.Published
   alias GeoGenius.RecordingRepo
-  alias GeoGenius.Registration
   alias GeoGenius.Staging
   alias GeoGenius.TestRepo
 
@@ -35,10 +35,10 @@ defmodule GeoGenius.PipelineTest do
   # The four statements a national import can spend minutes inside, each
   # identified by a fragment of the SQL the catalog issues for it.
   @timed_statements [
-    "unnest($1::text[]",
+    "insert_staging_many",
     "rebuild_relations",
-    "analyze_release",
-    "verify_release"
+    "analyze_import",
+    "verify_import"
   ]
 
   # `Relate.relate/1` asks a provider only these two questions, so these carry
@@ -53,6 +53,51 @@ defmodule GeoGenius.PipelineTest do
     @moduledoc false
     def relations(_manifest), do: :none
     def asserted_relations(_manifest, _row), do: []
+  end
+
+  defmodule PublishCommitLostReplyRepo do
+    @moduledoc false
+
+    def query(sql, params, opts \\ []) do
+      result = GeoGenius.TestRepo.query(sql, params, opts)
+
+      if sql =~ "publish_import" and Process.get({__MODULE__, :reply_lost?}) != true do
+        Process.put({__MODULE__, :reply_lost?}, true)
+        raise DBConnection.ConnectionError, "the publish committed but its reply was lost"
+      end
+
+      result
+    end
+  end
+
+  defmodule CompleteCommitLostReplyRepo do
+    @moduledoc false
+
+    def query(sql, params, opts \\ []) do
+      result = GeoGenius.TestRepo.query(sql, params, opts)
+
+      if sql =~ "complete_import" and Process.get({__MODULE__, :reply_lost?}) != true do
+        Process.put({__MODULE__, :reply_lost?}, true)
+        raise DBConnection.ConnectionError, "the complete committed but its reply was lost"
+      end
+
+      result
+    end
+  end
+
+  defmodule ClaimCommitLostReplyRepo do
+    @moduledoc false
+
+    def query(sql, params, opts \\ []) do
+      result = GeoGenius.TestRepo.query(sql, params, opts)
+
+      if sql =~ "claim_import_execution" and Process.get({__MODULE__, :reply_lost?}) != true do
+        Process.put({__MODULE__, :reply_lost?}, true)
+        raise "the executor claim committed but its reply was lost"
+      end
+
+      result
+    end
   end
 
   defmodule ConvertingCommand do
@@ -177,6 +222,38 @@ defmodule GeoGenius.PipelineTest do
       assert run.error == nil
     end
 
+    test "executes the manifest snapshot claimed by the run", fixtures do
+      {_manifest, release_id, run_id} = prepare(fixtures)
+
+      TestRepo.query!(
+        """
+        UPDATE geo_genius.release
+           SET manifest = jsonb_set(manifest, '{provider}', '"unregistered"'::jsonb)
+         WHERE id = $1
+        """,
+        [Ecto.UUID.dump!(release_id)]
+      )
+
+      assert {:ok, %ImportRun{status: "completed"}} =
+               Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+    end
+
+    test "rejects an invalid manifest snapshot on the run", fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+
+      TestRepo.query!(
+        "UPDATE geo_genius.import_run SET manifest = '{}'::jsonb WHERE id = $1",
+        [Ecto.UUID.dump!(run_id)]
+      )
+
+      assert {:error, %ImportRun{} = run} =
+               Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+
+      assert run.status == "failed"
+      assert run.error["phase"] == "pending"
+      assert run.error["reason"] =~ "manifest"
+    end
+
     test "lands the areas where a spatial read finds them", fixtures do
       {_manifest, release_id, run_id} = prepare(fixtures)
 
@@ -289,6 +366,65 @@ defmodule GeoGenius.PipelineTest do
 
       assert_received {:notified, :release_published, %{release_id: ^release_id}}
     end
+
+    test "a duplicate delivery returns a no-op and cannot replace the first executor's publish intent",
+         fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      first_executor = Ecto.UUID.generate()
+
+      assert Catalog.claim_import_execution(fixtures.context, run_id, first_executor) == :claimed
+
+      assert {:noop, %ImportRun{run_id: ^run_id, executor_id: ^first_executor}} =
+               Pipeline.execute(
+                 fixtures.context,
+                 run_id,
+                 Keyword.put(fixtures.opts, :publish, true)
+               )
+
+      assert Catalog.published_release(fixtures.context, "demo") == nil
+      assert Catalog.import_run(fixtures.context, run_id).status == "pending"
+      refute_received {:notified, :import_started, _payload}
+      refute_received {:notified, :import_completed, _payload}
+    end
+
+    test "a lost executor-claim reply is resolved with the same executor identity", fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      context = %{fixtures.context | repo: ClaimCommitLostReplyRepo}
+      Process.delete({ClaimCommitLostReplyRepo, :reply_lost?})
+
+      assert {:ok, %ImportRun{status: "completed"}} =
+               Pipeline.execute(context, run_id, fixtures.opts)
+
+      assert Catalog.import_run(fixtures.context, run_id).status == "completed"
+    end
+
+    test "a lost reply after non-publishing completion rereads completed instead of recording failure",
+         fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      context = %{fixtures.context | repo: CompleteCommitLostReplyRepo}
+      Process.delete({CompleteCommitLostReplyRepo, :reply_lost?})
+
+      assert {:ok, %ImportRun{status: "completed"}} =
+               Pipeline.execute(context, run_id, fixtures.opts)
+
+      assert Catalog.import_run(fixtures.context, run_id).status == "completed"
+      refute_received {:notified, :import_failed, _payload}
+    end
+
+    test "a lost reply after atomic publication rereads completed instead of recording failure",
+         fixtures do
+      {_manifest, release_id, run_id} = prepare(fixtures)
+      context = %{fixtures.context | repo: PublishCommitLostReplyRepo}
+      Process.delete({PublishCommitLostReplyRepo, :reply_lost?})
+
+      assert {:ok, %ImportRun{status: "completed"} = run} =
+               Pipeline.execute(context, run_id, Keyword.put(fixtures.opts, :publish, true))
+
+      assert run.release_id == release_id
+      assert Catalog.published_release(fixtures.context, "demo") == release_id
+      assert Catalog.import_run(fixtures.context, run_id).status == "completed"
+      refute_received {:notified, :import_failed, _payload}
+    end
   end
 
   describe "the artifact cache" do
@@ -317,7 +453,7 @@ defmodule GeoGenius.PipelineTest do
       assert_received {:downloaded, @url}
 
       # A download's own digest and `Downloader.hash_file/1`'s must agree:
-      # both reach `record_artifact_observation/3`, which refuses a mismatch.
+      # both reach `record_artifact_observation/5`, which refuses a mismatch.
       assert observation() == {sha256(fixtures.body), byte_size(fixtures.body)}
 
       {_manifest, _second_release, second_run} = prepare(fixtures, release: "r2")
@@ -420,6 +556,42 @@ defmodule GeoGenius.PipelineTest do
   end
 
   describe "failure handling" do
+    test "execute is idempotent for a completed run and starts no phases", fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      executor_id = Ecto.UUID.generate()
+      assert :claimed = Catalog.claim_import_execution(fixtures.context, run_id, executor_id)
+
+      # This test starts from a terminal fixture to isolate execute/3's
+      # idempotent read path from the completion operation itself.
+      TestRepo.query!(
+        "UPDATE geo_genius.import_run SET status = 'completed', completed_at = now() WHERE id = $1",
+        [Ecto.UUID.dump!(run_id)]
+      )
+
+      TestRepo.query!("DELETE FROM geo_genius.import_run_lease WHERE run_id = $1", [
+        Ecto.UUID.dump!(run_id)
+      ])
+
+      assert {:ok, %ImportRun{status: "completed", run_id: ^run_id}} =
+               Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+
+      refute_received {:notified, :import_started, _payload}
+      refute_received {:notified, :phase_advanced, _payload}
+    end
+
+    test "execute is idempotent for a failed run and starts no phases", fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      executor_id = Ecto.UUID.generate()
+      assert :claimed = Catalog.claim_import_execution(fixtures.context, run_id, executor_id)
+      Catalog.fail_import(fixtures.context, run_id, executor_id, %{"reason" => "fixture"})
+
+      assert {:error, %ImportRun{status: "failed", run_id: ^run_id}} =
+               Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+
+      refute_received {:notified, :import_started, _payload}
+      refute_received {:notified, :phase_advanced, _payload}
+    end
+
     test "a verification failure fails the run in verifying and publishes nothing",
          fixtures do
       {_manifest, _release_id, run_id} = prepare_stub(fixtures, rows: [], mode: "default")
@@ -461,7 +633,7 @@ defmodule GeoGenius.PipelineTest do
       # There is no run to record a failure against, which is exactly what the
       # :unrecorded tag means: a caller matching {:error, run} never has to
       # discover a bare string in that position in production.
-      assert {:error, {:unrecorded, reason}} =
+      assert {:error, {:unrecorded, :not_started, reason}} =
                Pipeline.execute(fixtures.context, Ecto.UUID.generate(), [])
 
       assert reason =~ "does not exist"
@@ -483,6 +655,67 @@ defmodule GeoGenius.PipelineTest do
       assert run.error["exception"] == ":exit"
       assert run.error["reason"] =~ "stub_provider_left"
       assert run.error["stacktrace"] != []
+    end
+
+    test "a work-directory setup failure becomes durable after the executor is claimed",
+         fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      blocked_parent = Path.join(fixtures.work_dir, "not_a_directory")
+      File.mkdir_p!(fixtures.work_dir)
+      File.write!(blocked_parent, "occupied by a file")
+
+      opts = Keyword.put(fixtures.opts, :work_dir, blocked_parent)
+
+      assert {:error, %ImportRun{} = run} =
+               Pipeline.execute(fixtures.context, run_id, opts)
+
+      assert run.status == "failed"
+      assert run.error["phase"] == "pending"
+      assert run.error["exception"] =~ "File.Error"
+      assert run.error["reason"] =~ "not_a_directory"
+    end
+
+    test "a forcibly killed executor is terminalized by its independent guardian", fixtures do
+      {_manifest, _release_id, run_id} =
+        prepare_stub(fixtures,
+          mode: "block",
+          rows: [
+            %{
+              "code" => "blocked",
+              "name" => "Blocked",
+              "area_type" => "region"
+            }
+          ]
+        )
+
+      {executor_pid, monitor_ref} =
+        spawn_monitor(fn -> Pipeline.execute(fixtures.context, run_id, fixtures.opts) end)
+
+      assert_receive {:stub_provider_blocked, ^executor_pid}, 5_000
+      Process.exit(executor_pid, :kill)
+      assert_receive {:DOWN, ^monitor_ref, :process, ^executor_pid, :killed}, 5_000
+
+      assert %ImportRun{status: "failed", error: error} = await_terminal_run(run_id)
+      assert error["phase"] == "execution"
+      assert error["reason"] =~ "executor process terminated"
+      assert error["exit_reason"] =~ "killed"
+    end
+
+    test "the guardian ignores unrelated messages until it is normally disarmed", fixtures do
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+      executor_id = Ecto.UUID.generate()
+
+      assert {:ok, guardian} =
+               ExecutionGuardian.start(fixtures.context, run_id, executor_id, self())
+
+      assert :claimed = Catalog.claim_import_execution(fixtures.context, run_id, executor_id)
+
+      monitor_ref = Process.monitor(guardian)
+      send(guardian, {:unrelated, :observer_message})
+
+      assert %{executor_id: ^executor_id} = :sys.get_state(guardian)
+      assert :ok = ExecutionGuardian.disarm(guardian)
+      assert_receive {:DOWN, ^monitor_ref, :process, ^guardian, :normal}, 1_000
     end
 
     test "a cleanup that fails cannot destroy the failure the run already recorded",
@@ -528,11 +761,13 @@ defmodule GeoGenius.PipelineTest do
         |> Keyword.put(:arm_on, :import_completed)
         |> Keyword.put(:arm, fn -> RecordingRepo.fail_on("import_run_status") end)
 
-      assert {:error, {:unrecorded, reason}} = Pipeline.execute(context, run_id, opts)
+      assert {:error, {:unrecorded, :outcome_unknown, reason}} =
+               Pipeline.execute(context, run_id, opts)
+
       assert reason =~ "completed, but reading it back failed"
 
       # The advance succeeded, so the run is completed in PostgreSQL and only
-      # the snapshot is missing. `fail_import/3` has no terminal-state guard,
+      # the snapshot is missing. `fail_import/4` refuses a completed run,
       # so routing this to the failure path would rewrite a finished run as
       # failed -- and tell the host so, right after telling it the opposite.
       assert Catalog.import_run(fixtures.context, run_id).status == "completed"
@@ -546,7 +781,8 @@ defmodule GeoGenius.PipelineTest do
 
       RecordingRepo.fail_on("fail_import")
 
-      assert {:error, {:unrecorded, reason}} = Pipeline.execute(context, run_id, fixtures.opts)
+      assert {:error, {:unrecorded, :outcome_unknown, reason}} =
+               Pipeline.execute(context, run_id, fixtures.opts)
 
       # The original failure, not the one that happened while recording it.
       assert reason =~ "stub provider exploded"
@@ -563,20 +799,22 @@ defmodule GeoGenius.PipelineTest do
       assert staging_table(failed_run) == nil
     end
 
-    # An attempt killed where the cleanup above could not run -- a lost
-    # machine, a killed VM -- leaves its rows staged under its own run id, and
-    # `begin_or_resume_import` hands that same run to the next worker once the
-    # lease goes stale. Every phase runs again from the start, so the artifact
-    # is parsed into the table a second time. Appending to what is there
-    # doubles the staged rows, and the rows it doubles them with are the
-    # previous attempt's: a row the source no longer carries is normalized
-    # into the release anyway.
-    test "a second staging pass empties the table the first one left behind", fixtures do
+    # An execution killed before cleanup can leave staged rows behind. A
+    # duplicate delivery must not resume that execution or mutate its staging
+    # table while the original executor still owns the run.
+    test "a duplicate delivery leaves the first executor's staging table untouched", fixtures do
       {_manifest, release_id, run_id} = prepare_stub(fixtures, [])
+      first_executor = Ecto.UUID.generate()
 
-      Staging.create(fixtures.context, run_id)
+      assert Catalog.claim_import_execution(fixtures.context, run_id, first_executor) == :claimed
 
-      Staging.insert(fixtures.context, run_id, [
+      for phase <- ~w(downloading validating staging) do
+        Catalog.advance_import(fixtures.context, run_id, first_executor, phase, %{})
+      end
+
+      Staging.create(fixtures.context, run_id, first_executor)
+
+      Staging.insert(fixtures.context, run_id, first_executor, [
         %Staging.Row{
           artifact: "territories.geojson",
           payload: %{"code" => "ghost", "name" => "Ghost", "area_type" => "region"},
@@ -586,11 +824,15 @@ defmodule GeoGenius.PipelineTest do
 
       assert Staging.count(fixtures.context, run_id) == 1
 
-      assert {:ok, run} = Pipeline.execute(fixtures.context, run_id, fixtures.opts)
+      assert {:noop,
+              %ImportRun{
+                run_id: ^run_id,
+                executor_id: ^first_executor,
+                status: "staging"
+              }} = Pipeline.execute(fixtures.context, run_id, fixtures.opts)
 
-      assert run.stage_metrics["staged"] == 1
-      assert run.stage_metrics["areas"] == 1
-      assert release_area_keys(release_id) == ["demo:region:north"]
+      assert Staging.count(fixtures.context, run_id) == 1
+      assert release_area_keys(release_id) == []
     end
   end
 
@@ -925,7 +1167,7 @@ defmodule GeoGenius.PipelineTest do
     end
 
     test "the asserted edges do not overwrite the measured one", fixtures do
-      # `Catalog.put_relation_many/3` upserts on `(parent_area_id,
+      # `Catalog.put_relation_many/4` upserts on `(parent_area_id,
       # child_area_id)` and nulls the three measurement columns when an
       # asserted edge lands on a measured pair, with no warning. The two sets
       # here are disjoint, so the measurement must survive intact.
@@ -1074,6 +1316,7 @@ defmodule GeoGenius.PipelineTest do
         opts = RecordingRepo.options_for(recorded, fragment)
         assert opts != nil, "no query recorded for #{fragment}"
         assert opts[:timeout] == 900_000, "#{fragment} ran without the default timeout"
+        assert opts[:checkout_retries] == 0, "#{fragment} permits an ambiguous retry"
       end
 
       {_manifest, _release_id, second_run} = prepare(fixtures, release: "r2")
@@ -1085,6 +1328,21 @@ defmodule GeoGenius.PipelineTest do
 
       for fragment <- @timed_statements do
         assert RecordingRepo.options_for(recorded, fragment)[:timeout] == 4_242
+      end
+    end
+
+    test "artifact and staging mutations disable connection checkout retries", fixtures do
+      context = %{fixtures.context | repo: RecordingRepo}
+      {_manifest, _release_id, run_id} = prepare(fixtures)
+
+      assert {:ok, _run} = Pipeline.execute(context, run_id, fixtures.opts)
+
+      recorded = RecordingRepo.recorded()
+
+      for fragment <- ~w(record_artifact_observation create_staging drop_staging) do
+        opts = RecordingRepo.options_for(recorded, fragment)
+        assert opts != nil, "no query recorded for #{fragment}"
+        assert opts[:checkout_retries] == 0, "#{fragment} permits an ambiguous retry"
       end
     end
 
@@ -1113,7 +1371,7 @@ defmodule GeoGenius.PipelineTest do
       context = %{fixtures.context | repo: RecordingRepo}
       {_manifest, release_id, run_id} = prepare(fixtures)
 
-      # `publish_release` re-runs `verify_release` inside itself, so a
+      # `publish_import` re-runs verification inside itself, so a
       # publishing phase left on DBConnection's fifteen-second default fails
       # every release the verifying phase needed its timeout for.
       opts = Keyword.put(fixtures.opts, :publish, true)
@@ -1122,16 +1380,17 @@ defmodule GeoGenius.PipelineTest do
       assert Catalog.published_release(context, "demo") == release_id
 
       recorded = RecordingRepo.recorded()
-      published = RecordingRepo.options_for(recorded, "publish_release")
-      assert published != nil, "no query recorded for publish_release"
-      assert published[:timeout] == 900_000, "publish_release ran without the default timeout"
+      published = RecordingRepo.options_for(recorded, "publish_import")
+      assert published != nil, "no query recorded for publish_import"
+      assert published[:timeout] == 900_000, "publish_import ran without the default timeout"
+      assert published[:checkout_retries] == 0, "publish_import permits an ambiguous retry"
 
       {_manifest, _release_id, second_run} = prepare(fixtures, release: "r2")
 
       assert {:ok, _run} =
                Pipeline.execute(context, second_run, Keyword.put(opts, :timeout, 4_242))
 
-      assert RecordingRepo.options_for(RecordingRepo.recorded(), "publish_release")[:timeout] ==
+      assert RecordingRepo.options_for(RecordingRepo.recorded(), "publish_import")[:timeout] ==
                4_242
     end
 
@@ -1147,6 +1406,20 @@ defmodule GeoGenius.PipelineTest do
 
       recorded = RecordingRepo.recorded()
       assert RecordingRepo.options_for(recorded, "rebuild_relations")[:timeout] == 900_000
+    end
+  end
+
+  test "both relation writes disable checkout retries and preserve the phase timeout" do
+    state = relation_fixture()
+    recording = %{state | context: %{state.context | repo: RecordingRepo}}
+
+    assert {:ok, %State{}} = Relate.relate(recording)
+    recorded = RecordingRepo.recorded()
+
+    for fragment <- ["rebuild_relations", "put_relation_many"] do
+      opts = RecordingRepo.options_for(recorded, fragment)
+      assert opts[:timeout] == state.timeout, "#{fragment} lost the phase timeout"
+      assert opts[:checkout_retries] == 0, "#{fragment} permits an ambiguous retry"
     end
   end
 
@@ -1168,34 +1441,73 @@ defmodule GeoGenius.PipelineTest do
 
     on_exit(fn -> ImportFixture.teardown!(collection) end)
 
-    Catalog.upsert_collection(context, %{key: collection, name: collection})
-    Catalog.upsert_authority(context, collection, %{key: "demo_auth", name: "Demo Authority"})
+    manifest_map = %{
+      "collection" => collection,
+      "collection_name" => collection,
+      "release" => "r1",
+      "provider" => "geojson",
+      "requires_geometry" => false,
+      "authorities" => [%{"key" => "demo_auth", "name" => "Demo Authority"}],
+      "area_types" =>
+        Enum.map(area_types, fn area_type ->
+          %{
+            "key" => Map.fetch!(area_type, :key),
+            "rank" => Map.fetch!(area_type, :rank),
+            "requires_geometry" => Map.get(area_type, :requires_geometry, false)
+          }
+        end),
+      "sources" => [
+        %{
+          "source_key" => "#{collection}:fixture",
+          "provider" => "geojson",
+          "license" => "CC0-1.0",
+          "release_key" => "r1",
+          "artifacts" => [
+            %{
+              "logical_name" => "fixture.geojson",
+              "operator_supplied" => true,
+              "format" => "geojson",
+              "required" => true,
+              "sha256" => sha256("fixture"),
+              "bytes" => byte_size("fixture")
+            }
+          ]
+        }
+      ],
+      "options" => %{
+        "area_type" => area_types |> hd() |> Map.fetch!(:key),
+        "code_property" => "code"
+      }
+    }
 
-    Enum.each(area_types, &Catalog.upsert_area_type(context, collection, &1))
+    {:ok, manifest} = Manifest.from_map(manifest_map)
 
-    release_id =
-      Catalog.open_release(context, collection, %{
-        release_key: "r1",
-        manifest: %{"collection" => collection},
-        source_date: ~D[2026-01-15]
-      })
-
-    run_id =
-      Catalog.begin_or_resume_import(context, release_id, %{
+    candidate =
+      ImportFixture.prepare!(context, manifest,
         owner: "asserting-fixture",
         runner_backend: "test",
         stale_after_seconds: 300
-      })
+      )
 
-    on_exit(fn -> Staging.drop(context, run_id) end)
+    run_id = candidate.run_id
+    executor_id = Ecto.UUID.generate()
+    assert :claimed = Catalog.claim_import_execution(context, run_id, executor_id)
 
-    Staging.create(context, run_id)
+    on_exit(fn -> Staging.drop(context, run_id, executor_id) end)
+
+    for phase <- ~w(downloading validating staging) do
+      Catalog.advance_import(context, run_id, executor_id, phase, %{})
+    end
+
+    Staging.create(context, run_id, executor_id)
     rows = Enum.map(payloads, &%Staging.Row{artifact: "fixture", payload: &1, geom: nil})
-    Staging.insert(context, run_id, rows)
+    Staging.insert(context, run_id, executor_id, rows)
+    Catalog.advance_import(context, run_id, executor_id, "normalizing", %{})
 
     state = %State{
       context: context,
       run: Catalog.import_run(context, run_id),
+      executor_id: executor_id,
       opts: [],
       work_dir: System.tmp_dir!(),
       publish?: false,
@@ -1207,7 +1519,8 @@ defmodule GeoGenius.PipelineTest do
     }
 
     assert {:ok, state} = Normalize.normalize(state)
-    state
+    :ok = Catalog.advance_import(context, run_id, executor_id, "relating", %{})
+    %{state | run: Catalog.import_run(context, run_id)}
   end
 
   defp relation_exists?(%State{context: context, run: run}, parent_key, child_key, relation_type) do
@@ -1249,22 +1562,37 @@ defmodule GeoGenius.PipelineTest do
     prepare_manifest(fixtures, geojson_manifest(fixtures, opts))
   end
 
+  defp await_terminal_run(run_id, attempts \\ 50)
+
+  defp await_terminal_run(run_id, attempts) when attempts > 0 do
+    case Catalog.import_run(Context.new(repo: TestRepo, prefix: "geo_genius"), run_id) do
+      %ImportRun{status: status} = run when status in ["completed", "failed"] ->
+        run
+
+      _run ->
+        Process.sleep(20)
+        await_terminal_run(run_id, attempts - 1)
+    end
+  end
+
+  defp await_terminal_run(run_id, 0),
+    do: Catalog.import_run(Context.new(repo: TestRepo, prefix: "geo_genius"), run_id)
+
   defp prepare_stub(fixtures, opts) do
     prepare_manifest(fixtures, stub_manifest(fixtures, opts))
   end
 
   defp prepare_manifest(fixtures, map) do
     {:ok, manifest} = Manifest.from_map(map)
-    release_id = Registration.register(fixtures.context, manifest)
 
-    run_id =
-      Catalog.begin_or_resume_import(fixtures.context, release_id, %{
+    candidate =
+      ImportFixture.prepare!(fixtures.context, manifest,
         owner: "pipeline-test",
         runner_backend: "test",
         stale_after_seconds: 300
-      })
+      )
 
-    {manifest, release_id, run_id}
+    {manifest, candidate.release_id, candidate.run_id}
   end
 
   # What `GeoGenius.import/1` will do before it calls the pipeline: the
@@ -1296,7 +1624,11 @@ defmodule GeoGenius.PipelineTest do
     |> geojson_manifest(opts)
     |> Map.put("provider", "stub")
     |> Map.update!("sources", fn sources ->
-      Enum.map(sources, &Map.put(&1, "provider", "stub"))
+      Enum.map(sources, fn source ->
+        source
+        |> Map.put("source_key", "demo:territories_stub")
+        |> Map.put("provider", "stub")
+      end)
     end)
     |> Map.put("area_types", [
       %{"key" => "region", "rank" => 300},
@@ -1461,7 +1793,13 @@ defmodule GeoGenius.PipelineTest do
   defp observation do
     %Postgrex.Result{rows: [[sha, bytes, validated_at]]} =
       TestRepo.query!(
-        "SELECT observed_sha256, observed_bytes, validated_at FROM geo_genius.artifact",
+        """
+        SELECT observed_sha256, observed_bytes, validated_at
+          FROM geo_genius.run_artifacts
+         WHERE observed_sha256 IS NOT NULL
+         ORDER BY validated_at DESC
+         LIMIT 1
+        """,
         []
       )
 

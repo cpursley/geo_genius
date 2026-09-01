@@ -2,6 +2,11 @@ import Config
 
 config :geo_genius, ecto_repos: [GeoGenius.TestRepo]
 
+# The package itself ships no PgFlow deadline. This test application acts as
+# a neutral consumer and chooses one at compile time so the optional-dependency
+# graph compiles and exercises GeoGenius.Runners.PgFlow.Job.
+config :geo_genius, pgflow_job_timeout_seconds: 1_200
+
 # The fallback `GeoGenius.Config.repo!/1` reaches when a caller drops an
 # explicit `repo:` option. `GeoGenius.SandboxedRepo` runs in `:manual` sandbox
 # mode, so that fallback raises `DBConnection.OwnershipError` naming this repo

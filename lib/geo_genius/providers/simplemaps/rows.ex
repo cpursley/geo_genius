@@ -24,7 +24,9 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   `usps` and carry a `usps_state` code instead. The code is carried rather
   than omitted because it is true and it leaves a host the same external-code
   join every other area offers; an area with no code at all would be
-  reachable only by key.
+  reachable only by key. Their area type defaults to `state` for compatibility,
+  but `areas/2` and `edges/2` accept the separately declared type selected by
+  the SimpleMaps manifest's `non_census_state_area_type` option.
 
   Nothing else about them changes: a name is read from `state_name` the way
   every other state's is. `FM`, `PW` and `MH` carry one and get it. `AA`, `AE`
@@ -54,15 +56,15 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   the city or ZIP, and hanging them on the county would let the last row
   imported decide what the county's median income is.
 
-  `edges/1` reads the same county columns `areas/1` does, through the same
+  `edges/2` reads the same county columns `areas/2` does, through the same
   helpers, so the hierarchy this provider asserts can only ever name keys
-  `areas/1` produced.
+  `areas/2` produced.
 
   This module knows SimpleMaps column names and how to parse them.
   `GeoGenius.Providers.SimpleMaps.Validation` reuses `list/2`, `field/2`,
   `label/1`, and the two counties-column-name accessors here rather than
   re-deriving them, so the two modules can never disagree about how a column
-  is read. `areas/1` runs `Validation.check/1` before building anything, so a
+  is read. `areas/2` runs `Validation.check/1` before building anything, so a
   row whose county columns contradict each other fails the release instead of
   being silently reconciled.
   """
@@ -84,14 +86,6 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   # "county_fips_all" and the counties column are pipe-delimited lists,
   # positionally paired: the nth fips is named by the nth name.
   @separator "|"
-
-  # State codes the USPS defines and the Census does not. `AA`, `AE` and `AP`
-  # are constructs for military mail -- Armed Forces Americas, Europe and
-  # Pacific. `FM`, `PW` and `MH` are the Freely Associated States --
-  # Micronesia, Palau and the Marshall Islands -- sovereign countries the
-  # USPS serves. The Census defines none of the six and assigns them no ANSI
-  # code, so they key under `usps` rather than `census`.
-  @non_census_state_codes ["AA", "AE", "AP", "FM", "PW", "MH"]
 
   # Read in this order into the description of a row an error names. These
   # three public place-name columns are the whole allowlist, and widening it
@@ -139,35 +133,46 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   it in a file of tens of thousands.
   """
   @spec areas(Staging.Row.t()) :: {:ok, [Area.t()]} | {:error, String.t()}
-  def areas(%Staging.Row{} = row) do
+  def areas(%Staging.Row{} = row), do: areas(row, "state")
+
+  @doc "Like `areas/1`, with the area type selected for the six USPS-only state codes."
+  @spec areas(Staging.Row.t(), String.t()) :: {:ok, [Area.t()]} | {:error, String.t()}
+  def areas(%Staging.Row{} = row, non_census_state_area_type) do
     with :ok <- Validation.check(row) do
-      build(row)
+      build(row, non_census_state_area_type)
     end
   end
 
-  defp build(%Staging.Row{artifact: "uscities", payload: payload}) do
+  defp build(%Staging.Row{artifact: "uscities", payload: payload}, non_census_state_area_type) do
     with {:ok, id} <- require_field(payload, "id"),
          {:ok, state_id} <- require_field(payload, "state_id") do
       counties = counties(payload, @cities_county_names)
 
       {:ok,
        [city(id, payload) | counties] ++
-         [state(state_id, payload) | county_states(counties, state_id)]}
+         [
+           state(state_id, payload, non_census_state_area_type)
+           | county_states(counties, state_id, non_census_state_area_type)
+         ]}
     end
   end
 
-  defp build(%Staging.Row{artifact: "uszips", payload: payload}) do
+  defp build(%Staging.Row{artifact: "uszips", payload: payload}, non_census_state_area_type) do
     with {:ok, code} <- require_field(payload, "zip"),
          {:ok, state_id} <- require_field(payload, "state_id") do
       counties = counties(payload, @zips_county_names)
 
       {:ok,
        counties ++
-         [zip(code, payload), state(state_id, payload) | county_states(counties, state_id)]}
+         [
+           zip(code, payload),
+           state(state_id, payload, non_census_state_area_type)
+           | county_states(counties, state_id, non_census_state_area_type)
+         ]}
     end
   end
 
-  defp build(%Staging.Row{artifact: other}) do
+  defp build(%Staging.Row{artifact: other}, _non_census_state_area_type) do
     {:error, "unknown artifact #{other}"}
   end
 
@@ -197,7 +202,7 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   lines, and neither one contains the other.
 
   Every edge names the parent first, the order
-  `GeoGenius.Catalog.put_relation/3` takes: a swapped pair writes
+  `GeoGenius.Catalog.put_relation/4` takes: a swapped pair writes
   successfully and silently inverts `GeoGenius.children_of/2` and
   `GeoGenius.ancestors_of/2`.
 
@@ -215,19 +220,26 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   `areas/1` is what reports that as an error.
   """
   @spec edges(Staging.Row.t()) :: [{String.t(), String.t(), String.t()}]
-  def edges(%Staging.Row{artifact: "uscities", payload: payload}) do
+  def edges(%Staging.Row{} = row), do: edges(row, "state")
+
+  @doc "Like `edges/1`, with the area type selected for the six USPS-only state codes."
+  @spec edges(Staging.Row.t(), String.t()) :: [{String.t(), String.t(), String.t()}]
+  def edges(
+        %Staging.Row{artifact: "uscities", payload: payload},
+        non_census_state_area_type
+      ) do
     payload
     |> counties(@cities_county_names)
-    |> hierarchy(payload, key_of(payload, "id", &city/2))
+    |> hierarchy(payload, key_of(payload, "id", &city/2), non_census_state_area_type)
   end
 
-  def edges(%Staging.Row{artifact: "uszips", payload: payload}) do
+  def edges(%Staging.Row{artifact: "uszips", payload: payload}, non_census_state_area_type) do
     payload
     |> counties(@zips_county_names)
-    |> hierarchy(payload, key_of(payload, "zip", &zip/2))
+    |> hierarchy(payload, key_of(payload, "zip", &zip/2), non_census_state_area_type)
   end
 
-  def edges(%Staging.Row{}), do: []
+  def edges(%Staging.Row{}, _non_census_state_area_type), do: []
 
   # A row naming no county hangs its child straight off the state, which is
   # the only parent it has: a military or Freely Associated States ZIP is in
@@ -237,8 +249,12 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   # a second, redundant path to the same place. A `uscities` row never
   # reaches this clause: `GeoGenius.Providers.SimpleMaps.Validation.check/1`
   # fails a city row naming no county before normalization.
-  defp hierarchy([], payload, child_key) do
-    edge(key_of(payload, "state_id", &state/2), child_key, "contains")
+  defp hierarchy([], payload, child_key, non_census_state_area_type) do
+    state_builder = fn state_id, state_payload ->
+      state(state_id, state_payload, non_census_state_area_type)
+    end
+
+    edge(key_of(payload, "state_id", state_builder), child_key, "contains")
   end
 
   # A county FIPS is assigned within a state and its first two digits name
@@ -249,13 +265,13 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   # state. The city or ZIP is contained only where the row names one county;
   # a row naming several describes a place crossing county lines, which each
   # of those counties overlaps rather than contains.
-  defp hierarchy(counties, _payload, child_key) do
+  defp hierarchy(counties, _payload, child_key, non_census_state_area_type) do
     child_type = child_relation_type(counties)
 
     Enum.flat_map(counties, fn county ->
       county_key = Area.key(county)
 
-      edge(state_key_of(county), county_key, "contains") ++
+      edge(state_key_of(county, non_census_state_area_type), county_key, "contains") ++
         edge(county_key, child_key, child_type)
     end)
   end
@@ -266,8 +282,8 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   # about the county often enough to be why the prefix is read at all.
   # `edge/3` drops a nil parent, so the county keeps its child edge and loses
   # only the assertion nothing supports.
-  defp state_key_of(county) do
-    case county_state(county) do
+  defp state_key_of(county, non_census_state_area_type) do
+    case county_state(county, non_census_state_area_type) do
       nil -> nil
       state -> Area.key(state)
     end
@@ -278,20 +294,20 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
   # key the row's own would. It carries no name: `state_name` on the row
   # describes the row's state, and copying it onto a different state would
   # label Virginia "District of Columbia".
-  defp county_state(%Area{code: fips}) do
+  defp county_state(%Area{code: fips}, non_census_state_area_type) do
     case Fips.state_code(fips) do
       nil -> nil
-      code -> state(code, %{})
+      code -> state(code, %{}, non_census_state_area_type)
     end
   end
 
   # The states a row's counties lie in that the row itself does not name.
-  # `GeoGenius.Catalog.put_relation/3` requires both ends of an edge to be
+  # `GeoGenius.Catalog.put_relation/4` requires both ends of an edge to be
   # members of the release, so the state a county hangs under has to be an
   # area this row produced, not one another row is assumed to have produced.
-  defp county_states(counties, state_id) do
+  defp county_states(counties, state_id, non_census_state_area_type) do
     counties
-    |> Enum.map(&county_state/1)
+    |> Enum.map(&county_state(&1, non_census_state_area_type))
     |> Enum.reject(&(is_nil(&1) or &1.code == state_id))
     |> Enum.uniq_by(& &1.code)
   end
@@ -386,18 +402,18 @@ defmodule GeoGenius.Providers.SimpleMaps.Rows do
     }
   end
 
-  defp state(state_id, payload) when state_id in @non_census_state_codes do
-    state_area(state_id, payload, "usps", "usps_state")
+  defp state(state_id, payload, non_census_state_area_type) do
+    if Fips.non_census_state_code?(state_id) do
+      state_area(state_id, payload, "usps", non_census_state_area_type, "usps_state")
+    else
+      state_area(state_id, payload, "census", "state", "ansi_state")
+    end
   end
 
-  defp state(state_id, payload) do
-    state_area(state_id, payload, "census", "ansi_state")
-  end
-
-  defp state_area(state_id, payload, authority, code_type) do
+  defp state_area(state_id, payload, authority, area_type, code_type) do
     %Area{
       authority_key: authority,
-      area_type_key: "state",
+      area_type_key: area_type,
       code: state_id,
       centroid: nil,
       geometry: nil,

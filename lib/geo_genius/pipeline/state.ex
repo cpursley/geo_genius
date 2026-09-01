@@ -20,10 +20,20 @@ defmodule GeoGenius.Pipeline.State do
   alias GeoGenius.ImportRun
   alias GeoGenius.Manifest
 
-  @enforce_keys [:context, :run, :opts, :work_dir, :publish?, :batch_size, :timeout]
+  @enforce_keys [
+    :context,
+    :run,
+    :executor_id,
+    :opts,
+    :work_dir,
+    :publish?,
+    :batch_size,
+    :timeout
+  ]
   defstruct [
     :context,
     :run,
+    :executor_id,
     :opts,
     :work_dir,
     :publish?,
@@ -47,6 +57,7 @@ defmodule GeoGenius.Pipeline.State do
   @type t :: %__MODULE__{
           context: Context.t(),
           run: ImportRun.t(),
+          executor_id: Ecto.UUID.t(),
           opts: keyword(),
           work_dir: Path.t(),
           publish?: boolean(),

@@ -14,6 +14,19 @@ defmodule GeoGenius.Providers.SimpleMaps do
 
   The data carries centroids and no boundaries, so relations are asserted
   from the FIPS columns rather than measured, and `relations/1` is `:none`.
+
+  ## Options
+
+  No option is required. By default every `state_id` value uses the `state`
+  area type. A collection that requires geometry for its ordinary states can
+  keep the six USPS-only codes (`AA`, `AE`, `AP`, `FM`, `MH`, and `PW`) in a
+  separately declared, non-geometric type:
+
+      "options": {"non_census_state_area_type": "postal_region"}
+
+  The value is an area-type key chosen by the host, not a type this provider
+  registers. The manifest must declare it in `area_types`; its default remains
+  `state` so existing manifests and area keys do not change.
   """
 
   @behaviour GeoGenius.Provider
@@ -25,16 +38,37 @@ defmodule GeoGenius.Providers.SimpleMaps do
   alias GeoGenius.Providers.SimpleMaps.Rows
   alias GeoGenius.Staging
 
-  # Bounds both the size of a single unnest bind (Staging.insert/3 binds
+  @non_census_state_area_type_option "non_census_state_area_type"
+
+  # Bounds both the size of a single unnest bind (Staging.insert/4 binds
   # every row in one round trip) and how long a slow artifact can run
   # between heartbeats -- each chunk is one emit call, and the pipeline
   # heartbeats the run's lease from inside that call.
   @chunk_size 1_000
 
   @impl Provider
-  @doc "Reads its columns by name, so a manifest supplies no options."
+  @doc "Reads its columns by name, so a manifest requires no options."
   @spec required_options() :: [String.t()]
   def required_options, do: []
+
+  @impl Provider
+  @doc "Validates the optional area type used for the six non-Census USPS state codes."
+  @spec validate_options(map() | nil) :: :ok | {:error, String.t()}
+  def validate_options(options) do
+    case non_census_state_area_type(options) do
+      {:ok, _area_type} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @impl Provider
+  @doc "Ensures the effective non-Census state type is declared and non-geometric."
+  @spec validate_manifest(Manifest.t()) :: :ok | {:error, String.t()}
+  def validate_manifest(%Manifest{area_types: area_types, options: options}) do
+    with {:ok, area_type} <- non_census_state_area_type(options) do
+      validate_non_census_state_area_type(area_types, area_type)
+    end
+  end
 
   @impl Provider
   @doc "Both declared artifacts; the logical name selects the parser."
@@ -68,10 +102,14 @@ defmodule GeoGenius.Providers.SimpleMaps do
   end
 
   @impl Provider
-  @doc "A city row describes its city, county and state; a ZIP row its ZIP, counties and state."
+  @doc "Describes each row's city or ZIP, counties, and state-like area."
   @spec normalize(Manifest.t(), Staging.Row.t()) ::
           {:ok, [Provider.Area.t()]} | {:error, Provider.reason()}
-  def normalize(%Manifest{}, %Staging.Row{} = row), do: Rows.areas(row)
+  def normalize(%Manifest{options: options}, %Staging.Row{} = row) do
+    with {:ok, area_type} <- non_census_state_area_type(options) do
+      Rows.areas(row, area_type)
+    end
+  end
 
   @impl Provider
   @doc "SimpleMaps carries no geometry to measure relations from."
@@ -79,10 +117,58 @@ defmodule GeoGenius.Providers.SimpleMaps do
   def relations(%Manifest{}), do: :none
 
   @impl Provider
-  @doc "State, county, city and ZIP edges read from the row's FIPS columns."
+  @doc "State-like, county, city and ZIP edges read from the row's FIPS columns."
   @spec asserted_relations(Manifest.t(), Staging.Row.t()) ::
           [{String.t(), String.t(), String.t()}]
-  def asserted_relations(%Manifest{}, %Staging.Row{} = row), do: Rows.edges(row)
+  def asserted_relations(%Manifest{options: options}, %Staging.Row{} = row) do
+    case non_census_state_area_type(options) do
+      {:ok, area_type} -> Rows.edges(row, area_type)
+      {:error, _reason} -> []
+    end
+  end
+
+  defp non_census_state_area_type(options) when is_map(options) do
+    case Map.fetch(options, @non_census_state_area_type_option) do
+      :error ->
+        {:ok, "state"}
+
+      {:ok, value} when is_binary(value) ->
+        if String.trim(value) == "" do
+          invalid_non_census_state_area_type(value)
+        else
+          {:ok, value}
+        end
+
+      {:ok, value} ->
+        invalid_non_census_state_area_type(value)
+    end
+  end
+
+  defp non_census_state_area_type(nil), do: {:ok, "state"}
+
+  defp non_census_state_area_type(options) do
+    {:error, "options must be a map or nil, got: #{inspect(options)}"}
+  end
+
+  defp invalid_non_census_state_area_type(value) do
+    {:error,
+     "#{@non_census_state_area_type_option} must be a non-blank string, got: #{inspect(value)}"}
+  end
+
+  defp validate_non_census_state_area_type(area_types, configured_type) do
+    case Enum.find(List.wrap(area_types), &(&1.key == configured_type)) do
+      nil ->
+        {:error,
+         "non_census_state_area_type #{inspect(configured_type)} must name an entry in area_types"}
+
+      %{requires_geometry: true} ->
+        {:error,
+         "non_census_state_area_type #{inspect(configured_type)} must have requires_geometry false"}
+
+      _non_geometric_type ->
+        :ok
+    end
+  end
 
   # The header line names every column; each data line becomes a map keyed
   # by it, so a column this provider never reads is carried rather than

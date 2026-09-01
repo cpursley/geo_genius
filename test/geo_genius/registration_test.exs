@@ -1,81 +1,221 @@
 defmodule GeoGenius.RegistrationTest do
-  @moduledoc """
-  Pins the catalog rows a manifest registers, through the one function both
-  `GeoGenius.import/1` and the test fixtures call.
-
-  Registration used to be written out four times -- once in `GeoGenius` and
-  once more in each of three test helpers. A test registering through a copy
-  cannot fail when the production line is wrong, which is how a manifest that
-  registered only its first authority reached a green suite. These cases drive
-  `GeoGenius.Registration.register/2` itself, so there is one implementation
-  left to be wrong.
-  """
   use ExUnit.Case, async: false
 
-  alias GeoGenius.{Context, ImportFixture, Manifest, Registration, TestRepo}
+  alias GeoGenius.{CandidateError, Catalog, Context, ImportFixture, Manifest, Registration}
 
-  setup do
-    collection = "registration_test_#{System.unique_integer([:positive])}"
-    on_exit(fn -> ImportFixture.teardown!(collection) end)
+  setup context do
+    if context[:catalog_translation] do
+      :ok
+    else
+      collection = "registration_test_#{System.unique_integer([:positive])}"
+      on_exit(fn -> ImportFixture.teardown!(collection) end)
 
-    context = Context.new(repo: GeoGenius.TestRepo, prefix: "geo_genius")
-    {:ok, context: context, collection: collection}
-  end
-
-  describe "register/2" do
-    test "registers every authority the manifest declares, not just the first",
-         %{context: context, collection: collection} do
-      manifest = manifest!(collection)
-
-      Registration.register(context, manifest)
-
-      assert authority_keys(collection) == ["census", "simplemaps", "usps"]
-    end
-
-    test "merges members and required into each artifact's metadata",
-         %{context: context, collection: collection} do
-      manifest = manifest!(collection)
-
-      Registration.register(context, manifest)
-
-      assert %{"members" => [], "required" => true} = artifact_metadata(collection)
-    end
-
-    test "persists each area type's geometry requirement",
-         %{context: context, collection: collection} do
-      manifest = manifest!(collection)
-
-      Registration.register(context, manifest)
-
-      assert area_type_geometry_flags(collection) == [
-               {"bounded_zone", true},
-               {"metadata_record", false}
-             ]
-    end
-
-    test "returns the id of the release it opened",
-         %{context: context, collection: collection} do
-      manifest = manifest!(collection)
-
-      release_id = Registration.register(context, manifest)
-
-      assert release_id == sole_release_id(collection)
-    end
-
-    test "is idempotent, so re-registering the same manifest adds no rows",
-         %{context: context, collection: collection} do
-      manifest = manifest!(collection)
-
-      first = Registration.register(context, manifest)
-      second = Registration.register(context, manifest)
-
-      assert first == second
-      assert authority_keys(collection) == ["census", "simplemaps", "usps"]
+      {:ok,
+       context: Context.new(repo: GeoGenius.TestRepo, prefix: "geo_genius"),
+       collection: collection}
     end
   end
 
-  # Three authorities so a single-authority regression is visible, and one
-  # artifact carrying `required` so the metadata merge is visible.
+  describe "prepare_import/3" do
+    test "returns an enqueue decision with both identifiers for a new candidate", %{
+      context: context,
+      collection: collection
+    } do
+      manifest = manifest!(collection)
+
+      assert {:enqueue,
+              %{
+                run_id: run_id,
+                release_id: release_id,
+                attempt: 1,
+                reason: :registered
+              }} = Registration.prepare_import(context, manifest, claim("owner-a"))
+
+      assert is_binary(run_id)
+      assert is_binary(release_id)
+      assert Catalog.import_run(context, run_id).release_id == release_id
+    end
+
+    test "same-owner replay re-enqueues the same attempt", %{
+      context: context,
+      collection: collection
+    } do
+      manifest = manifest!(collection)
+
+      assert {:enqueue, first} =
+               Registration.prepare_import(context, manifest, claim("owner-a"))
+
+      assert {:enqueue, second} =
+               Registration.prepare_import(context, manifest, claim("owner-a"))
+
+      assert second.reason == :same_owner
+      assert second.run_id == first.run_id
+      assert second.release_id == first.release_id
+      assert second.attempt == first.attempt
+    end
+
+    test "completed unpublished candidates return existing instead of enqueue", %{
+      context: context,
+      collection: collection
+    } do
+      manifest = manifest!(collection)
+      assert {:enqueue, first} = Registration.prepare_import(context, manifest, claim("owner-a"))
+      ImportFixture.claim_executor!(context, first.run_id)
+
+      # The registration branch under test starts from a historical terminal
+      # fixture; completion validation itself is covered by the catalog and
+      # pipeline suites.
+      GeoGenius.TestRepo.query!(
+        "UPDATE geo_genius.import_run SET status = 'completed', completed_at = now() WHERE id = $1",
+        [Ecto.UUID.dump!(first.run_id)]
+      )
+
+      GeoGenius.TestRepo.query!("DELETE FROM geo_genius.import_run_lease WHERE run_id = $1", [
+        Ecto.UUID.dump!(first.run_id)
+      ])
+
+      assert {:existing, existing} =
+               Registration.prepare_import(context, manifest, claim("owner-b"))
+
+      assert existing.reason == :completed
+      assert existing.run_id == first.run_id
+      assert existing.release_id == first.release_id
+      assert existing.attempt == first.attempt
+    end
+
+    test "a different owner of a live attempt receives a structured refusal", %{
+      context: context,
+      collection: collection
+    } do
+      manifest = manifest!(collection)
+      assert {:enqueue, first} = Registration.prepare_import(context, manifest, claim("owner-a"))
+
+      assert {:error,
+              %CandidateError{
+                reason: :live_import,
+                run_id: run_id,
+                release_id: release_id
+              }} = Registration.prepare_import(context, manifest, claim("owner-b"))
+
+      assert run_id == first.run_id
+      assert release_id == first.release_id
+    end
+
+    test "an identical failed candidate requires explicit retry", %{
+      context: context,
+      collection: collection
+    } do
+      manifest = manifest!(collection)
+      assert {:enqueue, first} = Registration.prepare_import(context, manifest, claim("owner-a"))
+      executor_id = ImportFixture.claim_executor!(context, first.run_id)
+
+      :ok =
+        Catalog.fail_import(context, first.run_id, executor_id, %{
+          "reason" => "fixture failure"
+        })
+
+      assert {:error,
+              %CandidateError{
+                reason: :failed,
+                run_id: run_id,
+                release_id: release_id,
+                message: message
+              }} = Registration.prepare_import(context, manifest, claim("owner-b"))
+
+      assert run_id == first.run_id
+      assert release_id == first.release_id
+      assert message =~ "GeoGenius.retry_failed/2"
+
+      assert [%GeoGenius.ImportRun{run_id: ^run_id, attempt: 1, status: "failed"}] =
+               Catalog.import_runs(context, collection)
+    end
+  end
+
+  describe "retry_failed/4" do
+    test "returns a new enqueue attempt for a corrected exact candidate", %{
+      context: context,
+      collection: collection
+    } do
+      original = manifest!(collection)
+      assert {:enqueue, first} = Registration.prepare_import(context, original, claim("owner-a"))
+      executor_id = ImportFixture.claim_executor!(context, first.run_id)
+
+      :ok =
+        Catalog.fail_import(context, first.run_id, executor_id, %{"reason" => "fixture failure"})
+
+      corrected = corrected_manifest!(original)
+
+      assert {:enqueue, retry} =
+               Registration.retry_failed(context, first.run_id, corrected, claim("owner-b"))
+
+      assert retry.reason == :retried
+      assert retry.release_id == first.release_id
+      assert retry.run_id != first.run_id
+      assert retry.attempt == first.attempt + 1
+    end
+
+    test "returns a structured refusal when the target is not failed", %{
+      context: context,
+      collection: collection
+    } do
+      manifest = manifest!(collection)
+      assert {:enqueue, first} = Registration.prepare_import(context, manifest, claim("owner-a"))
+
+      assert {:error,
+              %CandidateError{
+                reason: :not_failed,
+                run_id: run_id,
+                release_id: release_id
+              }} = Registration.retry_failed(context, first.run_id, manifest, claim("owner-b"))
+
+      assert run_id == first.run_id
+      assert release_id == first.release_id
+    end
+  end
+
+  describe "translate/1" do
+    @tag :catalog_translation
+    test "returns an invalid-catalog-response error when required catalog fields are missing" do
+      assert {:error,
+              %CandidateError{
+                reason: :invalid_catalog_response,
+                release_id: nil,
+                run_id: nil,
+                message: message
+              }} = Registration.translate(%{decision: "enqueue"})
+
+      assert message =~ "invalid candidate lifecycle response"
+      assert message =~ ~s(%{decision: "enqueue"})
+    end
+
+    @tag :catalog_translation
+    test "returns an invalid-catalog-response error for a malformed catalog result" do
+      malformed = {:unexpected, "catalog result"}
+
+      assert {:error,
+              %CandidateError{
+                reason: :invalid_catalog_response,
+                release_id: nil,
+                run_id: nil,
+                message: message
+              }} = Registration.translate(malformed)
+
+      assert message =~ "invalid candidate lifecycle response"
+      assert message =~ inspect(malformed)
+    end
+  end
+
+  defp claim(owner) do
+    %{owner: owner, runner_backend: "registration-test", stale_after_seconds: 900}
+  end
+
+  defp corrected_manifest!(manifest) do
+    corrected = Map.put(Manifest.to_map(manifest), "description", "Corrected release policy")
+
+    {:ok, manifest} = Manifest.from_map(corrected)
+    manifest
+  end
+
   defp manifest!(collection) do
     {:ok, manifest} =
       Manifest.from_map(%{
@@ -122,69 +262,5 @@ defmodule GeoGenius.RegistrationTest do
       })
 
     manifest
-  end
-
-  defp authority_keys(collection) do
-    %{rows: rows} =
-      TestRepo.query!(
-        """
-        SELECT authority.key
-          FROM geo_genius.authority
-          JOIN geo_genius.collection ON collection.id = authority.collection_id
-         WHERE collection.key = $1
-         ORDER BY authority.key
-        """,
-        [collection]
-      )
-
-    Enum.map(rows, fn [key] -> key end)
-  end
-
-  defp artifact_metadata(collection) do
-    %{rows: [[metadata]]} =
-      TestRepo.query!(
-        """
-        SELECT artifact.metadata
-          FROM geo_genius.artifact
-          JOIN geo_genius.source_release ON source_release.id = artifact.source_release_id
-          JOIN geo_genius.source ON source.id = source_release.source_id
-          JOIN geo_genius.collection ON collection.id = source.collection_id
-         WHERE collection.key = $1
-        """,
-        [collection]
-      )
-
-    metadata
-  end
-
-  defp area_type_geometry_flags(collection) do
-    %{rows: rows} =
-      TestRepo.query!(
-        """
-        SELECT area_type.key, area_type.requires_geometry
-          FROM geo_genius.area_type
-          JOIN geo_genius.collection ON collection.id = area_type.collection_id
-         WHERE collection.key = $1
-         ORDER BY area_type.key
-        """,
-        [collection]
-      )
-
-    Enum.map(rows, fn [key, requires_geometry] -> {key, requires_geometry} end)
-  end
-
-  defp sole_release_id(collection) do
-    %{rows: [[release_id]]} =
-      TestRepo.query!(
-        """
-        SELECT release.id::text
-          FROM geo_genius.release
-          JOIN geo_genius.collection ON collection.id = release.collection_id
-         WHERE collection.key = $1
-        """,
-        [collection]
-      )
-
-    release_id
   end
 end

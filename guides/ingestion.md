@@ -188,8 +188,8 @@ The conversion explicitly reprojects to EPSG:4326 and writes one Feature per lin
 sequence reader decodes and emits each configured batch before reading further, so neither
 the converted artifact nor all of its staged rows are retained in memory.
 
-`GeoGenius.Provider` declares six callbacks every provider implements, and one optional
-seventh.
+`GeoGenius.Provider` declares six callbacks every provider implements and two optional
+validation callbacks.
 
 A source may name its own `provider`, and a source that names none inherits the release's.
 That is what lets one release draw on sources in different formats: a delimited file staged
@@ -203,20 +203,30 @@ geometry at all.
 
 One caveat follows from `options` being release-level while the option vocabulary is
 per-provider: an `implied_areas` entry names its code key in one provider's suffix, so a
-release cannot share one between a CSV source and a GeoJSON source. A provider that reads
-no options at all -- `GeoGenius.Providers.SimpleMaps` -- composes with any of them.
+release cannot share one between a CSV source and a GeoJSON source. SimpleMaps requires
+no options, so its optional `"non_census_state_area_type"` key can coexist with the
+required options of another provider in a composed release.
 
 `required_options/0` returns the `options` keys manifest validation insists on. The
 GeoJSON provider requires `"area_type"` and `"code_property"`; the CSV provider requires
 `"area_type"` and `"code_column"`. SimpleMaps reads its columns by name and requires
-none.
+none; the optional key documented below changes only the type of its six USPS-only
+state codes.
 
-`validate_options/1` is the optional one. A provider that exports it is handed the whole
+`validate_options/1` is optional. A provider that exports it is handed the whole
 `options` map at load, once the required keys are known to be present, and the error it
 returns becomes a manifest error naming the field. This is where a provider checks what
 only it understands -- the shipped generic providers validate their `implied_areas`
 entries here. A provider that exports none contributes no checks beyond the required
 keys.
+
+`validate_manifest/1` is the second optional validation seam. It receives the fully
+decoded manifest after structural and option validation, so a provider can check a
+relationship between fields without putting source-specific policy in the manifest
+parser. Every provider named by the release or one of its sources receives the same
+complete manifest. SimpleMaps uses this to ensure its effective non-Census state type --
+the configured `"non_census_state_area_type"`, or `"state"` when omitted -- names a
+declared area type whose effective `requires_geometry` value is false.
 
 `artifacts/1` returns the artifacts, across the manifest's sources, this provider will
 stage. The shipped providers stage every declared artifact and so delegate to
@@ -343,8 +353,8 @@ defdelegate asserted_relations(manifest, row), to: GeoGenius.Provider, as: :no_a
 
 `GeoGenius.Providers.SimpleMaps` (`"simplemaps"`) parses the SimpleMaps US cities and US
 ZIP codes datasets: two comma-delimited files, `uscities` and `uszips`, named by the
-artifact's `logical_name` rather than by a manifest option. It requires no `options` at
-all. The files are licensed downloads, so the manifest this package ships,
+artifact's `logical_name` rather than by a manifest option. It requires no options. The
+files are licensed downloads, so the manifest this package ships,
 `us_simplemaps`, declares both artifacts `operator_supplied` with a `cache_key` and no
 `url`; place your copies in the cache under those keys, and replace each artifact's
 `sha256` and `bytes` with the digest and size of the copy you licensed. The shipped
@@ -397,6 +407,31 @@ kind. The Census defines none of the six and assigns none of them an ANSI code, 
 them under `census` with an `ansi_state` code would assert two things no source says.
 They key under `usps` and carry a `usps_state` external code instead.
 
+By default those six still use the `state` area type, preserving the area keys emitted by
+existing SimpleMaps manifests. In a collection where ordinary states require a Census
+boundary, opt only those six into a separately declared non-geometric type with:
+
+```json
+{
+  "area_types": [
+    { "key": "state", "rank": 10, "requires_geometry": true },
+    { "key": "postal_region", "rank": 15, "requires_geometry": false },
+    { "key": "county", "rank": 20 },
+    { "key": "city", "rank": 30 },
+    { "key": "zip", "rank": 40 }
+  ],
+  "options": { "non_census_state_area_type": "postal_region" }
+}
+```
+
+`postal_region` is an example, not a reserved name. The option accepts any non-blank
+area-type key and the manifest must declare that key with `requires_geometry` false. As
+with every area type, omitting `requires_geometry` has the same effective false value;
+spelling it out makes a mixed geometric manifest easier to audit. The option changes only
+`AA`, `AE`, `AP`, `FM`, `MH`, and `PW`: their area keys and their asserted
+state-like-to-ZIP edges use the selected type. Ordinary ANSI states, counties, cities,
+ZIPs, authorities, and external codes are unchanged.
+
 **A host looking a state up by code must query both code types.** `ansi_state` alone
 silently misses those six, and every ZIP under them; the two together are the whole set.
 
@@ -415,7 +450,7 @@ their ZIPs have a parent; a host that wants a label supplies its own.
 | `city`    | `simplemaps:city:<id>`   | `simplemaps:city:1840021543` |
 | `county`  | `census:county:<fips>`   | `census:county:06075` |
 | `state`   | `census:state:<code>`    | `census:state:CA`     |
-| `state`   | `usps:state:<code>`      | `usps:state:AE`       |
+| `state` (default) or configured type | `usps:<type>:<code>` | `usps:state:AE` or `usps:postal_region:AE` |
 | `zip`     | `usps:zip:<zip>`         | `usps:zip:94110`      |
 
 ### Relations
@@ -528,16 +563,27 @@ that fixed list so your notifier can match exhaustively.
 A runner decides where `GeoGenius.Pipeline.execute/3` actually runs. It owns none of the
 run's state: `enqueue/3` starts the work and returns, and the run's status, progress, and
 error all live in PostgreSQL. Three backends ship, and with nothing configured the first
-available one wins, in this order: `Runners.PgFlow`, then `Runners.Task`, then
-`Runners.Inline`.
+available automatic backend wins: `Runners.Task`, then `Runners.Inline`.
 
-`GeoGenius.Runners.PgFlow` therefore takes precedence if you have installed `pgflow`
-yourself, which is worth knowing before you install it for something else. GeoGenius declares
-`pgflow >= 0.3.4 and < 0.4.0` as an optional dependency: that establishes compile order when
-a host opts in, without installing PgFlow for hosts that do not. For those hosts the first
-available backend is `Runners.Task`.
+`GeoGenius.Runners.PgFlow` is explicit even when a PgFlow engine happens to be running. PgFlow's
+finite job deadline is a host decision for bounded work; merely installing it for an unrelated
+workflow must not make it the execution policy for an import that can run for hours. GeoGenius
+declares `pgflow >= 0.3.4 and < 0.4.0` as an optional dependency to establish compile order when a
+host opts in, without installing PgFlow for other hosts. Pin the runner per call or in application
+configuration after choosing a suitable deadline. The deadline is compile-time PgFlow job
+definition data, so it must be configured before GeoGenius compiles:
 
-`GeoGenius.Runners.Task` is what a host gets with no configuration and no pgflow. It runs
+```elixir
+config :geo_genius,
+  runner: GeoGenius.Runners.PgFlow,
+  pgflow_job_timeout_seconds: 14_400
+```
+
+`14_400` is only an example, not a package default. Choose a finite bound for the host's complete
+workload. It must exceed the effective `stale_after_seconds` on every import (900 by default), but
+that inequality alone does not prove that the whole import fits inside the deadline.
+
+`GeoGenius.Runners.Task` is what a host gets with no runner configuration. It runs
 each import as a supervised task under `GeoGenius.TaskSupervisor`, a `Task.Supervisor` the
 `:geo_genius` application starts itself. `GeoGenius.import/1` returns as soon as the task
 starts, and you read the outcome back with `GeoGenius.status/2` or `GeoGenius.await/3`.
@@ -559,28 +605,48 @@ why. Applications start in dependency order and stop in the reverse of it, so
 `:geo_genius` starts before your application and therefore stops after it. With no
 configuration, the library's own supervisor sits outside your tree: on shutdown your Repo
 finishes stopping first, and an import still running at that moment keeps running against
-a Repo that is already gone, failing on every call it makes for the whole length of your
-shutdown. A supervisor you place after your Repo does not have that problem, because a
+a Repo that is already gone. Its execution guardian cannot record a later task death once
+that Repo is unavailable. A supervisor you place after your Repo does not have that problem, because a
 supervisor terminates its children in the reverse of their start order, so the tasks
 under it are stopped before the Repo is. Setting the key at boot also tells GeoGenius to
-start no supervisor of its own. Either way, killing a running import is not graceful: a
-`Task` does not trap exits, so it dies wherever it happens to be, and what recovers the
-run is what always recovers it, the lease being reclaimed once `stale_after` elapses.
+start no task supervisor of its own; its execution-guardian supervisor remains active.
+Killing a running import is not graceful: a `Task` does not trap exits and cannot clean up
+its staging table. Under the host-owned ordering, the guardian sees that death while the Repo
+is still alive and records a durable failure with the exact executor identity. Whole-node loss,
+or package-owned shutdown after the Repo has already stopped, leaves no process able to record
+the outcome. A stale heartbeat never authorizes another executor to take over; an operator must
+fail that abandoned attempt explicitly before creating a replacement with
+`GeoGenius.retry_failed/2`.
 
 `GeoGenius.Runners.Inline` runs the import in the calling process and does not return
 until it has finished. Choose it deliberately for tests and for scripts, where blocking is
 the point and the outcome is already durable by the time the call returns. It is also
-where the resolution above ends up when neither other backend can accept work, which for
+where automatic resolution ends up when Task cannot accept work, which for
 a national vintage means blocking the caller for hours.
 
 More on `GeoGenius.Runners.PgFlow`: it runs the import as a durable PgFlow job.
 The optional dependency edge ensures this library's job submodule compiles after `PgFlow.Job`
-when the host adds PgFlow directly. PgFlow 0.3 releases may also compile dashboard modules
-against their optional `phoenix`, `phoenix_live_view`, and `livefilter` packages; a host using
-that dashboard opts into those dependencies too. This backend reports itself available once
+when the host adds PgFlow directly. PgFlow 0.3.4 compiles its dashboard modules even when the host
+does not mount the dashboard, so a current PgFlow consumer must also declare PgFlow's optional
+`phoenix`, `phoenix_live_view`, and `livefilter` dependencies. This is a PgFlow packaging
+requirement, not a dependency GeoGenius imposes on hosts using another runner. This backend reports itself available once
 `pgflow` and the job submodule are loaded and `PgFlow.Supervisor` is running; short of that it
-returns an error naming what is missing rather than raising deep inside `PgFlow.enqueue/2`, and
-the resolution falls through to `Runners.Task`.
+returns an explicit not-enqueued error naming what is missing rather than raising deep inside
+`PgFlow.enqueue/2`. It also verifies that PgFlow and the import use the same Repo, that the stored
+flow and `execute` step carry the compiled timeout, and that a healthy queue worker is polling
+before enqueue. This keeps readiness, durable enqueue, and execution in one database.
+
+After setting the compile-time timeout, generate and run the PgFlow job migration:
+
+```console
+mix pgflow.gen.job_migration GeoGenius.Runners.PgFlow.Job
+mix ecto.migrate
+```
+
+Then start `{PgFlow, repo: MyApp.Repo, jobs: [GeoGenius.Runners.PgFlow.Job]}` in the host's
+supervision tree. Changing `:pgflow_job_timeout_seconds` later requires forcing GeoGenius to
+recompile and generating another PgFlow job migration; enqueue fails before acceptance if the
+compiled module and stored definition disagree.
 
 Pin a backend for every import or for one call:
 
@@ -588,6 +654,13 @@ Pin a backend for every import or for one call:
 config :geo_genius, runner: GeoGenius.Runners.Inline
 
 GeoGenius.import(collection: "demo", release: "r1", runner: GeoGenius.Runners.Inline)
+
+GeoGenius.import(
+  collection: "demo",
+  release: "r1",
+  runner: GeoGenius.Runners.PgFlow,
+  stale_after_seconds: 900
+)
 ```
 
 The backend a run was claimed under is recorded on `import_run.runner_backend`, so a run
@@ -597,8 +670,11 @@ behaviour exists rather than a fixed backend list.
 
 ## The phases
 
-An import walks a fixed sequence, advancing the durable run row at each boundary. A phase
-that fails stops the sequence and records the failure.
+An import walks a fixed sequence, advancing the durable run row at each boundary. The catalog
+accepts only the next edge in that sequence: callers cannot skip ahead or use a phase advance to
+create a terminal status. A phase that fails stops the sequence and records the failure through
+`fail_import`; `complete_import` records a verified non-publishing completion, while
+`publish_import` records completion and swaps publication atomically.
 
 `downloading` resolves every artifact the release composes to a local file. The cache is
 checked first, a miss is downloaded, and whatever came back is hashed and recorded
@@ -610,9 +686,9 @@ against the manifest's expectation. Measures `artifacts`, `downloaded`, `cached`
 trusting what the previous phase believed, which is what makes it a check.
 
 `staging` calls the provider's `stage/5` for each artifact and writes the emitted rows
-into an unlogged table of this run's own. The table is emptied first: a resumed run stages
-afresh, and an attempt killed where its cleanup could not run leaves rows behind under the
-same run id.
+into an unlogged table of this run's own. The table is emptied before the attempt stages.
+A replacement attempt gets a new run id and a separate table; an abandoned attempt's rows
+are evidence to sweep after that attempt is terminal, never input another executor resumes.
 
 `normalizing` reads the staged rows back in batches, calls the provider's `normalize/2`
 on each, and writes the areas, names, codes, membership, and boundaries through
@@ -631,8 +707,13 @@ time.
 Collecting before writing also decides what a provider's own error leaves behind: an
 illegal name kind, or a staged row naming an artifact this run did not stage, fails the
 phase with none of that batch written, rather than partway through it. Earlier batches are
-already committed, which is what makes the phase resumable; nothing opens a transaction
-around a batch.
+already committed to the candidate during that attempt; nothing opens a transaction around
+a batch. A failed attempt is not resumed. `retry_failed` resets the candidate from the
+replacement manifest before the new run writes it.
+
+Calling `GeoGenius.import/1` again does not perform that reset. An identical failed candidate
+returns `%GeoGenius.CandidateError{reason: :failed}` with the failed run id, while a changed
+manifest returns `:manifest_changed`; only `GeoGenius.retry_failed/2` creates the next attempt.
 
 `relating` rebuilds measured relations from boundary overlap when `relations/1` asks for
 it, and then writes every edge `asserted_relations/2` returns for each staged row, one
@@ -642,10 +723,10 @@ two compose: a release can carry both. Measures `relations` (only when a rebuild
 two rows asserting the same edge each add one, though the edge itself upserts to a single
 row.
 
-`indexing` runs `analyze_release`, so the release has statistics before anything plans a
-query against it.
+`indexing` runs the run-fenced `analyze_import`, so the release has statistics before
+anything plans a query against it.
 
-`verifying` runs `verify_release` and fails the run when the report is not `ok`. This is
+`verifying` runs the run-fenced `verify_import` and fails the run when the report is not `ok`. This is
 the gate: a release that has no areas, that lacks a boundary somewhere the collection or
 area type requires one, that carries a relation or a membership belonging to another
 collection, or that declares no source releases, does not become publishable.
@@ -656,18 +737,33 @@ it, and the `boundary_geom_valid_chk` constraint refuses an invalid geometry wri
 the table by any other route. That check is a backstop against a writer that bypasses
 both, not a condition an import reaches.
 
-`publishing` runs only when you passed `publish: true`, and it does exactly what
-`GeoGenius.publish/2` does.
+`publishing` runs only when you passed `publish: true`. `publish_import` requires a validated
+observation for every required selected artifact, verifies and publishes the candidate, marks the
+attempt completed, and removes its lease in one transaction. An optional artifact that was not
+available remains part of the attempt snapshot without blocking publication.
 
-The import opens no transaction. Every catalog function is atomic on its own, and the
-state machine is deliberately resumable, so wrapping the run would roll back the progress
-a resumed run wants to start from and would hold one connection for the length of the
-slowest phase. The staging table is dropped on success and on failure alike.
+Without `publish: true`, the pipeline ends after `verifying` and calls `complete_import`. That
+operation re-checks the same required observations and release invariants, then completes the run
+and removes its lease without changing publication. A later `publish_release` call verifies the
+completed release again before making it visible.
 
-A resumed run re-runs every phase from `downloading`, rather than picking up at the phase
-it stopped in. What makes that cheap is the artifact cache, which skips the network; the
-staged rows of the interrupted attempt are discarded rather than reused, so a source that
-changed between attempts cannot leave a deleted row in the release.
+The import opens no transaction around the whole pipeline. Every catalog function is atomic on
+its own, so a long run does not hold one connection for the length of its slowest phase. The
+staging table is dropped on success and on failure alike.
+
+Every staging insert, set-based normalization or asserted-relation write, measured
+relation rebuild, analyze, verification, and publication statement disables
+DBConnection checkout retries. A timeout or dropped connection leaves a mutating
+statement's outcome ambiguous: automatically checking out a fresh connection could run
+the whole statement twice. GeoGenius surfaces the first failure instead. Once that failure is
+recorded, recovery is an explicit `GeoGenius.retry_failed/2` call that creates a new attempt. This does not
+change the configured `:timeout` or `:stale_after_seconds`; both keep their existing
+per-run meanings.
+
+A retry runs every phase from `downloading` under a new `run_id`, rather than picking up at
+the failed attempt's phase. What makes that cheap is the artifact cache, which skips the
+network. The new run owns its exact manifest, artifact selection, observations, and staging
+table; the failed run's manifest, observations, status, and error remain immutable evidence.
 
 ## Reading a run
 
@@ -707,10 +803,20 @@ progress object, updated by heartbeats during a phase. A failed run carries the 
 `error`. A terminal run holds no lease, so its `progress` reads as an empty map and its
 `heartbeat_at` falls back to the run's own column.
 
-`:owner` defaults to the node name, so a worker restarting on the same node resumes its
-own run rather than waiting out its lease. Pass `:owner` explicitly if you run two
-importers on one node. A second owner claiming a release whose lease is still live is
-refused, which is the property that keeps two workers from writing one release.
+`:owner` defaults to the node name and identifies who prepared the attempt. Re-enqueueing a
+live attempt for the same owner is safe, but it is not takeover: `claim_import_execution`
+latches the first executor, and every later delivery receives `occupied` and returns a no-op.
+A different owner is refused while the lease is live. Once an attempt fails, retry it
+explicitly; repeating `GeoGenius.import/1` returns the failed attempt rather than creating another,
+and an executor is never replaced in place.
+
+```elixir
+{:ok, retry_run_id} =
+  GeoGenius.retry_failed(failed.run_id,
+    collection: failed.collection_key,
+    release: failed.release_key
+  )
+```
 
 ## Publishing and rolling back
 
@@ -724,10 +830,11 @@ without either step implying the other.
 GeoGenius.published_release("demo")
 ```
 
-`publish/2` verifies and publishes atomically, returning `{:error, exception}` rather
-than raising when the release fails verification. Publishing the release that is already
-published is a no-op that leaves the rollback target untouched, so a rollback still
-reaches the last release actually swapped away from.
+`publish/2` is the explicit operator path. It verifies and publishes a release only when
+there is no active lease and its latest import, if any, is completed; it returns
+`{:error, exception}` rather than raising when those guards or verification fail.
+Publishing the release that is already published is a no-op that leaves the rollback target
+untouched, so a rollback still reaches the last release actually swapped away from.
 
 `rollback/2` swaps the publication pointer back to the previous release, not to the
 oldest one, and returns `{:error, reason}` without clearing the publication when there is
@@ -735,8 +842,9 @@ nothing to roll back to. Both are pointer swaps under MVCC: readers see one rele
 the other, never a partial catalog, and a published release is immutable, so changing
 what hosts see always means building and publishing a new release.
 
-`publish: true` on `GeoGenius.import/1` is the convenience for a caller that wants both
-in one go, and it is the same call, run as one more phase.
+`publish: true` on `GeoGenius.import/1` is the ingestion path for a caller that wants both
+in one go. Its final phase uses `publish_import`, not the operator shortcut, so completion,
+lease release, verification, and the publication swap are atomic.
 
 ## Enqueuing a release at boot
 

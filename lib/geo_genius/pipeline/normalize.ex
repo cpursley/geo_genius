@@ -28,7 +28,7 @@ defmodule GeoGenius.Pipeline.Normalize do
   denormalises a hierarchy describes the same county in every city row of it,
   so a batch names far fewer distinct areas than it has rows, and one statement
   per area would spend a round trip on every repeat. Boundaries use one plural
-  write for the page as well: `GeoGenius.Catalog.put_boundaries/3` validates
+  write for the page as well: `GeoGenius.Catalog.put_boundaries/4` validates
   and repairs the geometries, replaces the areas' boundaries and subdivided
   parts, and recomputes their centroids from what it stored.
 
@@ -75,7 +75,7 @@ defmodule GeoGenius.Pipeline.Normalize do
   end
 
   defp heartbeat(state, counts) do
-    Catalog.heartbeat_import(state.context, state.run.run_id, counts)
+    Catalog.heartbeat_import(state.context, state.run.run_id, state.executor_id, counts)
     {:cont, {:ok, counts}}
   end
 
@@ -103,9 +103,9 @@ defmodule GeoGenius.Pipeline.Normalize do
   end
 
   # A staged row names the artifact it came from, and the run's providers are
-  # keyed by that name. A row naming an artifact this run did not stage is a
-  # resumed run whose manifest changed underneath it, not a provider defect, so
-  # it fails naming the artifact rather than raising a `KeyError`.
+  # keyed by that name. A row naming an artifact this run did not select
+  # violates the attempt's immutable artifact snapshot, so it fails naming the
+  # artifact rather than raising a `KeyError`.
   defp unknown_artifact(row) do
     "staged row names artifact #{inspect(row.artifact)}, which no provider in this run stages"
   end
@@ -189,29 +189,48 @@ defmodule GeoGenius.Pipeline.Normalize do
   defp count_area(counts, %Area{geometry: nil}), do: bump(counts, "areas")
   defp count_area(counts, %Area{}), do: counts |> bump("areas") |> bump("boundaries")
 
-  # The order the catalog needs: an area exists before its names, codes and
-  # membership name it, and `put_boundaries/3` recomputes the centroid
-  # `put_area_in_release_many/3` has just written, so boundaries come last.
+  # The order the catalog needs: an area exists before its release membership,
+  # names and codes attach only to an existing membership, and boundaries
+  # recompute the centroid that membership has just written.
   defp write_batch(collected, state) do
     Catalog.upsert_area_many(
       state.context,
-      state.run.collection_key,
-      Enum.map(collected, &area_attrs/1)
+      state.run.run_id,
+      state.executor_id,
+      Enum.map(collected, &area_attrs/1),
+      timeout: state.timeout
     )
-
-    Catalog.put_area_name_many(state.context, Enum.flat_map(collected, &name_attrs/1))
-    Catalog.put_area_code_many(state.context, Enum.flat_map(collected, &code_attrs/1))
 
     Catalog.put_area_in_release_many(
       state.context,
-      state.run.release_id,
-      Enum.map(collected, &membership_attrs/1)
+      state.run.run_id,
+      state.executor_id,
+      Enum.map(collected, &membership_attrs/1),
+      timeout: state.timeout
+    )
+
+    Catalog.put_area_name_many(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      Enum.flat_map(collected, &name_attrs/1),
+      timeout: state.timeout
+    )
+
+    Catalog.put_area_code_many(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      Enum.flat_map(collected, &code_attrs/1),
+      timeout: state.timeout
     )
 
     Catalog.put_boundaries(
       state.context,
-      state.run.release_id,
-      Enum.flat_map(collected, &boundary_attrs/1)
+      state.run.run_id,
+      state.executor_id,
+      Enum.flat_map(collected, &boundary_attrs/1),
+      timeout: state.timeout
     )
   end
 

@@ -109,6 +109,12 @@ defmodule GeoGenius.Providers.SimpleMaps.Fips do
     "78" => "VI"
   }
 
+  @non_census_state_codes ~w(AA AE AP FM MH PW)
+
+  @doc "Returns whether SimpleMaps' state code has a USPS identity but no Census state identity."
+  @spec non_census_state_code?(term()) :: boolean()
+  def non_census_state_code?(code), do: code in @non_census_state_codes
+
   @doc """
   Returns the postal code of the state a five-digit county FIPS is assigned
   within, or `nil` when the code names no state this table carries.

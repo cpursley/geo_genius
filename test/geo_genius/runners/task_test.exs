@@ -65,7 +65,9 @@ defmodule GeoGenius.Runners.TaskTest do
     # the calling process with `{:noproc, ...}` here rather than returning
     # `{:error, reason}` -- exactly the failure the no-`spawn/1` rule exists
     # to prevent, just arrived at through the supervised path instead.
-    assert {:error, reason} = Runners.Task.enqueue(context, run_id, %{publish: false})
+    assert {:error, {:not_enqueued, reason}} =
+             Runners.Task.enqueue(context, run_id, %{publish: false})
+
     assert reason =~ "GeoGenius.Runners.TaskTest.DeadSupervisor"
 
     assert Catalog.import_run(context, run_id).status == "pending"
@@ -84,7 +86,9 @@ defmodule GeoGenius.Runners.TaskTest do
 
     {_collection, _release_id, run_id} = ImportFixture.claim_run!(context)
 
-    assert {:error, reason} = Runners.Task.enqueue(context, run_id, %{publish: false})
+    assert {:error, {:not_enqueued, reason}} =
+             Runners.Task.enqueue(context, run_id, %{publish: false})
+
     assert reason =~ "max_children"
     assert reason =~ inspect(name)
 
@@ -151,7 +155,7 @@ defmodule GeoGenius.Runners.TaskTest do
     try do
       refute Runners.Task.available?()
 
-      assert {:error, reason} =
+      assert {:error, {:not_enqueued, reason}} =
                Runners.Task.enqueue(context, Ecto.UUID.generate(), %{publish: false})
 
       assert reason =~ "GeoGenius.TaskSupervisor is not running"
@@ -163,7 +167,7 @@ defmodule GeoGenius.Runners.TaskTest do
   end
 
   @tag capture_log: true
-  test "a task killed mid-run is not restarted -- recovery belongs to the lease, not the supervisor",
+  test "a task killed mid-run is not restarted and its guardian records failure",
        %{context: context} do
     {_collection, _release_id, run_id} = ImportFixture.claim_run!(context)
     kills_remaining = :counters.new(1, [])
@@ -174,17 +178,19 @@ defmodule GeoGenius.Runners.TaskTest do
 
     # The handler reports each distinct execution of this run once, at its
     # first phase span, then brutal-kills the first one. start_child/2's
-    # default restart: :temporary means an abnormal exit is final -- the
-    # run is left claimed, for the lease to reclaim once stale_after
-    # elapses, exactly as Runners.Task's moduledoc promises ("it is the
-    # lease, not the supervisor, that eventually reclaims it"). Under
+    # default restart: :temporary means an abnormal exit is final. The
+    # independent execution guardian records that process death with the
+    # claimed executor rather than restarting or transferring it. Under
     # restart: :transient or :permanent the supervisor re-runs the fun in
     # a fresh process, whose own first span reports a second execution.
     assert_receive {:executed, first_pid}, 2_000
     refute first_pid == self()
     refute_receive {:executed, _restarted_pid}, 500
 
-    refute Catalog.import_run(context, run_id).status in ["completed", "failed"]
+    assert poll_status!(context, run_id) == "failed"
+
+    assert Catalog.import_run(context, run_id).error["reason"] =~
+             "executor process terminated"
   end
 
   # Attaches a handler that reports each distinct executing process of this

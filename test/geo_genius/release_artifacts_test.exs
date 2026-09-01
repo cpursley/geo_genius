@@ -18,7 +18,6 @@ defmodule GeoGenius.ReleaseArtifactsTest do
   alias GeoGenius.Context
   alias GeoGenius.ImportFixture
   alias GeoGenius.Manifest
-  alias GeoGenius.Registration
   alias GeoGenius.ReleaseArtifacts
   alias GeoGenius.Stores.Postgres
   alias GeoGenius.TestRepo
@@ -134,7 +133,7 @@ defmodule GeoGenius.ReleaseArtifactsTest do
     test "reads the release :release_id names, published or not",
          %{collection: collection, context: context, opts: opts} do
       publish_release!(context, collection)
-      second = register!(context, collection, "r2", [@second_only])
+      second = register!(context, collection, "r2", [@second_only]).release_id
 
       assert {:ok, published} = ReleaseArtifacts.list(collection, opts)
       refute Enum.any?(published, &(&1.logical_name == @second_only))
@@ -204,9 +203,8 @@ defmodule GeoGenius.ReleaseArtifactsTest do
 
       TestRepo.query!(
         """
-        DELETE FROM geo_genius.artifact
-         WHERE source_release_id IN (
-           SELECT source_release_id FROM geo_genius.release_source WHERE release_id = $1)
+        DELETE FROM geo_genius.release_artifact
+         WHERE release_id = $1
         """,
         [Postgres.dump_uuid(release_id)]
       )
@@ -257,7 +255,13 @@ defmodule GeoGenius.ReleaseArtifactsTest do
   end
 
   defp publish_release!(context, collection) do
-    release_id = register!(context, collection, "r1", [@supplied, @downloaded, @absent])
+    candidate = register!(context, collection, "r1", [@supplied, @downloaded, @absent])
+    release_id = candidate.release_id
+    executor_id = ImportFixture.claim_executor!(context, candidate.run_id)
+    ImportFixture.advance_to!(context, candidate.run_id, executor_id, "downloading")
+    ImportFixture.observe_selected_artifacts!(context, release_id, candidate.run_id, executor_id)
+
+    ImportFixture.advance_to!(context, candidate.run_id, executor_id, "normalizing")
     area_key = "#{collection}:territory:A"
 
     Catalog.upsert_area(context, collection, %{
@@ -266,17 +270,22 @@ defmodule GeoGenius.ReleaseArtifactsTest do
       code: "A"
     })
 
-    Catalog.put_area_name(context, area_key, %{name: "Alpha", kind: "official", locale: nil})
-
     TestRepo.query!(
       """
       SELECT geo_genius.put_area_in_release(
-        $1, $2, ST_GeogFromText('POINT(0 0)'), '{}'::jsonb)
+        $1, $2, $3, ST_GeogFromText('POINT(0 0)'), '{}'::jsonb)
       """,
-      [Postgres.dump_uuid(release_id), area_key]
+      [Postgres.dump_uuid(candidate.run_id), Postgres.dump_uuid(executor_id), area_key]
     )
 
-    Catalog.publish_release(context, release_id)
+    Catalog.put_area_name(context, candidate.run_id, executor_id, area_key, %{
+      name: "Alpha",
+      kind: "official",
+      locale: nil
+    })
+
+    ImportFixture.advance_to!(context, candidate.run_id, executor_id, "publishing")
+    Catalog.publish_import(context, candidate.run_id, executor_id)
     release_id
   end
 
@@ -285,12 +294,12 @@ defmodule GeoGenius.ReleaseArtifactsTest do
   defp register_other!(context, collection) do
     other = "#{collection}_other"
     ExUnit.Callbacks.on_exit({__MODULE__, other}, fn -> ImportFixture.teardown!(other) end)
-    {other, register!(context, other, "r1", [@supplied])}
+    {other, register!(context, other, "r1", [@supplied]).release_id}
   end
 
   defp register!(context, collection, release_key, logical_names) do
     {:ok, manifest} = Manifest.from_map(manifest_map(collection, release_key, logical_names))
-    Registration.register(context, manifest)
+    ImportFixture.prepare!(context, manifest)
   end
 
   defp manifest_map(collection, release_key, logical_names) do

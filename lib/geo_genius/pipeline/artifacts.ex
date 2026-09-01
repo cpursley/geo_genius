@@ -7,7 +7,7 @@ defmodule GeoGenius.Pipeline.Artifacts do
   downloader, or a checksum. Every artifact is resolved the same way -- look
   in the cache first, download a miss, hash whatever came back, and record
   that observation -- so a cached copy and a fresh download reach
-  `record_artifact_observation/3` through the same check.
+  `record_artifact_observation/5` through the same check.
 
   **A cache hit is hashed on every run**, including one whose artifact row
   already carries a `validated_at`. Trusting that column would mean a
@@ -34,7 +34,7 @@ defmodule GeoGenius.Pipeline.Artifacts do
   """
   @spec download(State.t()) :: State.result()
   def download(%State{} = state) do
-    artifacts = Catalog.release_artifacts(state.context, state.run.release_id)
+    artifacts = Catalog.run_artifacts(state.context, state.run.run_id)
 
     artifacts
     |> Enum.reduce_while({:ok, empty_downloads()}, &collect_artifact(&1, state, &2))
@@ -51,7 +51,7 @@ defmodule GeoGenius.Pipeline.Artifacts do
   """
   @spec validate(State.t()) :: State.result()
   def validate(%State{} = state) do
-    artifacts = Catalog.release_artifacts(state.context, state.run.release_id)
+    artifacts = Catalog.run_artifacts(state.context, state.run.run_id)
     {required, optional} = Enum.split_with(artifacts, &required?(state, &1))
     unvalidated = Enum.filter(required, &is_nil(&1["validated_at"]))
 
@@ -153,7 +153,11 @@ defmodule GeoGenius.Pipeline.Artifacts do
     downloader = Context.adapter(state.context, :downloader)
     destination = Path.join(state.work_dir, artifact["logical_name"])
 
-    case downloader.fetch(artifact["url"], destination, state.opts) do
+    case downloader.fetch(
+           artifact["url"],
+           destination,
+           Keyword.put(state.opts, :max_bytes, artifact["expected_bytes"])
+         ) do
       {:ok, observed} ->
         cache_and_observe(state, artifact, key, destination, observed)
 
@@ -176,23 +180,41 @@ defmodule GeoGenius.Pipeline.Artifacts do
     end
   end
 
-  # `record_artifact_observation/3` is where expectation meets observation, and
+  # `record_artifact_observation/5` is where expectation meets observation, and
   # it refuses a mismatch. That refusal arrives as a check violation naming an
   # artifact uuid, so it is turned into a message naming the artifact an
   # operator knows.
   defp observe(state, artifact, path, observed, origin) do
-    Catalog.record_artifact_observation(state.context, artifact["artifact_id"], %{
-      observed_sha256: observed.sha256,
-      observed_bytes: observed.bytes
-    })
+    Catalog.record_artifact_observation(
+      state.context,
+      state.run.run_id,
+      state.executor_id,
+      artifact["artifact_id"],
+      %{
+        observed_sha256: observed.sha256,
+        observed_bytes: observed.bytes
+      }
+    )
 
     {:ok, {origin, path, observed.bytes}}
   rescue
     error in CatalogError ->
-      {:error,
-       "artifact #{artifact["logical_name"]} does not match its manifest: " <>
-         "#{Exception.message(error)}"}
+      {:error, observation_error(artifact, error)}
   end
+
+  defp observation_error(artifact, %CatalogError{} = error) do
+    name = artifact["logical_name"]
+
+    if checksum_mismatch?(error) do
+      "artifact #{name} does not match its manifest: #{Exception.message(error)}"
+    else
+      "could not record the observation for artifact #{name}: #{Exception.message(error)}"
+    end
+  end
+
+  defp checksum_mismatch?(%CatalogError{reason: %{postgres: %{code: :check_violation}}}), do: true
+  defp checksum_mismatch?(%CatalogError{reason: %{postgres: %{code: "23514"}}}), do: true
+  defp checksum_mismatch?(_error), do: false
 
   defp required?(state, artifact) do
     case Map.fetch(state.manifest_artifacts, artifact["logical_name"]) do
