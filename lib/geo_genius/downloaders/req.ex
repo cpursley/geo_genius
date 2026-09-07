@@ -1,4 +1,9 @@
 defmodule GeoGenius.Downloaders.Req do
+  @retryable_statuses [429, 503]
+  @default_max_attempts 5
+  @base_backoff_ms 1_000
+  @max_backoff_ms 60_000
+
   @moduledoc """
   Streams an artifact to disk with Req, hashing as it goes.
 
@@ -12,20 +17,26 @@ defmodule GeoGenius.Downloaders.Req do
   status, a transport failure, a raised exception, or an `exit`/`throw`
   removes the partial file and leaves `destination` untouched.
 
-  Retries are fixed off and cannot be re-enabled through `opts`. The
+  Req-level retries are fixed off and cannot be re-enabled through `opts`. The
   destination file handle is opened once and written to as chunks arrive; a
   Req-level retry re-enters the adapter with a fresh response, so the hash
   state and byte count carried on that response reset while the handle keeps
   appending. The result is a file containing both attempts concatenated
   together, with a reported `sha256`/`bytes` covering only the last one:
-  corruption that passes checksum verification. Retrying a failed download
-  means calling `fetch/3` again from the top, over a fresh handle, which is
-  what a caller's own failure path already does.
+  corruption that passes checksum verification.
+
+  Rate limiting is retried here instead, from the top and over a fresh handle.
+  A `429` or `503` response closes the handle, removes the partial file, waits,
+  and starts the request again, up to `opts[:max_attempts]` times (default
+  #{@default_max_attempts}). The wait honors a `Retry-After` header given in
+  seconds and otherwise doubles from #{@base_backoff_ms} ms per attempt, capped
+  at #{@max_backoff_ms} ms. Any other non-200 status is final. `opts[:sleep]`
+  replaces `Process.sleep/1` for tests.
   """
 
   @behaviour GeoGenius.Downloader
 
-  @compile {:no_warn_undefined, [Req, Req.Request]}
+  @compile {:no_warn_undefined, [Req, Req.Request, Req.Response]}
 
   @request_opt_keys [:plug, :headers, :receive_timeout, :connect_options]
   @private_key :geo_genius_download
@@ -39,7 +50,7 @@ defmodule GeoGenius.Downloaders.Req do
           {:ok, %{bytes: non_neg_integer(), sha256: String.t()}} | {:error, term()}
   def fetch(url, destination, opts) do
     if available?() do
-      stream(url, destination, opts)
+      attempt(url, destination, opts, 1)
     else
       {:error, unavailable_message(url)}
     end
@@ -67,6 +78,27 @@ defmodule GeoGenius.Downloaders.Req do
 
     :ok = IO.binwrite(handle, data)
     {:cont, {req, record_chunk(resp, data)}}
+  end
+
+  defp attempt(url, destination, opts, attempt_number) do
+    max_attempts = Keyword.get(opts, :max_attempts, @default_max_attempts)
+
+    case stream(url, destination, opts) do
+      {:retry, _status, retry_after_ms} when attempt_number < max_attempts ->
+        sleep = Keyword.get(opts, :sleep, &Process.sleep/1)
+        sleep.(retry_after_ms || backoff_ms(attempt_number))
+        attempt(url, destination, opts, attempt_number + 1)
+
+      {:retry, status, _retry_after_ms} ->
+        {:error, "GET #{url} returned #{status} after #{max_attempts} attempts"}
+
+      result ->
+        result
+    end
+  end
+
+  defp backoff_ms(attempt_number) do
+    min(@base_backoff_ms * Integer.pow(2, attempt_number - 1), @max_backoff_ms)
   end
 
   defp stream(url, destination, opts) do
@@ -125,6 +157,11 @@ defmodule GeoGenius.Downloaders.Req do
     finalize(resp, part_path, destination)
   end
 
+  defp handle_result({:ok, %{status: status} = resp}, _url, _part_path, _destination)
+       when status in @retryable_statuses do
+    {:retry, status, retry_after_ms(resp)}
+  end
+
   defp handle_result({:ok, %{status: status}}, url, _part_path, _destination) do
     {:error, "GET #{url} returned #{status}"}
   end
@@ -140,6 +177,18 @@ defmodule GeoGenius.Downloaders.Req do
   end
 
   defp initial_state, do: {:crypto.hash_init(:sha256), 0}
+
+  # Only the delay-seconds form of Retry-After is read; an HTTP-date value
+  # falls through to the backoff schedule.
+  defp retry_after_ms(resp) do
+    with [value | _] <- Req.Response.get_header(resp, "retry-after"),
+         {seconds, ""} <- Integer.parse(String.trim(value)),
+         true <- seconds >= 0 do
+      seconds * 1_000
+    else
+      _other -> nil
+    end
+  end
 
   defp max_bytes(%{private: private}) when is_map(private),
     do: Map.get(private, :geo_genius_max_bytes)

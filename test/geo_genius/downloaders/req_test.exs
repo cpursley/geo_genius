@@ -104,6 +104,110 @@ defmodule GeoGenius.Downloaders.ReqTest do
     refute File.exists?(destination <> ".part")
   end
 
+  describe "rate limiting" do
+    defp counting_stub(responses) do
+      {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+      opts =
+        stub(fn conn ->
+          index = Agent.get_and_update(counter, fn n -> {n, n + 1} end)
+          Enum.at(responses, index, List.last(responses)).(conn)
+        end)
+
+      {opts, counter}
+    end
+
+    defp recording_sleep do
+      {:ok, sleeps} = Agent.start_link(fn -> [] end)
+      {fn ms -> Agent.update(sleeps, &[ms | &1]) end, sleeps}
+    end
+
+    test "a 429 is retried from the top over a fresh handle and the body is intact",
+         %{destination: destination} do
+      {opts, counter} =
+        counting_stub([
+          fn conn -> Plug.Conn.send_resp(conn, 429, "slow down") end,
+          fn conn -> Plug.Conn.send_resp(conn, 429, "slow down") end,
+          fn conn -> Plug.Conn.send_resp(conn, 200, @body) end
+        ])
+
+      {sleep, sleeps} = recording_sleep()
+
+      assert {:ok, observed} =
+               Downloader.fetch("https://example.test/a", destination, opts ++ [sleep: sleep])
+
+      assert Agent.get(counter, & &1) == 3
+      assert observed.bytes == byte_size(@body)
+      assert observed.sha256 == Base.encode16(:crypto.hash(:sha256, @body), case: :lower)
+      assert File.read!(destination) == @body
+      assert Agent.get(sleeps, &Enum.reverse/1) == [1_000, 2_000]
+    end
+
+    test "a Retry-After header in seconds sets the wait instead of the backoff",
+         %{destination: destination} do
+      {opts, _counter} =
+        counting_stub([
+          fn conn ->
+            conn |> Plug.Conn.put_resp_header("retry-after", "7") |> Plug.Conn.send_resp(429, "")
+          end,
+          fn conn -> Plug.Conn.send_resp(conn, 200, @body) end
+        ])
+
+      {sleep, sleeps} = recording_sleep()
+
+      assert {:ok, _observed} =
+               Downloader.fetch("https://example.test/a", destination, opts ++ [sleep: sleep])
+
+      assert Agent.get(sleeps, &Enum.reverse/1) == [7_000]
+    end
+
+    test "a 503 is retried the same way", %{destination: destination} do
+      {opts, counter} =
+        counting_stub([
+          fn conn -> Plug.Conn.send_resp(conn, 503, "") end,
+          fn conn -> Plug.Conn.send_resp(conn, 200, @body) end
+        ])
+
+      {sleep, _sleeps} = recording_sleep()
+
+      assert {:ok, _observed} =
+               Downloader.fetch("https://example.test/a", destination, opts ++ [sleep: sleep])
+
+      assert Agent.get(counter, & &1) == 2
+    end
+
+    test "gives up after the attempt budget with an error naming the status and attempts",
+         %{destination: destination} do
+      {opts, counter} = counting_stub([fn conn -> Plug.Conn.send_resp(conn, 429, "") end])
+      {sleep, sleeps} = recording_sleep()
+
+      assert {:error, reason} =
+               Downloader.fetch(
+                 "https://example.test/a",
+                 destination,
+                 opts ++ [sleep: sleep, max_attempts: 3]
+               )
+
+      assert reason =~ "429"
+      assert reason =~ "3 attempts"
+      assert Agent.get(counter, & &1) == 3
+      assert Agent.get(sleeps, &Enum.reverse/1) == [1_000, 2_000]
+      refute File.exists?(destination)
+      refute File.exists?(destination <> ".part")
+    end
+
+    test "a 404 is not retried", %{destination: destination} do
+      {opts, counter} = counting_stub([fn conn -> Plug.Conn.send_resp(conn, 404, "") end])
+      {sleep, sleeps} = recording_sleep()
+
+      assert {:error, _reason} =
+               Downloader.fetch("https://example.test/a", destination, opts ++ [sleep: sleep])
+
+      assert Agent.get(counter, & &1) == 1
+      assert Agent.get(sleeps, & &1) == []
+    end
+  end
+
   test "a transport failure is an error and leaves nothing behind", %{destination: destination} do
     opts = stub(fn conn -> Req.Test.transport_error(conn, :econnrefused) end)
 

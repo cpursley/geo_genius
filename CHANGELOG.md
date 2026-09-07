@@ -210,6 +210,12 @@
 
 ### Ingestion
 
+- **`Downloaders.Req` retries rate-limited downloads from the top.** A `429` or `503`
+  response closes the handle, removes the partial file, waits, and requests the artifact again
+  over a fresh handle, up to `:max_attempts` times (default 5), honoring a `Retry-After` header
+  in seconds and otherwise doubling from one second. Req-level retry stays off because it
+  concatenates attempts into one file. Sequential national imports against Census, which
+  answers a burst of a few dozen requests with `429`, previously failed the whole run.
 - **`Downloaders.Req` carries the reviewed byte cap through `Req.Request.put_private/3`.**
   Passing the cap as a `private:` request option was rejected by Req before any bytes moved,
   so every required artifact failed at `downloading` with `unknown option :private`. The
