@@ -67,6 +67,33 @@ defmodule GeoGenius.Downloaders.ReqTest do
     assert File.read!(destination) == body
   end
 
+  test "a reviewed byte cap is carried on the request and a body within it downloads",
+       %{destination: destination} do
+    opts = stub(fn conn -> Plug.Conn.send_resp(conn, 200, @body) end)
+
+    assert {:ok, observed} =
+             Downloader.fetch(
+               "https://example.test/a",
+               destination,
+               opts ++ [max_bytes: byte_size(@body)]
+             )
+
+    assert observed.bytes == byte_size(@body)
+    assert File.read!(destination) == @body
+  end
+
+  test "a body that exceeds the reviewed byte cap is an error and leaves nothing behind",
+       %{destination: destination} do
+    opts = stub(fn conn -> Plug.Conn.send_resp(conn, 200, @body) end)
+
+    assert {:error, message} =
+             Downloader.fetch("https://example.test/a", destination, opts ++ [max_bytes: 4])
+
+    assert message =~ "exceeded the reviewed 4 bytes"
+    refute File.exists?(destination)
+    refute File.exists?(destination <> ".part")
+  end
+
   test "a non-200 response is an error and leaves nothing behind", %{destination: destination} do
     opts = stub(fn conn -> Plug.Conn.send_resp(conn, 404, "nope") end)
 

@@ -25,7 +25,7 @@ defmodule GeoGenius.Downloaders.Req do
 
   @behaviour GeoGenius.Downloader
 
-  @compile {:no_warn_undefined, Req}
+  @compile {:no_warn_undefined, [Req, Req.Request]}
 
   @request_opt_keys [:plug, :headers, :receive_timeout, :connect_options]
   @private_key :geo_genius_download
@@ -75,8 +75,9 @@ defmodule GeoGenius.Downloaders.Req do
     handle = File.open!(part_path, [:write, :binary, :raw])
 
     try do
-      url
-      |> Req.get(build_request_opts(opts, handle))
+      opts
+      |> build_request(url, handle)
+      |> Req.get()
       |> handle_result(url, part_path, destination)
     rescue
       error -> {:error, Exception.message(error)}
@@ -86,25 +87,27 @@ defmodule GeoGenius.Downloaders.Req do
     end
   end
 
-  defp build_request_opts(opts, handle) do
-    opts
-    |> Keyword.take(@request_opt_keys)
-    |> Keyword.merge(
-      retry: false,
-      into: into_fun(handle),
-      redirect: false
-    )
-    |> maybe_put_max_bytes(opts)
-  end
+  # The byte cap rides in the request's private map, which Req reserves for
+  # libraries and exposes only through `Req.Request.put_private/3`; it is not a
+  # request option, so passing it as one is rejected before any bytes move.
+  defp build_request(opts, url, handle) do
+    request =
+      opts
+      |> Keyword.take(@request_opt_keys)
+      |> Keyword.merge(
+        url: url,
+        retry: false,
+        into: into_fun(handle),
+        redirect: false
+      )
+      |> Req.new()
 
-  defp maybe_put_max_bytes(request_opts, opts) do
     case Keyword.get(opts, :max_bytes) do
       max_bytes when is_integer(max_bytes) and max_bytes > 0 ->
-        private = Keyword.get(request_opts, :private, %{})
-        Keyword.put(request_opts, :private, Map.put(private, :geo_genius_max_bytes, max_bytes))
+        Req.Request.put_private(request, :geo_genius_max_bytes, max_bytes)
 
       _other ->
-        request_opts
+        request
     end
   end
 

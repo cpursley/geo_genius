@@ -210,6 +210,11 @@
 
 ### Ingestion
 
+- **`Downloaders.Req` carries the reviewed byte cap through `Req.Request.put_private/3`.**
+  Passing the cap as a `private:` request option was rejected by Req before any bytes moved,
+  so every required artifact failed at `downloading` with `unknown option :private`. The
+  downloader now builds the request explicitly and enforces the cap while streaming; a body that
+  exceeds it is an error that leaves no partial file behind.
 - **Import ownership is exact-attempt and run-fenced.** `prepare_import/2` registers the exact
   manifest and returns a candidate decision; `retry_failed/3` is the only replacement path and
   creates a new run while preserving the failed attempt's manifest, artifact observations,
