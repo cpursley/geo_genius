@@ -241,10 +241,11 @@ the same contract check at startup. Neither surface creates, repairs, or migrate
 
 ## Returning a pre-production install
 
-GeoGenius is pre-production and publishes one current schema contract at version 1. There is no
-in-place reconciliation API, generated reconciliation SQL, or compatibility edge between earlier
-development snapshots that also called themselves version 1. A database installed from an older
-snapshot must be returned and installed again from the current package.
+GeoGenius publishes one current schema contract, at version 2. A schema installed at version 1
+from this package upgrades in place -- see [Upgrades](#upgrades) -- and this section is not about
+that. There is no in-place reconciliation API, generated reconciliation SQL, or compatibility edge
+between earlier development snapshots that also called themselves version 1. A database installed
+from an older snapshot must be returned and installed again from the current package.
 
 This policy is destructive and is only appropriate while the catalog is reproducible from its
 reviewed manifests and checksummed source artifacts. Before returning the migration, confirm that
@@ -280,7 +281,8 @@ mix geo_genius.migration_sql --prefix geo_genius --from 0 --to 1 > priv/hasura/m
 
 `--prefix`, `--from`, and `--to` are all required. The task writes only SQL to standard output,
 so redirect it into the migration file that the host's own migration tool will apply. This
-pre-release package renders the consolidated v1 install (`0` to `1`) and uninstall (`1` to `0`).
+package renders the consolidated v1 install (`0` to `1`), the adjacent `1` to `2` upgrade and its
+reverse, the combined `0` to `2` install, and the matching uninstalls.
 The renderer validates that both versions are in the package's supported range, preserves the
 shipped version-file order, substitutes the escaped PostgreSQL identifier for `$SCHEMA$`, removes
 the internal statement separators, and emits the same version-view comment that the Ecto
@@ -426,6 +428,28 @@ When a later GeoGenius release ships an adjacent schema version, follow that rel
 notes to generate and review its own pinned wrapper, then migrate normally. Only one adjacent
 transition (`to = from + 1`) is accepted per invocation; there is no multi-version jump. Back up
 the database before running an upgrade migration, the same as before any other schema change.
+
+Version 2 is the first such upgrade. It replaces `put_boundary` and `put_boundaries` so both
+repair the display geometry they derive, and touches no table, view, index, or datum otherwise; a
+schema already at version 1 keeps every row it holds. An Ecto host generates the wrapper:
+
+```console
+mix geo_genius.gen.migration --repo MyApp.Repo --prefix geo_genius --from 1 --to 2
+mix ecto.migrate
+mix geo_genius.check_schema --repo MyApp.Repo --prefix geo_genius
+```
+
+A SQL-first host renders the same transition, and its reverse, and commits both with the host
+migration that applies them:
+
+```console
+mix geo_genius.migration_sql --prefix geo_genius --from 1 --to 2 > up.sql
+mix geo_genius.migration_sql --prefix geo_genius --from 2 --to 1 > down.sql
+```
+
+Both directions are `CREATE OR REPLACE FUNCTION` over the two boundary writes plus the two marker
+views, so either can be applied to a live schema. Upgrade before the next import: a version 1
+schema rejects a boundary whose quantized display geometry is invalid, failing the whole run.
 
 ## The down migration drops the schema, and that is deliberate
 

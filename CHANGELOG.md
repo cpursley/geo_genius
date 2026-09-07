@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Schema
+
+- **Schema version 2 repairs the display geometry both boundary writes derive, and is the
+  package's first adjacent upgrade.** `boundary.display_geom` is
+  `ST_QuantizeCoordinates(canonical, 6)`, and the column carries the same `ST_IsValid` and
+  `NOT ST_IsEmpty` checks the canonical column does. Quantizing moves every coordinate by up to
+  half a unit in the sixth decimal place, so a valid canonical geometry can quantize into an
+  invalid one -- a ring whose three distinct points differ only past that place collapses onto a
+  single point, and the row is rejected with
+  `violates check constraint "boundary_display_geom_valid_chk"`. Because the write is a batch in
+  the `normalizing` phase, one such area failed a whole national import. `put_boundary` and
+  `put_boundaries` now repair the quantized geometry the way they already repair the canonical
+  one -- `ST_MakeValid` then `ST_CollectionExtract(..., 3)` -- and keep the canonical geometry
+  when the repair leaves no polygon at all. The check constraints are unchanged: a display
+  geometry still has to be a valid, nonempty polygon, and now it is one. Adds the
+  `boundary_display_repair` capability.
+- **Version 2 is a function replacement, not a table change.** `v02_up.sql` and `v02_down.sql` are
+  `CREATE OR REPLACE FUNCTION` over the two boundary writes plus the two marker views, so a
+  schema at version 1 upgrades in place and keeps every row it holds, and either direction can be
+  applied to a live schema. **Hosts on version 1 must apply it**: generate the pinned wrapper with
+  `mix geo_genius.gen.migration --from 1 --to 2`, or render the SQL with
+  `mix geo_genius.migration_sql --prefix <prefix> --from 1 --to 2` and its reverse. Upgrade before
+  the next import.
+
 ### Installation
 
 - **Postgrex `>= 0.20.0 and < 0.23.0` is supported.** This includes hosts locked to

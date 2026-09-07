@@ -63,6 +63,13 @@ defmodule GeoGenius.MixHelpersTest do
     refute body =~ "CREATE EXTENSION"
   end
 
+  test "renders a pinned body for an adjacent upgrade" do
+    body = MixHelpers.migration_body("geo_genius", 1, 2, 2, false)
+
+    assert body =~ ~s|def up, do: GeoGenius.Migration.up(prefix: "geo_genius", version: 2)|
+    assert body =~ ~s|def down, do: GeoGenius.Migration.down(prefix: "geo_genius", version: 1)|
+  end
+
   test "emits extension statements when requested" do
     body = MixHelpers.migration_body("geo_genius", 0, 1, 1, true)
 

@@ -31,6 +31,27 @@ defmodule GeoGenius.MigrationSQLTest do
     refute sql =~ "--SPLIT--"
   end
 
+  test "renders the adjacent upgrade without reinstalling the schema" do
+    assert sql = Migration.render_sql(prefix: "geo_genius", from: 1, to: 2)
+
+    assert sql =~ "CREATE OR REPLACE FUNCTION geo_genius.put_boundaries("
+    assert sql =~ "CREATE OR REPLACE FUNCTION geo_genius.put_boundary("
+    assert sql =~ "COMMENT ON VIEW geo_genius.geo_genius_version IS 'GeoGenius version=2'"
+    refute sql =~ "CREATE SCHEMA"
+    refute sql =~ "CREATE TABLE"
+    refute sql =~ "$SCHEMA$"
+    refute sql =~ "--SPLIT--"
+  end
+
+  test "renders the reverse of the adjacent upgrade" do
+    assert sql = Migration.render_sql(prefix: "geo_genius", from: 2, to: 1)
+
+    assert sql =~ "CREATE OR REPLACE FUNCTION geo_genius.put_boundaries("
+    assert sql =~ "COMMENT ON VIEW geo_genius.geo_genius_version IS 'GeoGenius version=1'"
+    refute sql =~ "DROP TABLE"
+    refute sql =~ "$SCHEMA$"
+  end
+
   test "rejects invalid migration ranges" do
     assert_raise ArgumentError, ~r/from and to must differ/, fn ->
       Migration.render_sql(prefix: "geo_genius", from: 0, to: 0)
@@ -41,7 +62,7 @@ defmodule GeoGenius.MigrationSQLTest do
     end
 
     assert_raise ArgumentError, ~r/current version/, fn ->
-      Migration.render_sql(prefix: "geo_genius", from: 0, to: 2)
+      Migration.render_sql(prefix: "geo_genius", from: 0, to: 3)
     end
   end
 

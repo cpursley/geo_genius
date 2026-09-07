@@ -1283,6 +1283,67 @@ defmodule GeoGenius.CatalogTest do
              """) == [[2, %{"ordinal" => 2}, "POLYGON((2 2,3 2,3 3,2 3,2 2))"]]
     end
 
+    test "a boundary batch stores a display geometry quantizing would invalidate",
+         %{context: context} do
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
+
+      assert :ok =
+               Catalog.put_boundaries(context, run_id, executor_id, [
+                 %{
+                   area_key: "a:t:one",
+                   source_release_id: source_release_id,
+                   geometry: self_touching_polygon()
+                 }
+               ])
+
+      assert query_rows(context, """
+             SELECT ST_IsValid(display_geom), ST_IsEmpty(display_geom),
+                    GeometryType(display_geom), ST_IsValid(geom)
+               FROM geo_genius.boundary
+             """) == [[true, false, "MULTIPOLYGON", true]]
+    end
+
+    test "a boundary batch falls back to the canonical geometry when the display collapses",
+         %{context: context} do
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
+
+      assert :ok =
+               Catalog.put_boundaries(context, run_id, executor_id, [
+                 %{
+                   area_key: "a:t:one",
+                   source_release_id: source_release_id,
+                   geometry: collapsing_sliver()
+                 }
+               ])
+
+      assert query_rows(context, """
+             SELECT ST_IsValid(display_geom), ST_IsEmpty(display_geom),
+                    ST_OrderingEquals(display_geom, geom)
+               FROM geo_genius.boundary
+             """) == [[true, false, true]]
+    end
+
+    # A nonzero tolerance is what routes `put_boundary/5` to the singular SQL
+    # function instead of the batch one, so this covers the branch the batch
+    # tests above cannot reach.
+    test "the simplifying boundary write repairs its own display geometry",
+         %{context: context} do
+      {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
+
+      assert :ok =
+               Catalog.put_boundary(context, run_id, executor_id, "a:t:one", %{
+                 source_release_id: source_release_id,
+                 geometry: self_touching_polygon(),
+                 simplify_tolerance: 0.0000000001
+               })
+
+      assert query_rows(context, """
+             SELECT ST_IsValid(display_geom), ST_IsEmpty(display_geom),
+                    GeometryType(display_geom)
+               FROM geo_genius.boundary
+             """) == [[true, false, "MULTIPOLYGON"]]
+    end
+
     test "put_boundary remains a one-element compatibility wrapper",
          %{context: context} do
       {run_id, executor_id, source_release_id} = boundary_fixture(context, ["one"])
@@ -1564,6 +1625,42 @@ defmodule GeoGenius.CatalogTest do
   defp square(low, high) do
     %Geo.Polygon{
       coordinates: [[{low, low}, {high, low}, {high, high}, {low, high}, {low, low}]],
+      srid: 4326
+    }
+  end
+
+  # Zillow's 2018 Broadmoor (Seattle) neighborhood reduced to the five vertices
+  # that carry its pathology. The ring returns to -122.2896177 and steps 1e-7
+  # of a degree north, so it touches itself; repairing it yields the real
+  # polygon plus a zero-width sliver, and quantizing that pair to six decimals
+  # collapses the sliver's vertices onto one point.
+  defp self_touching_polygon do
+    %Geo.Polygon{
+      coordinates: [
+        [
+          {-122.2896171, 47.6280851},
+          {-122.2896177, 47.6279214},
+          {-122.2896177, 47.6279215},
+          {-122.2868289, 47.6298175},
+          {-122.2896171, 47.6280851}
+        ]
+      ],
+      srid: 4326
+    }
+  end
+
+  # That sliver on its own: a valid polygon whose every vertex quantizes to the
+  # same point, so repairing the quantized geometry leaves no polygon to store.
+  defp collapsing_sliver do
+    %Geo.Polygon{
+      coordinates: [
+        [
+          {-122.2896177, 47.6279215},
+          {-122.28961769963256, 47.627921500249805},
+          {-122.2896177, 47.6279214},
+          {-122.2896177, 47.6279215}
+        ]
+      ],
       srid: 4326
     }
   end

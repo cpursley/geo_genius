@@ -4,6 +4,24 @@ defmodule GeoGenius.MigrationTest do
   alias GeoGenius.AppEnv
   alias GeoGenius.TestRepo
 
+  # The two host-owned wrappers `mix geo_genius.setup` and
+  # `mix geo_genius.gen.migration` generate, pinned the way a host commits
+  # them: one install pinned at the version it was generated against, and one
+  # adjacent upgrade beside it.
+  defmodule PinnedV1 do
+    use Ecto.Migration
+
+    def up, do: GeoGenius.Migration.up(prefix: "geo_genius", version: 1)
+    def down, do: GeoGenius.Migration.down(prefix: "geo_genius", version: 0)
+  end
+
+  defmodule UpgradeV2 do
+    use Ecto.Migration
+
+    def up, do: GeoGenius.Migration.up(prefix: "geo_genius", version: 2)
+    def down, do: GeoGenius.Migration.down(prefix: "geo_genius", version: 1)
+  end
+
   # Reset-only per test: each test drops both prefixes and installs whichever
   # one it needs. ExUnit randomizes test order, so whichever test runs last
   # decides what's left installed when the module finishes -- fine for the
@@ -65,12 +83,39 @@ defmodule GeoGenius.MigrationTest do
     |> String.to_integer()
   end
 
-  test "the pre-release package has one consolidated schema version" do
-    assert GeoGenius.Migration.current_version() == 1
+  test "the package ships the consolidated install and one adjacent upgrade" do
+    assert GeoGenius.Migration.current_version() == 2
 
     assert "lib/geo_genius/migrations/v*.ex"
            |> Path.wildcard()
-           |> Enum.map(&Path.basename/1) == ["v01.ex"]
+           |> Enum.map(&Path.basename/1) == ["v01.ex", "v02.ex"]
+  end
+
+  test "a host pinned at v1 upgrades to v2 through its own adjacent wrapper" do
+    TestRepo.query!(~s(CREATE SCHEMA IF NOT EXISTS "geo_genius"))
+
+    :ok = Ecto.Migrator.up(TestRepo, 1, PinnedV1, log: false)
+    assert GeoGenius.Migration.installed_version(TestRepo, "geo_genius") == 1
+
+    :ok = Ecto.Migrator.up(TestRepo, 2, UpgradeV2, log: false)
+    assert GeoGenius.Migration.installed_version(TestRepo, "geo_genius") == 2
+
+    # The v01 boundary writes stayed in place until the upgrade replaced them,
+    # so the reverse migration has to put the v01 bodies back rather than drop
+    # functions the v1 install still owns.
+    :ok = Ecto.Migrator.down(TestRepo, 2, UpgradeV2, log: false)
+    assert GeoGenius.Migration.installed_version(TestRepo, "geo_genius") == 1
+
+    assert [[1]] =
+             TestRepo.query!("SELECT schema_version FROM geo_genius.geo_genius_contract").rows
+
+    assert [[2]] =
+             TestRepo.query!("""
+             SELECT count(*)::integer FROM pg_proc p
+               JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'geo_genius'
+                AND p.proname IN ('put_boundary', 'put_boundaries')
+             """).rows
   end
 
   test "installs at the default prefix and records the version" do

@@ -3,6 +3,8 @@ defmodule GeoGenius.SchemaContract do
 
   alias EctoEvolver.Adapters.Postgres
 
+  @schema_version 2
+
   @capabilities [
     "artifact_observation_publication_gate",
     "atomic_failed_candidate_retry",
@@ -11,6 +13,7 @@ defmodule GeoGenius.SchemaContract do
     "boundary_batches",
     "boundary_canonical_repair_once",
     "boundary_collection_provenance",
+    "boundary_display_repair",
     "boundary_publication_serialization",
     "exact_attempt_artifact_snapshots",
     "exact_attempt_manifest_snapshots",
@@ -145,7 +148,7 @@ defmodule GeoGenius.SchemaContract do
   @trigger_names ~w(publication_completed_release_check release_publication_check)
 
   @canonical_manifest Enum.map_join(
-                        ["schema_version=1"] ++
+                        ["schema_version=#{@schema_version}"] ++
                           Enum.map(@capabilities, &"capability=#{&1}") ++
                           Enum.map(@signatures, &"signature=#{&1}") ++
                           Enum.map(@relation_metadata, &"relation_metadata=#{&1}") ++
@@ -216,9 +219,9 @@ defmodule GeoGenius.SchemaContract do
     {"put_artifact(target_source_release_id uuid, logical_name text, url text, operator_supplied boolean, format text, expected_sha256 text, expected_bytes bigint, metadata jsonb)->uuid",
      "bbd6014ce7ddb008061eb5868634f841"},
     {"put_boundaries(target_run_id uuid, target_executor_id uuid, target_area_keys text[], target_source_release_ids uuid[], input_geometries geometry[], display_tiers integer[], source_properties_values jsonb[])->void",
-     "735d26b4728d9715a93b7f967ec74ec2"},
+     "19aa5fb5e5fc6279fcb6f9fb1e66cd4e"},
     {"put_boundary(target_run_id uuid, target_executor_id uuid, target_area_key text, target_source_release_id uuid, input_geom geometry, simplify_tolerance double precision)->void",
-     "a6c232fe775c26d234160d721cba16f9"},
+     "b818c2fe9832f54e4ee81f27c8e9d8b4"},
     {"put_relation(target_run_id uuid, target_executor_id uuid, parent_area_key text, child_area_key text, relation_type text)->void",
      "66a920480e40d882121e16ff27e76a7c"},
     {"put_relation_many(target_run_id uuid, target_executor_id uuid, parent_area_keys text[], child_area_keys text[], relation_types text[])->void",
@@ -306,7 +309,7 @@ defmodule GeoGenius.SchemaContract do
   @doc false
   def manifest do
     %{
-      schema_version: 1,
+      schema_version: @schema_version,
       capabilities: @capabilities,
       signatures: @signatures,
       relation_metadata: @relation_metadata,
@@ -338,7 +341,14 @@ defmodule GeoGenius.SchemaContract do
     version = GeoGenius.Migration.installed_version(repo, prefix)
 
     if version == 0 do
-      status(:not_installed, version, nil, [], [], "install GeoGenius schema v1")
+      status(
+        :not_installed,
+        version,
+        nil,
+        [],
+        [],
+        "install GeoGenius schema v#{@schema_version}"
+      )
     else
       marker = marker(repo, prefix)
       fingerprints = fingerprints(repo, prefix)
@@ -379,15 +389,15 @@ defmodule GeoGenius.SchemaContract do
   def validate_prefix!(_prefix), do: raise(ArgumentError, "PostgreSQL prefix must be a string")
 
   defp classify(
-         1,
-         %{schema_version: 1, revision: @revision, capabilities: @capabilities},
+         @schema_version,
+         %{schema_version: @schema_version, revision: @revision, capabilities: @capabilities},
          @target_fingerprints,
          @target_relation_metadata,
          @target_trigger_metadata,
          @signatures,
          _prefix
        ) do
-    status(:compatible, 1, @revision, @capabilities, [], nil)
+    status(:compatible, @schema_version, @revision, @capabilities, [], nil)
   end
 
   defp classify(
@@ -412,8 +422,10 @@ defmodule GeoGenius.SchemaContract do
       installed_revision,
       if(match?(%{capabilities: _}, marker), do: marker.capabilities, else: []),
       missing,
-      "schema #{prefix} does not match the current pre-release GeoGenius contract; " <>
-        "regenerate the host's pinned GeoGenius migration and recreate this non-production schema"
+      "schema #{prefix} does not match the GeoGenius contract at version #{@schema_version}; " <>
+        "an install at an earlier published version upgrades with " <>
+        "mix geo_genius.gen.migration --from #{version} --to #{version + 1}, and a schema from a " <>
+        "development snapshot must be returned and installed again from the current package"
     )
   end
 

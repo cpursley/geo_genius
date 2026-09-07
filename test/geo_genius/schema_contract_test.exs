@@ -12,6 +12,7 @@ defmodule GeoGenius.SchemaContractTest do
     "boundary_batches",
     "boundary_canonical_repair_once",
     "boundary_collection_provenance",
+    "boundary_display_repair",
     "boundary_publication_serialization",
     "exact_attempt_artifact_snapshots",
     "exact_attempt_manifest_snapshots",
@@ -139,7 +140,7 @@ defmodule GeoGenius.SchemaContractTest do
       rows =
         cond do
           sql =~ "obj_description" ->
-            if Map.get(state, :installed?, true), do: [["geo_genius;version=1"]], else: []
+            if Map.get(state, :installed?, true), do: [["geo_genius;version=2"]], else: []
 
           sql =~ "SELECT c.relkind" ->
             [["v"]]
@@ -154,7 +155,7 @@ defmodule GeoGenius.SchemaContractTest do
           sql =~ "SELECT schema_version, contract_revision, capabilities" ->
             [
               [
-                1,
+                2,
                 Map.get(state, :revision, SchemaContract.revision()),
                 Map.get(state, :capabilities, SchemaContract.capabilities())
               ]
@@ -183,7 +184,7 @@ defmodule GeoGenius.SchemaContractTest do
 
   test "the current revision is the sha256 identity of the canonical current-only contract" do
     assert SchemaContract.manifest() == %{
-             schema_version: 1,
+             schema_version: 2,
              capabilities: @capabilities,
              signatures: @signatures,
              relation_metadata: @relation_metadata,
@@ -201,7 +202,7 @@ defmodule GeoGenius.SchemaContractTest do
     lines = String.split(SchemaContract.canonical_manifest(), "\n", trim: true)
 
     assert lines ==
-             ["schema_version=1"] ++
+             ["schema_version=2"] ++
                Enum.map(@capabilities, &"capability=#{&1}") ++
                Enum.map(@signatures, &"signature=#{&1}") ++
                Enum.map(@relation_metadata, &"relation_metadata=#{&1}") ++
@@ -275,7 +276,7 @@ defmodule GeoGenius.SchemaContractTest do
              status: :not_installed,
              compatible?: false,
              installed_revision: nil,
-             remedy: "install GeoGenius schema v1"
+             remedy: "install GeoGenius schema v2"
            } = SchemaContract.status(ContractRepo, "geo_genius")
   end
 end

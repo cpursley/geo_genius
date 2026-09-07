@@ -450,6 +450,15 @@ defmodule GeoGenius.InstallIntegrationTest do
 
     assert Migration.installed_version(TestRepo, prefix) == 1
 
+    # An install left at v1 is a real state a deployed host can be in, and the
+    # contract gate has to name it rather than accept it.
+    assert %{status: :drifted, compatible?: false, schema_version: 1} =
+             Migration.contract_status(TestRepo, prefix)
+
+    TestSimpleSQL.query!(TestRepo, Migration.render_sql(prefix: prefix, from: 1, to: 2))
+
+    assert Migration.installed_version(TestRepo, prefix) == 2
+
     assert %{status: :compatible, compatible?: true} =
              Migration.contract_status(TestRepo, prefix)
 
@@ -467,6 +476,14 @@ defmodule GeoGenius.InstallIntegrationTest do
     assert boundaries_definition =~ "publication_lock_key"
     assert boundaries_definition =~ "foreign_source_release_id"
     assert boundaries_definition =~ "accepted_repaired"
+    assert boundaries_definition =~ "accepted_display_geometries"
+
+    TestSimpleSQL.query!(TestRepo, Migration.render_sql(prefix: prefix, from: 2, to: 1))
+
+    assert Migration.installed_version(TestRepo, prefix) == 1
+
+    assert function_definition(prefix, "put_boundaries") =~
+             "ST_QuantizeCoordinates(requested.geom"
 
     TestSimpleSQL.query!(TestRepo, Migration.render_sql(prefix: prefix, from: 1, to: 0))
 

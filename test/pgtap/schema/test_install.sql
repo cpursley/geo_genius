@@ -8,12 +8,12 @@ SELECT has_view('geo_genius', 'geo_genius_contract', 'contract marker view exist
 SELECT has_table('geo_genius', 'area_type', 'area_type is an ordinary table');
 SELECT is(
   (SELECT schema_version FROM geo_genius.geo_genius_contract),
-  1,
-  'contract marker keeps the public schema at version 1'
+  2,
+  'contract marker keeps the public schema at version 2'
 );
 SELECT is(
   (SELECT contract_revision FROM geo_genius.geo_genius_contract),
-  'sha256:b2a132663db6baaf8482454a9dce7f385d98c665133b3b123fe3cf00630c0c44',
+  'sha256:5b8a85fb0b01123e7e9b1aef9eaf0206709a024254e3c6857819123c93a40567',
   'contract marker exposes the canonical content address'
 );
 SELECT is(
@@ -22,7 +22,8 @@ SELECT is(
     'artifact_observation_publication_gate', 'atomic_failed_candidate_retry',
     'atomic_import_completion', 'atomic_import_publication', 'boundary_batches',
     'boundary_canonical_repair_once', 'boundary_collection_provenance',
-    'boundary_publication_serialization', 'exact_attempt_artifact_snapshots',
+    'boundary_display_repair', 'boundary_publication_serialization',
+    'exact_attempt_artifact_snapshots',
     'exact_attempt_manifest_snapshots', 'executor_fenced_staging_cleanup',
     'failed_candidate_requires_explicit_retry', 'idempotent_executor_reclaim',
     'immutable_failure_evidence',

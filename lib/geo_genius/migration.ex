@@ -9,7 +9,7 @@ defmodule GeoGenius.Migration do
     otp_app: :geo_genius,
     default_prefix: "geo_genius",
     tracking_object: {:view, "geo_genius_version"},
-    versions: [GeoGenius.Migrations.V01]
+    versions: [GeoGenius.Migrations.V01, GeoGenius.Migrations.V02]
 
   @doc "Renders a deterministic SQL transition for hosts that do not run Ecto migrations."
   @spec render_sql(keyword()) :: String.t()
